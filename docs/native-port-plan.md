@@ -157,7 +157,11 @@ Each step needs a concrete goal the GS path can't meet; otherwise skip it.
   only (D9).
 - **Texture packs:** from Phase 7's hook.
 - **Model export:** meshes to glTF (T14); re-import through Phase 8's
-  native draw path.
+  native draw path. Lessons from the pilot game: meshes can be stored as
+  ready-made VIF DMA chains, so decode each unpack by its VU memory
+  address, not its format; strips may have no fixed winding (wind by the
+  normals); check handedness and UV scale on a texture with text in a
+  render, and compare against the port's frames.
 - **Model improvement:** no reliable automatic method for game meshes:
   export → artists improve → re-import. Texture upscaling reuses `textures/`.
 
