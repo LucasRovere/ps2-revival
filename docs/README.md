@@ -15,6 +15,7 @@
 | [native-port-plan.md](native-port-plan.md) | Working on recompilation, runtime, graphics, modding or the conversion tool (Phases 5–9, track C) |
 | [recomp-survey.md](recomp-survey.md) | Choosing or reusing recompiler/runtime code (prior art, licenses) |
 | [recomp-tests.md](recomp-tests.md) | Writing or running recompiler tests (vectors, edge cases, priorities) |
+| [`.claude/skills/`](../.claude/skills/) | Porting a new game (`/port-game`), a hang (`/diagnose-hang`), widescreen (`/find-widescreen`), textures (`/texture-pack`), the next task (`/next-task`) |
 | [games.md](games.md) | Per-game recipes and notes (`local/games/<serial>/`, not in git) |
 
 Status labels used across docs: **Verified** (tested on real data),

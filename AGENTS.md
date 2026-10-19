@@ -72,6 +72,7 @@ Full details: [docs/environment.md](docs/environment.md). The traps that cost ti
 AGENTS.md            this file (CLAUDE.md points here)
 README.md            human overview
 docs/                all documentation (index: docs/README.md)
+.claude/skills/      agent skills: next-task, port-game, diagnose-hang, find-widescreen, texture-pack
 textures/            texture upscale pipeline (working)
 extract/             ISO reader, boot files, disc inventory (working)
 analysis/            Ghidra headless analysis + plain-file export (working)
@@ -86,6 +87,13 @@ tools/bin/           local tool installs (Ghidra, JDK, Real-ESRGAN), git-ignored
 Planned modules (see roadmap): `mods/`. Runtime and graphics work happens
 in the vendored code under `recomp/` (D23); no separate `runtime/` or
 `graphics/`.
+
+## Skills
+
+Procedures in `.claude/skills/<name>/SKILL.md`. For a new game start with
+`/port-game`; it points to `/diagnose-hang`, `/find-widescreen` and
+`/texture-pack`. When a skill misses a step or is wrong, fix the skill in
+the same change.
 
 ## Conventions
 
@@ -161,6 +169,9 @@ in the vendored code under `recomp/` (D23); no separate `runtime/` or
   9 mods (mod folder done) and assets. Plan: [docs/native-port-plan.md](docs/native-port-plan.md).
 - Plan (D26, 2026-10-19): conversion tool track next (T37 folder build,
   T38 `port.py init`, T39 automatic exploration, T40 second game, T41 agent
-  skills), then Phases 8–9; final intent fully native. Plan at agent pace:
+  skills done), then Phases 8–9; final intent fully native. Plan at agent pace:
   Phases 0–7 took about 30 hours; one game fully native ≈ a week.
+- Agent skills (T41, `.claude/skills/`, game-neutral): `/port-game` (new
+  game: onboard, check, triage), `/diagnose-hang` (traces + PCSX2 IOP log),
+  `/find-widescreen`, `/texture-pack`. Use them for a new game.
 - Next up: see [docs/tasks.md](docs/tasks.md). The owner runs tasks with `/next-task`.

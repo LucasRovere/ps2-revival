@@ -131,7 +131,8 @@ manual on the pilot game into tooling and agent skills. Order (owner):
 - **(e) Agent skills** (`.claude/skills/`, game-neutral): `/port-game`
   (onboard, build, run, triage), `/diagnose-hang` (syscall/SIF traces,
   compare with a PCSX2 IOP log: the method that found the pilot game's
-  post-intro stall), `/find-widescreen`, `/texture-pack`.
+  post-intro stall), `/find-widescreen`, `/texture-pack`. Done (T41);
+  tried on the second game in T40.
 
 Each step is about one session; split if bigger.
 
