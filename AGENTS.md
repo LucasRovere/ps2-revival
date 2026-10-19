@@ -137,6 +137,10 @@ in the vendored code under `recomp/` (D23); no separate `runtime/` or
 - Texture packs (Phase 7, T33, D25): `play.json` `textures` (pack folder of
   `<key>.png`), `PS2_TEX_DUMP` dump mode, `textures/pack.py` builds a pack
   from the PCSX2 replacements. Phase 7 items done (owner checks open).
+- Conversion tool (D26), T37: `port.py --folder` writes `work/<serial>/port/`
+  (window exe, ELF, `disc/` + `layout.txt` + `sectors.bin`, D27); `ps2run.exe`
+  there runs with no arguments and no ISO; `play.py` uses it when present.
+  Pilot game: frames and cycles as the ISO run; an in-place file edit shows.
 - Repo policy (D24): nothing game-specific in git; recipes, notes and
   game-specific code in `local/games/<serial>/`.
 - Phases 6–9 re-planned (D23): build on the vendored runtime and GS renderer;

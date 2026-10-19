@@ -22,6 +22,10 @@ Usage (WSL; on Windows the same with Windows Python and a Windows ISO path):
 
 --saves also plays the `recomp.save` run (the game saves to a fresh memory
 card) and the `recomp.load` run (a new boot loads that save).
+
+--folder [<dir>] (Windows) also builds the standalone port folder (default
+work/<serial>/port/): the window ps2run.exe, SDL2.dll, the ELF and the disc's
+files with their sector layout. ps2run.exe runs it with no arguments, no ISO.
 """
 
 import argparse
@@ -49,7 +53,7 @@ sys.path.insert(0, str(REPO / "extract"))
 sys.path.insert(0, str(REPO / "patches"))
 from build import apply_writes, check_writes  # noqa: E402
 from extract import boot_path, parse_system_cnf  # noqa: E402
-from iso9660 import Iso  # noqa: E402
+from iso9660 import SECTOR, Iso  # noqa: E402
 
 
 def run(cmd, log=None, env=None):
@@ -165,6 +169,61 @@ def build_window_runner(out, generated):
     run(["ninja", "-C", build, "ps2run"])
     shutil.copy2(SDL2_DIR / "lib" / "x64" / "SDL2.dll", build)
     print(f"window build: {build / 'ps2run'} (run with --window)")
+    return build
+
+
+def copy_bytes(src, dst, size):
+    while size > 0 and (chunk := src.read(min(size, 16 << 20))):
+        dst.write(chunk)
+        size -= len(chunk)
+
+
+def unpack_disc(iso, folder):
+    """disc/ with each file at its disc path; layout.txt with each file's sector and size; sectors.bin with
+    every other non-zero sector, so the folder reads back sector for sector like the ISO (games read by LBA)."""
+    sectors = iso.stat().st_size // SECTOR
+    covered = bytearray(sectors)
+    lines = [f"sectors {sectors}"]
+    with Iso(iso) as disc:
+        for e in disc.files():
+            out = folder / "disc" / e.path
+            out.parent.mkdir(parents=True, exist_ok=True)
+            disc.f.seek(e.lba * SECTOR)
+            with open(out, "wb") as f:
+                copy_bytes(disc.f, f, e.size)
+            padding = disc.f.read(-e.size % SECTOR)
+            full = e.size // SECTOR + (1 if padding and not padding.strip(b"\0") else 0)
+            covered[e.lba:e.lba + full] = b"\1" * full
+            lines.append(f"file {e.lba} {e.size} {e.path}")
+        runs = []
+        with open(folder / "sectors.bin", "wb") as blob:
+            s = covered.find(0)
+            while s != -1:
+                disc.f.seek(s * SECTOR)
+                data = disc.f.read(SECTOR)
+                if data.strip(b"\0"):
+                    if runs and sum(runs[-1]) == s:
+                        runs[-1][1] += 1
+                    else:
+                        runs.append([s, 1])
+                    blob.write(data)
+                s = covered.find(0, s + 1)
+    lines += [f"rest {start} {count}" for start, count in runs]
+    (folder / "layout.txt").write_text("".join(line + "\n" for line in lines), newline="\n")
+    print(f"unpacked {len(disc.files())} files, {sum(c for _, c in runs)} other sectors -> {folder}")
+
+
+def build_folder(window_build, elf, iso, folder):
+    """The standalone port: ps2run.exe finds the ELF and the disc next to itself."""
+    folder.mkdir(parents=True, exist_ok=True)
+    for name in ("ps2run.exe", "SDL2.dll"):
+        shutil.copy2(window_build / name, folder)
+    shutil.copy2(elf, folder / elf.name)
+    if (folder / "layout.txt").exists():
+        print(f"disc files kept in {folder} (delete layout.txt to unpack again)")
+    else:
+        unpack_disc(iso, folder)
+    print(f"port folder: {folder} (run ps2run.exe)")
 
 
 def play(runner, elf, iso, out, name, frames, presses, frame_every, card_from=None):
@@ -222,7 +281,10 @@ def main():
     ap.add_argument("--window", action="store_true", help="also build ps2run with the window and GPU renderer (Windows)")
     ap.add_argument("--no-patches", action="store_true", help="translate and run the disc's ELF without the game.json patches")
     ap.add_argument("--saves", action="store_true", help="also play the game.json save and load runs (memory card check)")
+    ap.add_argument("--folder", nargs="?", const="", help="also build the standalone port folder (Windows; default work/<SERIAL>/port)")
     args = ap.parse_args()
+    if args.folder is not None and os.name != "nt":
+        sys.exit("--folder needs the Windows window build")
 
     game = json.loads((GAMES_DIR / args.serial / "game.json").read_text(encoding="utf-8"))
     cfg = game["recomp"]
@@ -254,8 +316,10 @@ def main():
         check_saves(runner, elf, iso, out, cfg)
     compile_vu(eerecomp.with_name("vurecomp"), out / "vu1", generated)
     build_runner(out, generated)
-    if args.window:
-        build_window_runner(out, generated)
+    if args.window or args.folder is not None:
+        window_build = build_window_runner(out, generated)
+    if args.folder is not None:
+        build_folder(window_build, elf, iso, Path(args.folder) if args.folder else WORK_DIR / args.serial / "port")
 
 
 if __name__ == "__main__":

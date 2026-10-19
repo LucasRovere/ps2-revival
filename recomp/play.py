@@ -1,7 +1,9 @@
 """Play a built port in its window with the saved settings.
 
 Starts the window build of ps2run (built by `port.py <SERIAL> --window`) on
-the same ELF port.py translates (patched when game.json has patches). The
+the same ELF port.py translates (patched when game.json has patches), or
+the port folder work/<serial>/port/ (`port.py <SERIAL> --folder`) when it
+exists. The
 settings live in local/games/<serial>/play.json (per machine, git-ignored)
 and are created with defaults on first use:
 
@@ -42,13 +44,20 @@ def main():
     # A widescreen patch makes the game draw 16:9; a 4:3 window would squeeze it.
     settings = load_settings(args.serial, game.get("recomp", {}).get("aspect", "4:3") if game.get("patches") else "4:3")
     out = WORK_DIR / args.serial / "recomp"
-    runner = out / f"build-window{BUILD_SUFFIX}" / "ps2run"
-    elf = out / ("patched" if game.get("patches") else "disc") / game["disc"]["elf"]
-    if not elf.exists() or not runner.with_suffix(".exe" if os.name == "nt" else "").exists():
-        sys.exit(f"No window build: run python recomp/port.py {args.serial} --window first")
+    folder = WORK_DIR / args.serial / "port" / "ps2run.exe"
+    if folder.exists():
+        # The folder build finds its ELF and disc next to itself.
+        print(f"port folder: {folder.parent}")
+        cmd = [folder]
+    else:
+        runner = out / f"build-window{BUILD_SUFFIX}" / "ps2run"
+        elf = out / ("patched" if game.get("patches") else "disc") / game["disc"]["elf"]
+        if not elf.exists() or not runner.with_suffix(".exe" if os.name == "nt" else "").exists():
+            sys.exit(f"No window build: run python recomp/port.py {args.serial} --window first")
+        cmd = [runner, elf, "--disc", out / "disc.iso"]
     card = REPO / settings["memcard"]
     print(f"settings: memcard {card}, scale {settings['scale']}, fullscreen {settings['fullscreen']}, aspect {settings['aspect']}, textures {settings['textures'] or 'off'}", flush=True)
-    cmd = [runner, elf, "--disc", out / "disc.iso", "--memcard", card, "--fullscreen" if settings["fullscreen"] else "--window"]
+    cmd += ["--memcard", card, "--fullscreen" if settings["fullscreen"] else "--window"]
     env = {**os.environ, "PS2_SCALE": str(settings["scale"]), "PS2_ASPECT": settings["aspect"]}
     if settings["textures"]:
         env["PS2_TEXTURES"] = str(REPO / settings["textures"])

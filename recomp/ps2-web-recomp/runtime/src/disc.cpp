@@ -4,7 +4,10 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <map>
+#include <memory>
 
 namespace ps2::disc {
 
@@ -54,6 +57,95 @@ void walk(std::uint32_t base, std::uint32_t lba, std::uint32_t size, const std::
     }
 }
 
+// Port folder (T37): disc/ holds each file at its disc path, layout.txt each file's sector and size,
+// sectors.bin every other non-zero sector (volume descriptors, path tables, directory records).
+struct Span {
+    std::uint32_t sector;
+    std::uint64_t size;
+    std::string path;
+    std::uint64_t offset;
+};
+
+void seek(std::FILE *file, std::uint64_t offset) {
+#if defined(_WIN32)
+    _fseeki64(file, static_cast<long long>(offset), SEEK_SET);
+#else
+    fseeko(file, static_cast<off_t>(offset), SEEK_SET);
+#endif
+}
+
+struct Folder {
+    std::uint64_t size = 0;
+    std::vector<Span> files, rest;
+    std::string open_path;
+    std::FILE *open_file = nullptr;
+
+    std::FILE *handle(const std::string &path) {
+        if (path != open_path) {
+            if (open_file) std::fclose(open_file);
+            open_file = std::fopen(path.c_str(), "rb");
+            open_path = path;
+        }
+        return open_file;
+    }
+
+    void copy(const std::vector<Span> &spans, std::uint64_t offset, std::uint8_t *out, std::size_t bytes) {
+        const std::uint64_t end = offset + bytes;
+        for (const Span &s : spans) {
+            const std::uint64_t first = static_cast<std::uint64_t>(s.sector) * kSector;
+            const std::uint64_t lo = std::max(offset, first), hi = std::min(end, first + s.size);
+            if (lo >= hi) continue;
+            std::FILE *file = handle(s.path);
+            if (!file) continue;
+            seek(file, s.offset + lo - first);
+            std::fread(out + (lo - offset), 1, static_cast<std::size_t>(hi - lo), file);
+        }
+    }
+
+    std::size_t read(std::uint64_t offset, void *out, std::size_t bytes) {
+        if (offset >= size) return 0;
+        bytes = static_cast<std::size_t>(std::min<std::uint64_t>(bytes, size - offset));
+        auto *dst = static_cast<std::uint8_t *>(out);
+        std::memset(dst, 0, bytes);
+        copy(files, offset, dst, bytes);
+        // After the files: a file's last sector is in sectors.bin when its padding is not zero.
+        copy(rest, offset, dst, bytes);
+        return bytes;
+    }
+};
+
+bool open_folder(const std::string &dir) {
+    std::ifstream layout(dir + "/layout.txt");
+    if (!layout) return false;
+    auto folder = std::make_shared<Folder>();
+    std::uint64_t blob = 0;
+    std::string kind;
+    while (layout >> kind) {
+        Span s{};
+        if (kind == "sectors") {
+            layout >> folder->size;
+            folder->size *= kSector;
+        } else if (kind == "file") {
+            layout >> s.sector >> s.size;
+            layout.get();
+            std::getline(layout, s.path);
+            s.path = dir + "/disc/" + s.path;
+            folder->files.push_back(s);
+        } else if (kind == "rest") {
+            std::uint32_t count = 0;
+            layout >> s.sector >> count;
+            s.size = static_cast<std::uint64_t>(count) * kSector;
+            s.path = dir + "/sectors.bin";
+            s.offset = blob;
+            blob += s.size;
+            folder->rest.push_back(s);
+        }
+    }
+    return open(dir, folder->size, [folder](std::uint64_t offset, void *out, std::size_t bytes) {
+        return folder->read(offset, out, bytes);
+    });
+}
+
 void index_layer(std::uint32_t pvd_sector, std::uint32_t base) {
     std::uint8_t pvd[kSector];
     if (!read(pvd_sector, 1, pvd) || std::memcmp(pvd, "\x01" "CD001", 6) != 0) return;
@@ -63,6 +155,9 @@ void index_layer(std::uint32_t pvd_sector, std::uint32_t base) {
 }
 
 bool open(const std::string &path) {
+    const bool folder = std::filesystem::is_directory(path);
+    std::fprintf(stderr, "[disc] %s backend: %s\n", folder ? "folder" : "image", path.c_str());
+    if (folder) return open_folder(path);
     g_file = std::fopen(path.c_str(), "rb");
     if (!g_file) return false;
 #if defined(_WIN32)

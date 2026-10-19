@@ -551,3 +551,24 @@ which parts are really generic (D6) before we build more on them.
 absorb (then rethink what is generic, D6); the pace estimate proves wrong
 by a large factor on real tasks; or the owner wants deeper work on the
 pilot game first.
+
+## D27: Port folder keeps the disc's sector layout
+
+**Decision (T37, 2026-10-19):** the standalone port folder holds the disc's
+files at their disc paths (`disc/`), plus `layout.txt` (each file's first
+sector and size, the disc's sector count) and `sectors.bin` (every other
+non-zero sector: system area, volume descriptors, path tables, directory
+records, file tails with non-zero padding). The runtime's folder backend
+reads a sector from the file that covers it, else from `sectors.bin`, else
+zeros. The game sees the same bytes at the same LBAs as on the ISO.
+
+**Why:** games look files up and then read sectors by LBA, some from their
+own tables, so files must keep their places. Rebuilding the image from the
+folder gives the ISO byte for byte (pilot game), and the runtime's other
+code (lookups, directory index, CD/DVD RPCs, IRX loads) stays unchanged.
+Files are plain files, so a data mod that fits the file's sector range is
+an in-place edit.
+
+**Revisit if:** files must grow or be added (T42: relocation past the end
+of the disc), or a dual-layer disc needs its layer-1 files unpacked (today
+they stay in `sectors.bin`; untested).

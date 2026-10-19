@@ -10,6 +10,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -20,22 +22,44 @@ namespace {
 
 int usage() {
     std::fprintf(stderr,
-                 "usage: ps2run <elf> [--arg text]... [--frames n] [--ntsc] [--misses file]\n"
-                 "              [--disc image.iso] [--memcard card.ps2] [--pal | --ntsc] [--trace-syscalls] [--trace-io] [--trace-threads]\n"
+                 "usage: ps2run [<elf>] [--arg text]... [--frames n] [--ntsc] [--misses file]\n"
+                 "              [--disc image.iso | folder] [--memcard card.ps2] [--pal | --ntsc] [--trace-syscalls] [--trace-io] [--trace-threads]\n"
                  "              [--trace-iop] [--trace-iop-hle] [--frames-dir dir] [--frame-every n]\n"
                  "              [--press frame:button[+button][:frames]]... [--window] [--fullscreen]\n"
                  "              [--save-state frame:file] [--load-state file]\n");
     return 2;
 }
 
+// The boot ELF a port folder holds next to ps2run, named as in the disc's SYSTEM.CNF (BOOT2 = cdrom0:\NAME;1).
+std::string folder_elf(const std::filesystem::path &dir) {
+    std::ifstream cnf(dir / "disc" / "SYSTEM.CNF");
+    std::string line;
+    while (std::getline(cnf, line)) {
+        if (line.rfind("BOOT2", 0) != 0) continue;
+        std::string name = line.substr(line.find_last_of("\\:") + 1);
+        return (dir / name.substr(0, name.find_first_of(";\r "))).string();
+    }
+    return {};
+}
+
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) return usage();
-    std::vector<std::string> args{argv[1]};
-    [[maybe_unused]] bool window = false, fullscreen = false;
+    // No ELF argument: run the port folder ps2run sits in (T37); no arguments at all opens the window.
+    const bool folder = argc < 2 || argv[1][0] == '-';
+    std::string elf = folder ? std::string() : argv[1];
+    if (folder) {
+        std::filesystem::path dir = std::filesystem::path(argv[0]).parent_path();
+        if (dir.empty()) dir = ".";
+        elf = folder_elf(dir);
+        if (elf.empty()) return usage();
+        ps2::g_options.disc_path = dir.string();
+        ps2::g_options.memcard_path = (dir / "memcard.ps2").string();
+    }
+    std::vector<std::string> args{elf};
+    [[maybe_unused]] bool window = argc < 2, fullscreen = false;
     std::string load_path;
-    for (int i = 2; i < argc; ++i) {
+    for (int i = folder ? 1 : 2; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--arg" && i + 1 < argc) args.push_back(argv[++i]);
         else if (a == "--frames" && i + 1 < argc) ps2::g_options.max_frames = std::strtoull(argv[++i], nullptr, 10);
@@ -80,8 +104,8 @@ int main(int argc, char **argv) {
     register_generated_vu();
     const auto emulate = [&]() -> int {
         std::uint32_t entry = 0;
-        if (!ps2::load_elf(argv[1], entry)) {
-            std::fprintf(stderr, "cannot load %s\n", argv[1]);
+        if (!ps2::load_elf(elf, entry)) {
+            std::fprintf(stderr, "cannot load %s\n", elf.c_str());
             return 1;
         }
         ps2::boot(entry, args);

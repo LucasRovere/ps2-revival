@@ -2,7 +2,7 @@
 
 EE (R5900) → C++ static recompiler (Phase 5). The recompiler and runtime are
 [ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp) (MIT), vendored
-in `ps2-web-recomp/` (D14, D16). Our own code: `port.py`, `play.py` (launcher), the function
+in `ps2-web-recomp/` (D14, D16). Our own code: `port.py` (incl. the port folder), `play.py` (launcher), the function
 override hook (vendored patch, below), generic overrides in `overrides/`
 (none yet; created with the first) and the instruction tests in `tests/`.
 
@@ -111,6 +111,62 @@ git-ignored), created with defaults on first use:
 Keys missing from an older `play.json` take the defaults. The log shows
 `settings: ...`, `[gpu] scale N`, `[gpu] aspect W:H` and
 `[mc] card in slot 1: <file>`.
+
+When the port folder `work/<SERIAL>/port/` exists (below), `play.py` starts
+its `ps2run.exe` instead, with the same settings, and prints `port folder: ...`.
+
+### Port folder (T37, D27, Windows)
+
+```powershell
+python recomp/port.py <SERIAL> --no-explore --no-menu --folder [<dir>]
+work\<SERIAL>\port\ps2run.exe          # or double-click it; no ISO needed
+```
+
+`--folder` builds the window runner and writes a standalone port (default
+`work/<SERIAL>/port/`; game data, never commit):
+
+| File | Content |
+|---|---|
+| `ps2run.exe`, `SDL2.dll` | Window build (wgpu linked in) |
+| `<boot ELF>` | The ELF port.py translated (patched when `game.json` has patches), named as in `SYSTEM.CNF` |
+| `disc/` | Every disc file at its disc path |
+| `layout.txt` | `sectors <n>`, then `file <lba> <size> <path>` per file and `rest <lba> <count>` per run of other non-zero sectors |
+| `sectors.bin` | Those other sectors in `rest` order (system area, volume descriptors, path tables, directory records; also a file's last sector when its padding is not zero) |
+
+The disc is unpacked once; a later `--folder` only refreshes the exe, DLL
+and ELF (delete `layout.txt` to unpack again). The runtime's folder backend
+(`--disc <dir>`, a directory instead of an ISO) reads each sector from the
+file that covers it, else from `sectors.bin`, else zeros, so every LBA reads
+back as on the ISO and the directory index is built from the same records.
+`ps2run` with no ELF argument runs the folder it sits in: ELF name from
+`disc/SYSTEM.CNF`, disc = that folder, card `memcard.ps2` there (other
+options still apply, e.g. `--memcard`, `--window`). With no arguments at all
+it opens the window. The log says `[disc] folder backend: <dir>` or
+`[disc] image backend: <file>`.
+
+Editing a file in `disc/` in place changes what the game reads, as long as
+the file keeps its size (the disc's directory records keep the old size).
+Limits: files that grow, new files and a mod overlay are T42; layer-1 files
+of a dual-layer disc are not unpacked (they stay in `sectors.bin`; no
+dual-layer disc tested); started without arguments the folder uses the
+defaults (4:3, scale 1), not `play.json`. The exe needs the Microsoft Visual
+C++ 2015-2022 runtime (`MSVCP140.dll`, `VCRUNTIME140.dll`), already present
+on a machine with the build tools.
+
+Check (pilot game): the image rebuilt from the folder equals the ISO byte
+for byte (the folder is smaller: zero sectors are not stored);
+menu run from boot on the folder: 107 of 107 frames byte-identical to the
+ISO run and the same cycle count (with the ELF at the same path: the guest's
+`argv[0]` is the host ELF path on Windows, below); window run with the ISO
+link renamed away: intro movies, menus, loading screen and race intro, 60
+fps from a race-intro state like the ISO; a same-size string edit in one
+archive file in a copy of the folder shows in the loading-screen frames.
+Headless race-intro time is the same as the ISO's.
+
+Note: on Windows `boot()` passes the host ELF path as the guest's `argv[0]`
+(its `cdrom0:\NAME;1` conversion skips paths with a `:`, and `C:` has one),
+so the cycle count depends on the length of the ELF's path. Not changed
+(upstream behaviour; changing it changes ISO-run cycle counts).
 
 ### Widescreen and resolution (T32)
 
@@ -266,6 +322,7 @@ except:
 | `runtime/src/iop/sio2.cpp` (`flush_cards`), `runtime/src/gs/gpu/gpu.cpp` (scale) | Log lines (T34): `[mc] card saved: <file>` after each card file write, `[gpu] scale N` at GPU start, so save runs and the launcher's settings show in the log. |
 | `runtime/src/gs/gpu/gpu.cpp` (blit viewport in `submit`, `present`), `host/window.cpp` (window size, SDL logical size) | 16:9 presentation (T32): `PS2_ASPECT=16:9` replaces the fixed 4:3 of the blit viewport and the SDL fallback with 16:9 and opens a 1280×720 window; `[gpu] aspect W:H` at GPU start. Unset, the arithmetic is the same as upstream's. |
 | `runtime/src/gs/gpu/texpack.cpp`, `texpack.hpp` (new), `gpu.cpp` (upload tags, `replacement` in the setup cache, `g_repl` binding 8, plan_decodes skips replaced setups, `[tex]` stats), `gpu.hpp` (`texture_dump`), `gs.wgsl` (`sample_repl`), `gs.cpp` (`cpu_memory`: CPU copy of GS memory for the dump), `CMakeLists.txt` (texpack.cpp) | Texture packs (T33, D25): setup word 24 = `0x80000000 | log2(scale) << 29 | offset/16` points the raster shader at a pack image instead of GS memory. Without `PS2_TEXTURES`/`PS2_TEX_DUMP` the new code does not run and frames and cycle counts are unchanged. |
+| `runtime/src/disc.cpp` (`open`, folder backend), `host/main.cpp` (no-ELF folder mode) | Port folder (T37, D27): `disc::open` on a directory reads `layout.txt`, `disc/` and `sectors.bin` through the existing `Reader` hook; one `[disc] folder/image backend` log line. `ps2run` without an ELF argument takes the ELF named in `disc/SYSTEM.CNF`, the disc and `memcard.ps2` from its own folder, and opens the window when started with no arguments. ISO runs: frames and cycle counts unchanged. |
 
 The headless Windows build (T22) needs no changes to upstream: the headless path
 leaves out `host/window.cpp` (SDL2), `host/profile.cpp` (Linux only) and the
