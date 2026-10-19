@@ -1,7 +1,10 @@
 # AGENTS.md: start here
 
-You are working on **ps2-revival**, a public, MIT-licensed toolkit for
-improving PS2 games in PCSX2 and, long term, porting them natively to Windows.
+You are working on **ps2-revival**, a public, MIT-licensed toolkit whose
+goal is a tool that turns a PS2 ISO into a native Windows game, with
+per-game work automated as far as possible (D26). Final intent: fully
+native games (no PS2 hardware layer). Along the way it improves games in
+PCSX2.
 The owner directs the project and lets agents do the coding. This file is the
 onboarding for a fresh agent with no prior context.
 
@@ -140,4 +143,8 @@ in the vendored code under `recomp/` (D23); no separate `runtime/` or
   6 port hooks (override table, recipe patches, saves, launcher done), 7 look better
   (widescreen, resolution, texture packs), 8 selective native draw paths,
   9 mods and assets. Plan: [docs/native-port-plan.md](docs/native-port-plan.md).
+- Plan (D26, 2026-10-19): conversion tool track next (T37 folder build,
+  T38 `port.py init`, T39 automatic exploration, T40 second game, T41 agent
+  skills), then Phases 8–9; final intent fully native. Plan at agent pace:
+  Phases 0–7 took about 30 hours; one game fully native ≈ a week.
 - Next up: see [docs/tasks.md](docs/tasks.md). The owner runs tasks with `/next-task`.

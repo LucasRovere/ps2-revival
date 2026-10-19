@@ -12,7 +12,7 @@
 | [textures.md](textures.md) | Working on the texture pipeline (includes lessons learned) |
 | [pcsx2-tuning.md](pcsx2-tuning.md) | Helping someone get better quality or performance in PCSX2 |
 | [analysis-plan.md](analysis-plan.md) | Working on executable extraction or Ghidra analysis (Phases 2–3) |
-| [native-port-plan.md](native-port-plan.md) | Working on recompilation, runtime, graphics or modding (Phases 5–9) |
+| [native-port-plan.md](native-port-plan.md) | Working on recompilation, runtime, graphics, modding or the conversion tool (Phases 5–9, track C) |
 | [recomp-survey.md](recomp-survey.md) | Choosing or reusing recompiler/runtime code (prior art, licenses) |
 | [recomp-tests.md](recomp-tests.md) | Writing or running recompiler tests (vectors, edge cases, priorities) |
 | [games.md](games.md) | Per-game recipes and notes (`local/games/<serial>/`, not in git) |

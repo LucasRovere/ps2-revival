@@ -515,3 +515,39 @@ state and render targets get no key (never replaced).
 
 **Revisit if:** a game uploads its textures in partial columns (most of its
 textures untagged), or the CPU cost matters (T29).
+
+## D26: End goal is an ISO-to-native conversion tool; fully native games; plan at agent pace
+
+**Decision (owner, 2026-10-19):**
+1. **End goal:** a tool that turns a PS2 ISO into a native Windows game.
+   Per-game work is automated as far as possible. Agents, skills and
+   tooling prepare the ground so further games (done with AI help) go
+   fast. The owner owns several other PS2 games for testing.
+2. **Final intent: fully native games.** No PS2 hardware layer in the end:
+   native renderer, audio and IO; game logic moves from recompiled code to
+   hand-written or decompiled C++. The detailed plan is written when we do
+   it for the first game, not before.
+3. Phases 8 (native draw paths) and 9 (assets and mods) stay; they are
+   steps towards the fully native game.
+4. **Estimates at agent pace.** Phases 0–7 took about 30 hours of agent
+   work. Plan with that pace: a full native conversion of one game is on
+   the order of a week, not months or years. This supersedes the "years"
+   and "months" estimates in D3, D5, D14 and D23 as planning figures (those
+   entries stay as written, as history).
+
+**New order:** a "Conversion tool" track is worked next, before Phases 8
+and 9: (a) standalone folder build (exe + unpacked disc files, no ISO at
+runtime; absorbs T35), (b) one-command onboarding `port.py init <iso>`,
+(c) automatic exploration (generated input, hang detection), (d) a second
+game from the owner's discs, (e) game-neutral agent skills from the manual
+steps. Then Phases 8 and 9. Plan: [native-port-plan.md](native-port-plan.md).
+
+**Why:** the pilot game shows the pipeline works. The project's value is
+in doing more games with little per-game effort, so automation and a
+second game come before deeper work on one game. A second game also tests
+which parts are really generic (D6) before we build more on them.
+
+**Revisit if:** the second game needs mostly hand work the tool can't
+absorb (then rethink what is generic, D6); the pace estimate proves wrong
+by a large factor on real tasks; or the owner wants deeper work on the
+pilot game first.

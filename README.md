@@ -1,7 +1,9 @@
 # ps2-revival
 
-Tools for bringing PlayStation 2 games to modern Windows PCs: better-looking
-games in PCSX2 today, and native, moddable Windows ports over time.
+Tools for bringing PlayStation 2 games to modern Windows PCs. The goal is a
+tool that turns a PS2 disc image you own into a native Windows game, with
+the per-game work automated as far as possible. Along the way: better-looking
+games in PCSX2, and moddable native ports.
 
 > **This repository contains tools only.** It never contains games, BIOS
 > files, game executables, decompiled or recompiled game code, or game
@@ -14,16 +16,20 @@ games in PCSX2 today, and native, moddable Windows ports over time.
 |---|---|---|
 | [`textures/`](textures/) | Working, verified on a pilot game | Batch AI upscale of PCSX2 texture dumps with Real-ESRGAN: PS2 alpha preserved, per-game junk filtering, automatic fallback when the AI erases detail, verification and before/after previews |
 | [`patches/`](patches/) | Built, untested in game | PCSX2 `.pnach` builder from per-game recipes (kept locally, not in the repo) |
+| [`extract/`](extract/) | Working | Reads a game ISO: boot files, main executable, modules, file listing, CRC |
+| [`analysis/`](analysis/) | Working | Ghidra + PS2 (Emotion Engine) extension, headless export of functions, pseudocode and references |
+| [`recomp/`](recomp/) | Working on a pilot game | Static recompilation of the game's code to C++ on a vendored runtime ([ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp), MIT): native Windows window at 60 fps, widescreen, higher resolution, texture packs, saves, launcher |
 | [`docs/pcsx2-tuning.md`](docs/pcsx2-tuning.md) | Guide | Getting the most out of PCSX2 (adapter, upscaling, patches, diagnosing slowdowns) |
 
 ## Where it is going
 
-1. **extract**: read a game ISO, find the main executable and modules
-2. **analysis**: Ghidra + PS2 (Emotion Engine) extension, headless export of functions, pseudocode and references
-3. **patches**: 60 FPS / widescreen patches for PCSX2
-4. **recomp + runtime**: static recompilation of the game's MIPS code to C++, with replacements for the BIOS and PS2 hardware services
-5. **graphics**: first a simple PS2 graphics translation, then native per-engine renderers
-6. **mods**: asset export/import and a data-file mod loader for native ports
+1. **conversion tool** (next): ISO in, playable Windows folder out, with one
+   command; automatic exploration of the game; tried on a second game;
+   agent skills for the steps that still need judgment
+2. **native draw paths**: native per-engine rendering where the PS2 graphics path can't reach
+3. **mods**: a mod folder over the game's files, asset export/import
+4. **fully native**: no PS2 hardware layer left: native renderer, audio and
+   IO, game logic as hand-written or decompiled C++
 
 Details: [docs/roadmap.md](docs/roadmap.md). Design decisions and their
 reasons: [docs/decisions.md](docs/decisions.md).

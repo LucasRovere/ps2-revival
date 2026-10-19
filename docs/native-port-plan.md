@@ -1,9 +1,16 @@
-# Native port plan (Phases 5–9)
+# Native port plan (Phases 5–9, conversion tool)
 
-Status: **Phase 5 done; Phases 6–9 re-planned (D23, 2026-10-18)** around
-the vendored ps2-web-recomp, which already provides most of what the
-original Phases 6 and 7 planned to build. Strategy decisions: D3, D5, D6,
-D9, D14, D16, D23 in [decisions.md](decisions.md).
+Status: **Phases 5–7 done; conversion tool track next (D26, 2026-10-19),
+then Phases 8–9.** Phases 6–9 were re-planned (D23, 2026-10-18) around the
+vendored ps2-web-recomp, which already provides most of what the original
+Phases 6 and 7 planned to build. Strategy decisions: D3, D5, D6, D9, D14,
+D16, D23, D26 in [decisions.md](decisions.md).
+
+End goal (D26): a tool that turns a PS2 ISO into a native Windows game,
+per-game work automated as far as possible. Final intent: **fully native**
+games (see the last phase section). Pace: Phases 0–7 took about 30 hours of
+agent work; a full native conversion of one game is planned at about a
+week.
 
 ## Overview
 
@@ -19,9 +26,11 @@ game ELF ─► eerecomp ─► C++ (16 KiB units) ─┐
                     disc-file mods, later native draw paths (option C)
 ```
 
-The game logic keeps running as recompiled code. We improve it by hooks in
-three places: patched code words and overridden functions (EE side), the
-GS renderer (output side) and the disc layer (data side).
+For now the game logic keeps running as recompiled code. We improve it by
+hooks in three places: patched code words and overridden functions (EE
+side), the GS renderer (output side) and the disc layer (data side). The
+overrides are also the path to fully native: more and more of the game
+moves into our C++ until the PS2 layer is gone.
 
 ## Phase 5: recompiler (`recomp/`): done
 
@@ -100,6 +109,32 @@ The vendored GS renderer (option B) is accurate and fast; it stays the base
   own timestep (D11); whether the port can present faster than the emulated
   VBlank is *unverified*.
 
+## Conversion tool (next, D26)
+
+Make "ISO in, playable Windows folder out" one command, and turn what was
+manual on the pilot game into tooling and agent skills. Order (owner):
+
+- **(a) Standalone folder build:** the exe plus the unpacked disc files in
+  one folder, no ISO at runtime. The runtime's disc layer reads loose files
+  (lookups and sector reads). This absorbs T35 (disc-file mod folder): both
+  need the same disc-layer change. A mod folder over the loose files is the
+  follow-up (Phase 9).
+- **(b) One-command onboarding:** `port.py init <iso>` reads the serial,
+  boot ELF and CRC from the disc, writes `local/games/<serial>/game.json`
+  with defaults and runs the full pipeline (translate, explore, VU1
+  record/compile, folder build).
+- **(c) Automatic exploration:** drive the game with generated input, detect
+  stuck or hung runs from frame dumps, reach more scenes, record their VU1
+  programs and find missed entries, without hand-written press scripts.
+- **(d) Second game:** one of the owner's games (owner picks) through the
+  tool. Measures how generic it is; whatever breaks becomes tasks.
+- **(e) Agent skills** (`.claude/skills/`, game-neutral): `/port-game`
+  (onboard, build, run, triage), `/diagnose-hang` (syscall/SIF traces,
+  compare with a PCSX2 IOP log: the method that found the pilot game's
+  post-intro stall), `/find-widescreen`, `/texture-pack`.
+
+Each step is about one session; split if bigger.
+
 ## Phase 8: native draw paths (option C), selective
 
 Only where Phase 7 can't reach: replacing models, FOV and draw distance,
@@ -115,22 +150,37 @@ Each step needs a concrete goal the GS path can't meet; otherwise skip it.
 
 ## Phase 9: assets and mods
 
-- **Disc-file mods:** a mods folder overrides disc files (and, per engine,
-  entries inside engine archives, via local per-game tools) by path, served by the
-  runtime's disc layer. Data only (D9).
+- **Disc-file mods:** a mods folder over the unpacked disc files of the
+  folder build (conversion tool, a) overrides files by path (and, per
+  engine, entries inside engine archives, via local per-game tools). Data
+  only (D9).
 - **Texture packs:** from Phase 7's hook.
 - **Model export:** meshes to glTF (T14); re-import through Phase 8's
   native draw path.
 - **Model improvement:** no reliable automatic method for game meshes:
   export → artists improve → re-import. Texture upscaling reuses `textures/`.
 
+## Fully native (final intent, D26)
+
+The end state of a converted game has no PS2 hardware layer: a native
+renderer, native audio and IO, and the game logic as hand-written or
+decompiled C++ instead of recompiled MIPS. Phases 8 and 9 are steps on the
+way (native draw paths, own asset formats). The route is the override table
+(D5): replace functions one by one, checked against the recompiled original,
+until the runtime's emulation parts are no longer called. Game-specific code
+stays in `local/games/<serial>/` (D24).
+
+The detailed plan is written when we do this for the first game. Target
+pace: about a week of agent work per game (D26).
+
 ## Generalising
 
 The core (recompiler, runtime, hooks, texture packs, disc mods) is shared
 (D6). Per game: `game.json` (entries, menu script, patches, overrides),
 archive formats, draw-list structures, all in `local/games/<serial>/` (D24).
-A second game through `port.py` (ideally on the same engine, D6, D7) is the
-generality check; not scheduled.
+A second game through the conversion tool (step d, owner picks) is the
+generality check; the automation (b, c) and skills (e) keep the per-game
+part small.
 
 ## 60 FPS
 

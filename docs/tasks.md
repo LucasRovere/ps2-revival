@@ -6,73 +6,141 @@ fits in one session.
 
 ## Next task
 
-### T35: mods: disc-file mod folder
+### T37: conversion tool: standalone folder build
 
-**Goal:** Phase 9 (D23, D9): the port reads files from a mods folder before
-the disc, by disc path, so data mods (text tables, textures inside the
-game's own files) work without rebuilding the ISO, as a launcher setting.
+**Goal:** Conversion tool step (a) (D26): a port is one folder: the window
+exe, its DLLs, the game's ELF and the disc's files unpacked. It runs from
+that folder with no ISO. This absorbs T35 (disc-file mod folder): both need
+the runtime's disc layer to read loose files. The mod overlay itself is the
+follow-up T42.
 
 **Context:**
-- Phase 7 is done (T32 widescreen/resolution, T33 texture packs). The next
-  phase with planned work is 9; Phase 8 waits for T14/T36.
-- The runtime's disc layer: `runtime/src/disc.cpp` (ISO9660 index of all
-  files: `find(path)` → LBA and size, sector `read`), used by the IOP side
-  (`iop/cdvd.cpp`, `iop/cdvdfsv.cpp`: the game's CD/DVD RPCs). Games usually
-  look a file up (`sceCdSearchFile` → LBA, size) and then read sectors, so a
-  mod file of another size needs its own sector range (e.g. virtual LBAs past
-  the end of the disc) and the lookup must return it. *Unverified:* which
-  calls the pilot game uses (check `[iop]`/`[disc]` logs, `PS2_TRACE_*`).
-- Engine archives: games that pack files into their own archives need a
-  game-specific writer (D24: `local/games/<serial>/tools/`, not in the repo).
-  Pilot game: archive format and reader in the local notes (T4, T8);
-  game-specific details for this task: local notes, "Task details".
-- Settings: `play.py` passes `play.json` keys as env vars (`PS2_SCALE`,
-  `PS2_ASPECT`, `PS2_TEXTURES`); test runs and baselines: `work/t33/`
-  scripts (`run.ps1` menu run from boot, 107 frames, 52,595,993,473
-  cycles; `shots.ps1` race intro from `work/t32/p10400.state`).
+- Phases 5–7 are done. D26 puts the conversion tool track before Phases 8
+  and 9; this is its first step.
+- Today `port.py` hard-links the ISO to `work/<serial>/recomp/disc.iso` and
+  `ps2run` gets `--disc <iso>` (`play.py` too). Window build outputs:
+  `build-window-win/ps2run.exe` + `SDL2.dll` (wgpu is linked in).
+- The runtime's disc layer: `runtime/src/disc.cpp`. `disc::open(name, size,
+  Reader, Probe)` already takes a byte reader; `open(path)` wraps a file.
+  `open` indexes all files by walking the ISO9660 directory records from
+  sector 16 (and layer 1 on dual-layer discs). Users: `iop/cdvd.cpp`,
+  `iop/cdvdfsv.cpp` (the game's CD/DVD RPCs: lookups and sector reads),
+  `iop/io.cpp` (`cdrom0:` file reads), `iop/sif.cpp` (IRX module loads),
+  `system.cpp` (open). All go through `disc::find` / `disc::read` /
+  `disc::ready`, so one new backend covers them.
+- Games often look a file up and then read sectors by LBA; some read LBAs
+  from their own tables. So the folder must keep each file's original LBA,
+  and sectors outside files (system area, volume descriptors, path tables,
+  directory records) must still read back the same. Suggested layout
+  (*Assumption*, choose in the task): `disc/` with the files by disc path,
+  plus a small layout file (each file's LBA and size, layer 1 start) and
+  one blob with the non-file sectors; the reader maps a sector to a file
+  or the blob. *Unverified:* which non-file sectors the pilot game reads
+  (check `[disc]`/`[iop]` logs, `PS2_TRACE_*`).
+- `extract/` has our ISO9660 reader (`iso9660.py`, used by `port.py`).
+- Data mods become "edit the file in the folder" when the size still fits
+  its sector range; larger files need relocation (T42).
+- Test runs and baselines: `work/t33/` scripts (`run.ps1` menu run from
+  boot, cycle count in the local notes; `shots.ps1` race intro from a
+  save state). Game-specific details: local notes, "Task details".
 - Vendored code: minimal patches, each in the `recomp/README.md` list.
 
 **Scope:**
-0. Owner approvals: none expected (no downloads; mods are made from the
-   owner's own disc into `local/` or `work/`).
-1. Runtime: `PS2_MODS=<folder>`: a file at `<folder>/<disc path>` replaces
-   that disc file (lookup and reads); log `[mods] N files` and each file
-   served once. Without the setting, nothing changes.
-2. Launcher: `play.json` key `mods` (default `""`).
-3. Pilot game: a changed text table and one changed texture inside the
-   game's files (local tool rebuilds the archive with the changed entry),
-   seen in frames.
-4. Docs: README (mod folder format, limits), local notes, roadmap, AGENTS.
+0. Owner approvals: none expected (no downloads). The folder holds the
+   disc's files: a few GB in `work/`; mention the size.
+1. `port.py <SERIAL> --folder [<dir>]` (default `work/<serial>/port/`):
+   window build, `SDL2.dll`, the ELF (patched when `game.json` has
+   patches), `disc/` and the layout files. Unpacking uses `extract/`.
+2. Runtime: `--disc <folder>` (or a path that is a directory) opens the
+   folder backend; an ISO path works as before. Log one `[disc]` line
+   saying which backend.
+3. `ps2run.exe` started with no arguments in the folder finds the ELF and
+   `disc/` next to it and opens the window. `play.py` runs the folder
+   build when it exists (settings unchanged).
+4. Docs: `recomp/README.md` (folder layout, limits, patch list), local
+   notes, roadmap, AGENTS current state, this file (Done row).
 
 **Success criteria:**
-- With a mods folder, the changed text and texture show in frames; the log
-  lists the served files.
-- Without it, menu-run frames byte-identical and the same cycle count as
+- Menu run from boot on the folder: frames byte-identical to the ISO run
+  and the same cycle count.
+- The folder plays in the window with no ISO linked: title, menus, race
+  intro reached (frames looked at); an owner play check is a bonus.
+- One file in a copy of the folder changed in place (same size, e.g. a
+  text string) shows in a frame: proof the folder is read, not the ISO.
+- ISO runs unchanged: menu-run frames byte-identical and same cycles as
   the previous build.
-- A mod file larger than the original works (or the limit is written down).
 - No game data and nothing game-specific in git.
 
-**Out of scope:** new file formats beyond what the check needs, model
-replacement (Phase 8/9), texture packs (T33), speed (T29).
+**Out of scope:** mod overlay and files that grow (T42), `port.py init`
+(T38), packaging or an installer, distributing ports (roadmap: out of
+scope), speed (T29).
 
 ## Backlog
 
 Ordered. The finishing agent turns the top item into the next "Next task",
 with the same level of detail as above. Plan:
-[native-port-plan.md](native-port-plan.md) (D23). Game-specific details of
-each item: `local/games/<serial>/notes.md`, section "Task details".
+[native-port-plan.md](native-port-plan.md) (D23, D26). Game-specific
+details of each item: `local/games/<serial>/notes.md`, section "Task
+details". Each item is one session; split it if it is bigger.
 
-1. **T14: assets: pilot game mesh format (Phase 9, feeds Phase 8).** Owner:
+Conversion tool (D26), in this order:
+
+1. **T38: conversion tool: one-command onboarding.** `port.py init <iso>`
+   reads the serial and boot ELF from `SYSTEM.CNF`, computes the CRC
+   (`extract/`), writes `local/games/<serial>/game.json` with defaults
+   (`recomp` block, no recipe) and `notes.md` from the template
+   ([games.md](games.md)), then runs the full pipeline up to the T37
+   folder. Check: re-onboard the pilot game into a scratch serial folder;
+   the result plays like today's build. Never overwrites an existing
+   `game.json`.
+2. **T39: conversion tool: automatic exploration.** Replace hand-written
+   press scripts with generated input (button patterns, menu walks) plus
+   stuck/hang detection from frame dumps (identical frames for N seconds,
+   no new VU1 programs or entries). Goals: reach more scenes, record their
+   VU1 programs (D21), find missed entries. Check on the pilot game: at
+   least the scenes the current menu script reaches, with no script.
+3. **T40: conversion tool: second-game trial.** Needs owner input: the
+   owner picks one of their games. Run it through `port.py init` and the
+   folder build; record every failure in its local notes. Output: what
+   worked, what broke, and new tasks for the breaks. Measures how generic
+   the tool is (D6).
+4. **T41: conversion tool: agent skills.** Game-neutral skills in
+   `.claude/skills/` from what was manual: `/port-game` (onboard, build,
+   run, triage), `/diagnose-hang` (syscall/SIF traces, compare with a
+   PCSX2 IOP log: the method that found the pilot game's post-intro
+   stall), `/find-widescreen`, `/texture-pack`. Built from the T38–T40
+   experience; tried on the second game where possible. Split in two if
+   needed.
+
+Phase 9 / Phase 8 (after the conversion tool):
+
+5. **T42: mods: mod folder over the disc files (was T35).** A mods folder
+   whose files replace folder files by disc path at runtime, without
+   touching the port folder; files that grow get a new sector range (past
+   the end of the disc) and the lookup returns it. Launcher key `mods`.
+   Check on the pilot game: a changed text table and a texture inside the
+   game's archives (local tool rebuilds the archive entry), seen in frames.
+6. **T14: assets: pilot game mesh format (Phase 9, feeds Phase 8).** Owner:
    "this can be done later". Decode the pilot game's binary model meshes and
    export one to glTF, checked by a render. Engine-specific: the tool lives
    in `local/games/<serial>/tools/`, not in the repo (D24).
-2. **T36: analysis: pilot game renderer draw lists (Phase 8 start).** From
+7. **T36: analysis: pilot game renderer draw lists (Phase 8 start).** From
    the Ghidra export and the T14 mesh format: how the engine turns meshes,
    materials, matrices and lights into VIF/GS packets; which functions to
    override to draw a model natively next to the GS output. Output: local
    notes and a go/no-go for a native draw path with a concrete goal (model
    replacement, LOD, lighting) the GS path can't meet.
-3. **T29: recomp: speed headroom for racing.** After T28 the race intro is
+
+Texture work (small, owner-driven, open from T33):
+
+- Fuller PCSX2 dump session of tracks and cars (owner plays with dumping
+  on), then re-run the port dump and `textures/pack.py`: more matches.
+- Owner to judge the upscaled glare-star sprites (harder, longer rays);
+  if bad, exclude them from the pack.
+
+Parked by the owner:
+
+8. **T29: recomp: speed headroom for racing.** After T28 the race intro is
    60 fps paced but only ~71 fps unpaced, with the VU and render threads both
    near 100% there (at 60 fps: VU ~83%, render ~80%). Record VU1 programs
    during real gameplay (`PS2_VU_RECORD` / `port.py`) and check how many
@@ -84,7 +152,7 @@ each item: `local/games/<serial>/notes.md`, section "Task details".
    loop, `memcpy` into the rings); `x86-64-v3` builds (AVX2, no FMA, needs
    the owner's OK to drop CPUs without AVX2, D22). Same save-state runs and
    byte-identical frame checks as T25-T28.
-4. **T30: recomp: decouple IOP/SPU2 from the EE clock.** Owner request: audio
+9. **T30: recomp: decouple IOP/SPU2 from the EE clock.** Owner request: audio
    must not depend on the frame rate. Today the EE, IOP and SPU2 share one
    emulated clock, so when the EE falls behind real time the SPU2 makes
    fewer samples and the audio underruns. On a real PS2 the IOP/SPU2 run on
@@ -135,4 +203,5 @@ Results with game-specific numbers: `local/games/<serial>/notes.md`.
 | T31: recomp: function overrides and recipe patches in the port | 2026-10-19 | `port.py` applies the `game.json` patches to the translated ELF (`--no-patches`); `eerecomp --overrides` + runtime `register_override` (vendored patch); pilot game: 16:9 camera in the port, identity override and screen-type override byte-identical, harness override case passes | `1688122` |
 | T34: recomp: saves and launcher | 2026-10-19 | `port.py --saves`: the pilot game formats the card, saves a new profile, a new boot loads it (frames looked at); the card has PCSX2's `.ps2` layout (superblock byte-identical, ECC right) and the port loads a PCSX2-made save; `recomp/play.py` launches the window port with `local/games/<serial>/play.json` (card, scale, fullscreen); two vendored log lines | `7081f3c` |
 | T32: recomp: widescreen and resolution in the window | 2026-10-19 | `play.json` `aspect: "16:9"` (`PS2_ASPECT`, vendored patch: blit viewport, SDL fallback, 1280×720 window) presents the game's own 16:9 image unsqueezed (presented surface read back and looked at); 4:3 default frames byte-identical, same cycle count; `PS2_SCALE` 2/3 sharper, no new artefacts, +2-3 ms/frame headless, small race-intro fps dips in the window; default 1, clamp 3; owner check pending | `c21e2a7` |
-| T33: recomp: texture packs in the GPU renderer | 2026-10-19 | Packs of `<key>.png` (`play.json` `textures`, `PS2_TEXTURES`), dump mode `PS2_TEX_DUMP`, `textures/pack.py` (PCSX2 replacements via pixel match); key from per-column upload hashes (D25), stable across frames and runs; replaced textures seen in frames (solid test pack, real upscales); no pack = byte-identical frames and cycles; window 60 fps with a pack, +1.6-2 ms/frame headless; Phase 7 items done | this commit |
+| T33: recomp: texture packs in the GPU renderer | 2026-10-19 | Packs of `<key>.png` (`play.json` `textures`, `PS2_TEXTURES`), dump mode `PS2_TEX_DUMP`, `textures/pack.py` (PCSX2 replacements via pixel match); key from per-column upload hashes (D25), stable across frames and runs; replaced textures seen in frames (solid test pack, real upscales); no pack = byte-identical frames and cycles; window 60 fps with a pack, +1.6-2 ms/frame headless; Phase 7 items done | `e86061b` |
+| Plan: conversion tool track | 2026-10-19 | D26 (owner): end goal ISO → native Windows game, automated per game; final intent fully native; estimates at agent pace (Phases 0–7 ≈ 30 h); conversion tool track (T37–T41) before Phases 8–9; T35 merged into T37/T42 | this commit |
