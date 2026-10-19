@@ -2,7 +2,7 @@
 
 EE (R5900) → C++ static recompiler (Phase 5). The recompiler and runtime are
 [ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp) (MIT), vendored
-in `ps2-web-recomp/` (D14, D16). Our own code: `port.py`, the function
+in `ps2-web-recomp/` (D14, D16). Our own code: `port.py`, `play.py` (launcher), the function
 override hook (vendored patch, below), generic overrides in `overrides/`
 (none yet; created with the first) and the instruction tests in `tests/`.
 
@@ -10,7 +10,7 @@ override hook (vendored patch, below), generic overrides in `overrides/`
 
 ```bash
 python3 recomp/port.py <SERIAL> --iso "/mnt/c/path/to/game.iso"   # first run links the ISO
-python3 recomp/port.py <SERIAL> [--no-explore] [--no-menu] [--no-patches]
+python3 recomp/port.py <SERIAL> [--no-explore] [--no-menu] [--no-patches] [--saves]
 ```
 
 Needs clang, CMake and Ninja in WSL (SDL2 optional, for the window).
@@ -51,6 +51,7 @@ them (D21, T25). Programs not recorded run on the VU1 interpreter;
 | `explore_frames` | Frames per exploring run (presses: start at 300, cross every 300) |
 | `menu` | Optional scripted run from boot: `frames`, `frame_every`, `presses` (`frame:button[+button][:hold]`) |
 | `overrides` | Optional `{"0x00123456": "name"}`: guest function entry → our C++ function `name` (below) |
+| `save`, `load` | Optional scripted runs for `--saves` (same keys as `menu`, below) |
 
 Output (game-derived, never commit): `work/<SERIAL>/recomp/`: `generated/`
 (C++, incl. `vu1_*.cpp`, `overrides.cpp` and copies of the override
@@ -58,6 +59,53 @@ sources), `patched/` (the patched ELF), `vu1/` (recorded VU1 program
 images), `build-tools/`, `build-native/`, `explore.log`/`menu.log`,
 `*-frames/` (PPM), memory cards. New entry points found by exploring are
 printed; add them to `entries`.
+
+### Saves (T34)
+
+`ps2run --memcard <file>` puts one memory card in slot 1. The file is a raw
+card image in PCSX2's `.ps2` layout: 16,384 pages of 512 data bytes + 16
+spare bytes (ECC), 8,650,752 bytes. A missing file is a new, unformatted
+card (the game offers to format it). The runtime only moves pages; the
+format, file system and ECC come from the game's own card modules running
+on the IOP. After a write the card file is rewritten once 50 frames pass
+without card writes, and the log says `[mc] card saved: <file>` (quitting
+less than a second after a save can lose it).
+
+`port.py <SERIAL> --saves` plays two more scripted runs from boot:
+`recomp.save` (presses that make the game save to a fresh card `save.ps2`;
+stops if no card was written) and `recomp.load` (boots on a copy,
+`load.ps2`, and loads that save). Look at `save-frames/` and
+`load-frames/`. Without `--saves` nothing changes.
+
+Card check (pilot game, T34): the port's card has PCSX2's layout: page 0
+(superblock: "Sony PS2 Memory Card Format 1.2.0.0", 512-byte pages, 2 pages
+per cluster, 16 per block, 8,192 clusters, alloc offset 41, root cluster 0,
+backup blocks 1023/1022, type 2, flags 0x2B) is byte-identical to a card
+PCSX2 made; every written page's ECC (3 bytes per 128) is right; the save
+directory and file sizes match a save PCSX2 wrote for the same game. The
+port also loads that PCSX2-made save. One difference: superblock page 1 is
+all 0xFF on the port's card and holds leftover bytes on PCSX2's own new
+card (unused by the file system). *Unverified:* PCSX2 listing a card the
+port wrote (owner check: copy the card into PCSX2's `memcards` folder).
+
+### Launcher: play.py (T34, Windows)
+
+```powershell
+python recomp/play.py <SERIAL>
+```
+
+Starts `build-window-win/ps2run.exe` (from `port.py <SERIAL> --window`) on
+the ELF port.py translates (`patched/` when `game.json` has patches) in its
+window. Settings: `local/games/<SERIAL>/play.json` (per machine,
+git-ignored), created with defaults on first use:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `memcard` | `local/games/<SERIAL>/memcard.ps2` | Slot 1 card file (relative to the repo or absolute) |
+| `scale` | `1` | GPU internal resolution 1-3 (`PS2_SCALE`) |
+| `fullscreen` | `false` | Start fullscreen (F11 toggles) |
+
+The log shows `settings: ...`, `[gpu] scale N` and `[mc] card in slot 1: <file>`.
 
 ### Patches and overrides (T31)
 
@@ -121,6 +169,7 @@ except:
 | `runtime/src/vif.cpp`, `runtime/src/vu_micro.cpp` (`xgkick`) | VU thread speed (T28): VIF NOP (about half of all VIF commands, ~100,000 per pilot game race-intro frame) skips the command dispatch; the general unpack path writes each qword with one 16-byte store and wraps with a mask; XGKICK sends a packet that does not wrap around VU memory straight from VU memory instead of copying it to a stack buffer first. |
 | `runtime/src/gs/queue.hpp`, `runtime/src/gs/queue.cpp` | VU thread speed (T28): `role()` is inline (thread-local read, asked once per VIF command); ring positions wrap with a mask (capacities are powers of two) instead of a 64-bit division; producer and consumer cache the other side's position and only reload it when they run out; each side's atomics sit on their own cache line; `post` does one locked operation instead of two (`consumer_waiting_` is read before it is exchanged). |
 | `recomp/main.cpp`, `recomp/codegen.hpp`, `recomp/codegen.cpp`, `runtime/include/ps2/generated.hpp`, `runtime/src/dispatch.cpp` | Function overrides (T31, D5): `eerecomp --overrides <file>` (each address must be a function entry, else an error); at each listed entry of the main program the unit emits `if (run_override(c, k)) { c.pc = ra; return; }` (k = place in the sorted list); `table.cpp` gets `kOverrides[]` and `register_generated_code` calls `register_overrides()` (written by `port.py`) and `check_overrides`. Runtime: `register_override(addr, fn)`, `check_overrides` (exits on a listed address without an override or an extra registration), `run_override` (counts calls; counts printed at exit). Without `--overrides` the output is byte-identical (pilot game: all 238 units and `table.cpp`). |
+| `runtime/src/iop/sio2.cpp` (`flush_cards`), `runtime/src/gs/gpu/gpu.cpp` (scale) | Log lines (T34): `[mc] card saved: <file>` after each card file write, `[gpu] scale N` at GPU start, so save runs and the launcher's settings show in the log. |
 
 The headless Windows build (T22) needs no changes to upstream: the headless path
 leaves out `host/window.cpp` (SDL2), `host/profile.cpp` (Linux only) and the

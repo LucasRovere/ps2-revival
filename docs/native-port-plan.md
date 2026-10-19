@@ -75,10 +75,12 @@ affect play.
 - **Recipe patches in the port, done (T31):** `port.py` applies the `game.json`
   `patches` words to the ELF before translation (same check as
   `patches/build.py`), so Phase 4 recipes work in the port too.
-- **Saves:** memory card save and load checked in the port.
-- **Launcher:** `port.py` (or a small `play` entry) starts the built port
-  with the user's settings (scale, aspect, fullscreen, memory card) instead
-  of env vars.
+- **Saves, done (T34):** the game saves to the port's memory card and a new
+  run loads it (`port.py --saves`); the card has PCSX2's `.ps2` layout and
+  the port loads a PCSX2-made save.
+- **Launcher, done (T34):** `recomp/play.py <SERIAL>` starts the window port
+  with per-machine settings (memory card, scale, fullscreen; aspect comes
+  with T32) instead of flags and env vars.
 - Later in the phase, as needed: audio on its own clock (T30), VU1
   coverage of real racing and speed headroom (T29).
 

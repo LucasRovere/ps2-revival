@@ -73,7 +73,7 @@ textures/            texture upscale pipeline (working)
 extract/             ISO reader, boot files, disc inventory (working)
 analysis/            Ghidra headless analysis + plain-file export (working)
 patches/             PCSX2 .pnach builder from game.json recipes (working)
-recomp/              vendored ps2-web-recomp + port.py (Windows/WSL, working) + tests
+recomp/              vendored ps2-web-recomp + port.py, play.py (Windows/WSL, working) + tests
 local/               git-ignored: MACHINE.md, games/<serial>/ (game.json,
                      notes.md, game-specific tools/)
 work/                scratch space, git-ignored
@@ -122,10 +122,15 @@ in the vendored code under `recomp/` (D23); no separate `runtime/` or
   `recomp/overrides/` or `local/games/<serial>/overrides/`). Overrides must
   charge the guest's cycles (`recomp/README.md`). Pilot game: 16:9 camera in
   the port's frames; identity override byte-identical.
+- Saves and launcher (Phase 6, T34): `port.py --saves` (game saves to the
+  port's card, a new run loads it; PCSX2 `.ps2` layout, a PCSX2-made save
+  loads); `recomp/play.py <serial>` starts the window port with settings from
+  `local/games/<serial>/play.json` (card, scale, fullscreen). Phase 6 left:
+  T29/T30 (parked by the owner).
 - Repo policy (D24): nothing game-specific in git; recipes, notes and
   game-specific code in `local/games/<serial>/`.
 - Phases 6–9 re-planned (D23): build on the vendored runtime and GS renderer;
-  6 port hooks (override table and recipe patches done, saves), 7 look better
+  6 port hooks (override table, recipe patches, saves, launcher done), 7 look better
   (widescreen, resolution, texture packs), 8 selective native draw paths,
   9 mods and assets. Plan: [docs/native-port-plan.md](docs/native-port-plan.md).
 - Next up: see [docs/tasks.md](docs/tasks.md). The owner runs tasks with `/next-task`.

@@ -333,6 +333,7 @@ void flush_cards() {
         return;
     }
     out.close();
+    std::fprintf(stderr, "[mc] card saved: %s\n", g_options.memcard_path.c_str());
     if (g_options.on_memcard_saved) g_options.on_memcard_saved();
 }
 

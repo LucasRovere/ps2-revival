@@ -1249,6 +1249,7 @@ bool init(Mode m) {
         }
     }
     if (const char *scale = std::getenv("PS2_SCALE")) g_scale = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::atoi(scale)), 1u, 3u);
+    std::fprintf(stderr, "[gpu] scale %u\n", g_scale);
     g_copy_words = (1u << 20) * g_scale * g_scale;
     g_tiles_per_row = (2048 * static_cast<int>(g_scale) + 15) / 16;
     g_tile_count.assign(static_cast<std::size_t>(g_tiles_per_row) * g_tiles_per_row, 0);

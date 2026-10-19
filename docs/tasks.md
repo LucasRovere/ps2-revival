@@ -6,67 +6,58 @@ fits in one session.
 
 ## Next task
 
-### T34: recomp: saves and launcher
+### T32: recomp: widescreen and resolution in the window
 
-**Goal:** Two Phase 6 gaps (D23): (1) memory card saves checked in the
-native port: the game saves to the card, the port quits, a new run loads
-the save; (2) a launcher that starts the built window port with saved
-settings instead of command-line flags and env vars.
+**Goal:** Phase 7 start (D23): (1) present the game's 16:9 output at 16:9
+in the window, as a launcher setting; (2) check higher internal resolution
+(`PS2_SCALE` 2 and 3) on the pilot game.
 
 **Context:**
-- Phase 6 so far (T31): `port.py` applies the `game.json` patches and
-  supports function overrides ([recomp/README.md](../recomp/README.md),
-  "Patches and overrides"). Build: `python recomp/port.py <SERIAL>
-  --no-explore --no-menu --window` (shell setup `. work/t22/env.ps1`).
-  Pilot game details (menu path, autosave prompt, frame numbers): local
-  notes, section "Task details".
-- Memory card in the runtime: `ps2run --memcard <file>` (one card in slot 1,
-  `runtime/src/iop/sio2.cpp`; a missing file starts as a new, unformatted
-  card; the whole file is rewritten on each save, then
-  `g_options.on_memcard_saved`). The cards the runs write are 8,650,752
-  bytes, the size of PCSX2's `.ps2` format (8 MB + ECC); whether the layout
-  matches is *unverified*. `PS2_TRACE_MC=1` traces card commands.
-- `port.py`'s menu run starts from a fresh card each time and its presses
-  turn saving off, so no save has been written or loaded in the port yet.
-- Settings today: `ps2run` flags (`--window`, `--fullscreen`, `--memcard`,
-  `--disc`) and env vars (`PS2_SCALE` 1-3 in `gs/gpu/gpu.cpp`,
-  `PS2_ONE_THREAD`, ...). Aspect is fixed 4:3 until T32.
-- Method from T25-T31: headless runs with `--press` scripts and frame dumps
-  every 50-100 frames (looked at, kept in `work/`); no desktop screenshots.
+- With T31's recipe patches on (default build), the port's frames show the
+  pilot game's 16:9 camera, horizontally squeezed into 4:3 (local notes,
+  "Recipe patches and overrides in the port"). A save state made without the
+  patches keeps the game's 4:3 flag in RAM, so 16:9 checks need a run from
+  boot (or a state made with the patches; T34's menu states in `work/t34/`
+  are patched).
+- 4:3 is fixed in two places of the vendored `runtime/src/gs/gpu/gpu.cpp`:
+  the blit viewport in the present pass (`vw = min(w, h * 4/3)`) and
+  `present` (the `blit` params `vw`, `vh`). Check `host/window.cpp`'s SDL
+  fallback path too. Frame dumps (`dump_frame`, `gs::display`) are the
+  game's own buffer size, not the window's.
+- Launcher (T34): `recomp/play.py <SERIAL>` reads
+  `local/games/<serial>/play.json` (`memcard`, `scale`, `fullscreen`) and
+  passes `PS2_SCALE`; the log shows `[gpu] scale N`. `PS2_SCALE` is clamped
+  to 1-3 in `gpu.cpp`.
+- Speed: race intro ~60 fps paced (~71 unpaced) in the window at scale 1
+  (T28); the VU and render threads are near 100% there.
 
 **Scope:**
-0. Owner approvals: none expected (no downloads or installs). PCSX2 is only
-   read from: if a card made by PCSX2 is needed, use a copy in `work/` with
-   PCSX2's own data folder there (T21/T27 method), never the owner's config.
-1. Save: a scripted headless run from boot (presses in `game.json`
-   `recomp`, a new key such as `save`) that creates a profile and lets the
-   game save to the card; the run ends after the save (`[mc]` log and the
-   card file changed).
-2. Load: a second run on that card reaches the game's load path and loads
-   the save (frames show the saved profile).
-3. Card layout: check the saved card against PCSX2's format (superblock,
-   cluster size, ECC, directory entry of the save); best: PCSX2 with the
-   owner's BIOS loads the port's card and lists the save. Fix in the
-   vendored runtime only if needed (README patch list).
-4. Launcher: `port.py play <SERIAL>` (or a small script next to it) starts
-   `build-window-win/ps2run.exe` on the built port with settings from a
-   local settings file (memory card path, scale, fullscreen; aspect kept
-   for T32), creating it with defaults on first use. Settings file is
-   per-machine and git-ignored (`local/` or `work/`).
-5. Docs: README (`play`, settings keys, `game.json` key), local notes
-   (save/load frames, card check), roadmap, AGENTS.
+0. Owner approvals: none expected.
+1. Aspect: a runtime option (env var or `ps2run` flag) for 16:9
+   presentation; `play.json` key `aspect` (`"4:3"` default, `"16:9"`),
+   added to the defaults in `play.py`. Vendored patch, README list.
+2. Window check (short runs, no desktop screenshots): the window opens with
+   the setting; whatever the runtime can dump to show the presented image
+   (or a short window run with the frame log) proves the 16:9 viewport.
+3. Scale: race intro fps in the window at `PS2_SCALE` 1, 2, 3
+   (`work/t28/threads_window.ps1` pattern), frames at scale 2/3 looked at
+   (sharper, no new artefacts: e.g. half-pixel offsets, post-effect
+   misalignment); whether more than 3 is worth raising the clamp.
+4. Owner check in the window: menus, HUD and a race in 16:9 (no
+   stretching, HUD not cut, no culling at the screen edges; the D12 owner
+   check, now in the port).
+5. Docs: README (setting, scale results), local notes, roadmap, AGENTS.
 
 **Success criteria:**
-- Save written by the port, then loaded by a new run (frames looked at).
-- Card layout compared with PCSX2's (result written down; PCSX2 reads it,
-  or the difference is named).
-- `port.py play <SERIAL>` opens the window port with the saved settings
-  (scale and card path visible in the log); owner check in the window.
-- Existing runs unchanged: menu run reaches the race intro.
+- `aspect: "16:9"` in `play.json` shows the 16:9 image unsqueezed in the
+  window; `"4:3"` is unchanged (frames byte-identical, menu run reaches the
+  race intro with the same cycle count).
+- Scale 2 and 3 measured (fps) and looked at; recommendation written down.
+- Owner check in the window done or listed as pending.
 - No game data and nothing game-specific in git.
 
-**Out of scope:** 16:9 presentation (T32), a settings GUI, save states,
-more than one card slot, the audio clock (T30).
+**Out of scope:** texture packs (T33), HUD fixes beyond what the game's own
+16:9 mode does, the audio clock (T30), speed work (T29).
 
 ## Backlog
 
@@ -75,41 +66,29 @@ with the same level of detail as above. Plan:
 [native-port-plan.md](native-port-plan.md) (D23). Game-specific details of
 each item: `local/games/<serial>/notes.md`, section "Task details".
 
-1. **T32: recomp: widescreen and resolution in the window (Phase 7).**
-   With T31's patches on (the port's frames already show the game's 16:9
-   camera, squeezed into 4:3), present the game's 16:9 output at 16:9
-   (today `gpu.cpp` `present` letterboxes to 4:3), as a setting (T34's
-   settings file); 4:3 stays the default without the recipe. Note: a save
-   state made without the patches keeps the game's 4:3 flag in RAM, so 16:9
-   checks need a run from boot (or a state made with the patches). Check
-   `PS2_SCALE` 2 and 3 on the pilot game:
-   race intro fps in the window, frames looked at (sharper, no new
-   artefacts), whether more than 3 is worth it. Owner check in the window:
-   menus, HUD and a race in 16:9 (no stretching, HUD not cut, no culling at
-   the edges; the D12 owner check, now in the port).
-2. **T33: recomp: texture packs in the GPU renderer (Phase 7).** Replace GS
+1. **T33: recomp: texture packs in the GPU renderer (Phase 7).** Replace GS
    textures with PNGs by our own content hash (decoded texels + CLUT), fed
    by the `textures/` replacements. Find where `gpu.cpp` decodes textures,
    map dump PNGs to hashes offline, upload replacements at the scaled size.
    Check: replaced textures in a race-intro frame, hit/miss counts, fps
    cost. *Unverified:* that the hash is stable across uploads.
 
-3. **T35: mods: disc-file mod folder (Phase 9).** The runtime's disc layer
+2. **T35: mods: disc-file mod folder (Phase 9).** The runtime's disc layer
    (`disc.cpp`/`cdvdfsv.cpp`) serves files from a mods folder before the
    ISO, by disc path. Games that pack files in engine archives need a local
    archive writer (game-specific, in `local/games/<serial>/tools/`). Check
    with a changed text table and one texture, seen in game.
-4. **T14: assets: pilot game mesh format (Phase 9, feeds Phase 8).** Owner:
+3. **T14: assets: pilot game mesh format (Phase 9, feeds Phase 8).** Owner:
    "this can be done later". Decode the pilot game's binary model meshes and
    export one to glTF, checked by a render. Engine-specific: the tool lives
    in `local/games/<serial>/tools/`, not in the repo (D24).
-5. **T36: analysis: pilot game renderer draw lists (Phase 8 start).** From
+4. **T36: analysis: pilot game renderer draw lists (Phase 8 start).** From
    the Ghidra export and the T14 mesh format: how the engine turns meshes,
    materials, matrices and lights into VIF/GS packets; which functions to
    override to draw a model natively next to the GS output. Output: local
    notes and a go/no-go for a native draw path with a concrete goal (model
    replacement, LOD, lighting) the GS path can't meet.
-6. **T29: recomp: speed headroom for racing.** After T28 the race intro is
+5. **T29: recomp: speed headroom for racing.** After T28 the race intro is
    60 fps paced but only ~71 fps unpaced, with the VU and render threads both
    near 100% there (at 60 fps: VU ~83%, render ~80%). Record VU1 programs
    during real gameplay (`PS2_VU_RECORD` / `port.py`) and check how many
@@ -121,7 +100,7 @@ each item: `local/games/<serial>/notes.md`, section "Task details".
    loop, `memcpy` into the rings); `x86-64-v3` builds (AVX2, no FMA, needs
    the owner's OK to drop CPUs without AVX2, D22). Same save-state runs and
    byte-identical frame checks as T25-T28.
-7. **T30: recomp: decouple IOP/SPU2 from the EE clock.** Owner request: audio
+6. **T30: recomp: decouple IOP/SPU2 from the EE clock.** Owner request: audio
    must not depend on the frame rate. Today the EE, IOP and SPU2 share one
    emulated clock, so when the EE falls behind real time the SPU2 makes
    fewer samples and the audio underruns. On a real PS2 the IOP/SPU2 run on
@@ -169,4 +148,5 @@ Results with game-specific numbers: `local/games/<serial>/notes.md`.
 | T27: recomp: owner play test (sound, input, racing) | 2026-10-18 | Black screen after the intro movie = a USB driver handshake timing out (ioman `AddDrv` stub, vendored fix); owner play test: title right after the intro, racing plays well, small menu fps drops (also in PCSX2). Open bits moved to T29 | `284837b` |
 | Plan: re-plan Phases 6-9 | 2026-10-18 | Phase 5 done; D23: build on the vendored runtime and GS renderer; new Phases 6 (hooks, runtime gaps), 7 (look better), 8 (selective native draw paths), 9 (mods, assets); T31-T36 written, T14/T29/T30 reordered | `d5b1db3` |
 | Policy: nothing game-specific in the repo | 2026-10-18 | D24 (owner): per-game recipes, notes and engine-specific tools moved to `local/games/<serial>/`; tools read `local/games/<serial>/game.json`; docs game-neutral | `3eb8a1a` |
-| T31: recomp: function overrides and recipe patches in the port | 2026-10-19 | `port.py` applies the `game.json` patches to the translated ELF (`--no-patches`); `eerecomp --overrides` + runtime `register_override` (vendored patch); pilot game: 16:9 camera in the port, identity override and screen-type override byte-identical, harness override case passes | this commit |
+| T31: recomp: function overrides and recipe patches in the port | 2026-10-19 | `port.py` applies the `game.json` patches to the translated ELF (`--no-patches`); `eerecomp --overrides` + runtime `register_override` (vendored patch); pilot game: 16:9 camera in the port, identity override and screen-type override byte-identical, harness override case passes | `1688122` |
+| T34: recomp: saves and launcher | 2026-10-19 | `port.py --saves`: the pilot game formats the card, saves a new profile, a new boot loads it (frames looked at); the card has PCSX2's `.ps2` layout (superblock byte-identical, ECC right) and the port loads a PCSX2-made save; `recomp/play.py` launches the window port with `local/games/<serial>/play.json` (card, scale, fullscreen); two vendored log lines | this commit |

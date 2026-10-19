@@ -18,7 +18,10 @@ The ISO is linked into work/<serial>/recomp/disc.iso on the first run, so
 
 Usage (WSL; on Windows the same with Windows Python and a Windows ISO path):
   python3 recomp/port.py <SERIAL> --iso "/mnt/c/.../game.iso"
-  python3 recomp/port.py <SERIAL> [--no-explore] [--no-menu] [--no-patches]
+  python3 recomp/port.py <SERIAL> [--no-explore] [--no-menu] [--no-patches] [--saves]
+
+--saves also plays the `recomp.save` run (the game saves to a fresh memory
+card) and the `recomp.load` run (a new boot loads that save).
 """
 
 import argparse
@@ -164,10 +167,12 @@ def build_window_runner(out, generated):
     print(f"window build: {build / 'ps2run'} (run with --window)")
 
 
-def play(runner, elf, iso, out, name, frames, presses, frame_every):
-    """One headless run from boot with a fresh memory card; returns its misses."""
+def play(runner, elf, iso, out, name, frames, presses, frame_every, card_from=None):
+    """One headless run from boot on a fresh memory card (or a copy of card_from); returns its misses."""
     card, misses, shots = out / f"{name}.ps2", out / f"{name}-misses.txt", out / f"{name}-frames"
     card.unlink(missing_ok=True)
+    if card_from:
+        shutil.copy2(card_from, card)
     misses.unlink(missing_ok=True)
     shots.mkdir(exist_ok=True)
     args = [runner, elf, "--disc", iso, "--memcard", card, "--misses", misses, "--frames", str(frames),
@@ -178,6 +183,16 @@ def play(runner, elf, iso, out, name, frames, presses, frame_every):
     run(args, out / f"{name}.log", {**os.environ, "PS2_VU_RECORD": str(out / "vu1")})
     print(f"{name}: {frames} frames in {time.time() - start:.0f} s, frames in {shots}")
     return misses.read_text().split() if misses.exists() else []
+
+
+def check_saves(runner, elf, iso, out, cfg):
+    """The `save` run writes the game's save to a fresh card; the `load` run boots on a copy of it."""
+    save, load = cfg["save"], cfg["load"]
+    play(runner, elf, iso, out, "save", save["frames"], save["presses"], save["frame_every"])
+    if not (out / "save.ps2").exists():
+        sys.exit("The save run wrote no memory card: see save.log and save-frames/")
+    play(runner, elf, iso, out, "load", load["frames"], load["presses"], load["frame_every"], out / "save.ps2")
+    print("save and load runs done: look at save-frames/ and load-frames/")
 
 
 def explore(runner, eerecomp, elf, iso, out, entries, overrides, generated, frames):
@@ -206,6 +221,7 @@ def main():
     ap.add_argument("--no-menu", action="store_true", help="skip the scripted menu run")
     ap.add_argument("--window", action="store_true", help="also build ps2run with the window and GPU renderer (Windows)")
     ap.add_argument("--no-patches", action="store_true", help="translate and run the disc's ELF without the game.json patches")
+    ap.add_argument("--saves", action="store_true", help="also play the game.json save and load runs (memory card check)")
     args = ap.parse_args()
 
     game = json.loads((GAMES_DIR / args.serial / "game.json").read_text(encoding="utf-8"))
@@ -234,6 +250,8 @@ def main():
     if not args.no_menu and "menu" in cfg:
         menu = cfg["menu"]
         play(runner, elf, iso, out, "menu", menu["frames"], menu["presses"], menu["frame_every"])
+    if args.saves:
+        check_saves(runner, elf, iso, out, cfg)
     compile_vu(eerecomp.with_name("vurecomp"), out / "vu1", generated)
     build_runner(out, generated)
     if args.window:
