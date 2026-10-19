@@ -2,7 +2,10 @@
 #include "../gs.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -10,9 +13,12 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace ps2::gs::texpack {
 
@@ -21,8 +27,6 @@ namespace {
 namespace fs = std::filesystem;
 
 fs::path g_pack_dir, g_dump_dir;
-std::unordered_map<std::uint64_t, fs::path> g_index;
-std::unordered_map<std::uint64_t, std::unique_ptr<Image>> g_loaded;
 std::unordered_set<std::uint64_t> g_dumped;
 
 std::uint64_t mix(std::uint64_t h, std::uint64_t v) {
@@ -337,6 +341,62 @@ bool read_png(const fs::path &path, Image &img) {
     return true;
 }
 
+// Pack images are decoded by loader threads from the start, so the render thread
+// finds them ready instead of stalling on a PNG at a scene change (T53).
+struct Slot {
+    fs::path path;
+    std::unique_ptr<Image> image;
+    bool claimed = false, done = false;
+};
+// Filled before the loaders start, never resized after.
+std::unordered_map<std::uint64_t, Slot> g_index;
+std::vector<Slot *> g_order;
+std::atomic<std::size_t> g_next{0}, g_decoded{0};
+std::chrono::steady_clock::time_point g_start;
+std::mutex g_mutex;
+std::condition_variable g_loaded;
+
+void load(Slot &slot) {
+    auto image = std::make_unique<Image>();
+    if (!read_png(slot.path, *image)) {
+        std::fprintf(stderr, "[tex] cannot read %s (8-bit RGB/RGBA PNG expected)\n", slot.path.string().c_str());
+        image.reset();
+    }
+    {
+        std::lock_guard lock(g_mutex);
+        slot.image = std::move(image);
+        slot.done = true;
+    }
+    g_loaded.notify_all();
+    if (++g_decoded == g_index.size())
+        std::fprintf(stderr, "[tex] pack decoded in %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count());
+}
+
+bool claim(Slot &slot) {
+    std::lock_guard lock(g_mutex);
+    return !std::exchange(slot.claimed, true);
+}
+
+struct Loaders {
+    std::vector<std::thread> threads;
+    std::atomic<bool> stop{false};
+    ~Loaders() {
+        stop = true;
+        for (std::thread &t : threads) t.join();
+    }
+} g_loaders;
+
+void start_loaders() {
+    g_start = std::chrono::steady_clock::now();
+    for (auto &[key, slot] : g_index) g_order.push_back(&slot);
+    const unsigned count = std::max(1u, std::thread::hardware_concurrency() / 4);
+    for (unsigned i = 0; i < count; ++i)
+        g_loaders.threads.emplace_back([] {
+            for (std::size_t n; !g_loaders.stop && (n = g_next++) < g_order.size();)
+                if (claim(*g_order[n])) load(*g_order[n]);
+        });
+}
+
 std::string name(std::uint64_t key) {
     char s[24];
     std::snprintf(s, sizeof s, "%016llx.png", static_cast<unsigned long long>(key));
@@ -353,9 +413,10 @@ bool init() {
             const std::string stem = e.path().stem().string();
             char *end = nullptr;
             const std::uint64_t key = std::strtoull(stem.c_str(), &end, 16);
-            if (stem.size() == 16 && *end == 0 && e.path().extension() == ".png") g_index[key] = e.path();
+            if (stem.size() == 16 && *end == 0 && e.path().extension() == ".png") g_index[key].path = e.path();
         }
         std::fprintf(stderr, "[tex] pack %s: %zu textures%s\n", dir, g_index.size(), ec ? " (folder not readable)" : "");
+        start_loaders();
     }
     if (const char *dir = std::getenv("PS2_TEX_DUMP"); dir && *dir) {
         g_dump_dir = dir;
@@ -462,13 +523,12 @@ std::uint64_t combine(std::uint64_t texels, std::uint64_t palette) { return texe
 const Image *find(std::uint64_t key) {
     const auto it = g_index.find(key);
     if (it == g_index.end()) return nullptr;
-    auto [slot, fresh] = g_loaded.try_emplace(key);
-    if (fresh) {
-        auto img = std::make_unique<Image>();
-        if (read_png(it->second, *img)) slot->second = std::move(img);
-        else std::fprintf(stderr, "[tex] cannot read %s (8-bit RGB/RGBA PNG expected)\n", it->second.string().c_str());
-    }
-    return slot->second.get();
+    Slot &slot = it->second;
+    // Not decoded yet: decode or wait here, so what is drawn never depends on timing.
+    if (claim(slot)) load(slot);
+    std::unique_lock lock(g_mutex);
+    g_loaded.wait(lock, [&] { return slot.done; });
+    return slot.image.get();
 }
 
 void dump(std::uint64_t key, const std::uint32_t *w, const std::uint32_t *clut) {

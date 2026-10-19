@@ -77,7 +77,8 @@ matching the VU path.
 - No game data and nothing game-specific in git.
 
 **Out of scope:** car meshes (T47); the GPU mesh path (T48); the menu
-dips (T53); changing what the engine draws (LOD, parts).
+GPU-bound menu screens (T54); changing what the engine draws (LOD,
+parts).
 
 ## Backlog
 
@@ -90,22 +91,19 @@ section "Task details". Each item is one session; split it if it is bigger.
 
 Phase 8 (native draw paths, D32):
 
-1. **T53: recomp: menu dips (pack loads, GPU-bound screens).** Owner sees
-   dips in the menus (D33); T45 found two causes left after its pacing
-   fix (local notes "Draw profile and frame-time log"): (a) texture pack
-   PNGs decoded on the render thread at first use: 50-800 ms stalls at
-   scene changes and loading screens; move the decode off the render
-   thread (a loader thread, or preload a pack's index of keys seen in
-   the dump run) so the render thread never waits for a file, without
-   changing what is drawn once the image is in (frames with the pack
-   byte-identical after the load; a not-yet-loaded image draws the
-   original texture for those frames, or the decision is the owner's);
-   (b) menu screens GPU-bound at scale 3 (~20 ms per frame waiting in
-   the surface acquire): find which draws cost the GPU there (wgpu
-   timestamps per dispatch kind, `gpu.cpp` profile mode) and fix if
-   small. Check with `PS2_FRAME_LOG` on the T45 menu state
-   (`work/t45/menu_state/s5850.state`, `win.ps1`) and more menu screens
-   (garage, car select, options).
+1. **T54: recomp: full-screen pass cost at scale 3 (owner pick).** T53
+   found the last menu dips at scale 3 GPU-bound (~40 ms GPU per frame,
+   ~8 at scale 1): the pilot's title fade-in (~50 frames after the T45
+   menu state) and career-menu fade-out (~23 frames) draw the full screen
+   many times per frame (local notes "Menu dips (T53)"). Options for the
+   owner: (a) accept (under 1 s each, at transitions); (b) a raster fast
+   path for full-screen sprite/copy batches (one prim per tile, no
+   per-entry loop; frames byte-identical); (c) check whether the game
+   loops more per frame than on a PS2 because the port's GS costs no
+   emulated time (*assumption*), then charge GS fill time or patch the
+   loop (game-specific, local). Measure with the T53 method (queue wait
+   before the acquire, per-dispatch submit + wait; the pass timestamps
+   are not reliable on the owner's GPU).
 2. **T47: recomp: lit car mesh handler.** The pilot's car meshes through
    the T46 seam: lighting (lights and ambient from VU1 memory), the
    envmap pass if the program has one, wheels and blur variants; frames
@@ -243,4 +241,5 @@ Results with game-specific numbers: `local/games/<serial>/notes.md`.
 | T14: assets: pilot game mesh format | 2026-10-19 | Done before T40 (owner AFK, T40 waits for a game pick). Local tools (D24): mesh decoder + glTF export, glTF checker/software renderer; mesh files are ready-made VIF DMA chains (triangle strips with ADC restarts, 12-bit fixed-point ST, int16 normals, float positions) per material, plus a part hierarchy and name-hashed materials/textures; every mesh in the car archives parses; two stock cars exported (glTF structure and buffer sizes checked), renders match the cars in the port's frames, texture text reads the right way round; unverified: a few header fields, stock part selection, right-wheel turn | `26692a4` |
 | T43: conversion tool without PCSX2 | 2026-10-19 | D30 (owner): no PCSX2 in the tool or its skills. `port.py --textures` (and `init --textures`) dumps the exploration's textures and upscales them (`upscale.py --out --junk-groups`, new pixel-noise check `fine_retention`) into `local/games/<serial>/textures/`, copied into the port folder (`settings.json` `"textures": "textures"`); pilot scratch init: 774 dumps, 442 upscaled, 429 replaced in the menu run (T33: 51), init 13 min, frames sharper with road grain kept, alpha right; boot path `cdrom0:\<ELF>;1` as `argv[0]` in every mode (vendored `system.cpp`): frames unchanged, ISO and folder cycles now equal (52,595,993,647, re-recorded); skills: `/port-game` single entry point (textures, widescreen, hangs, report), `/diagnose-hang` on port traces + analysis export (`pcsx2_log.py` removed), `/find-widescreen` port-only (pnach optional), `/texture-pack` on port dumps; `tools/gltfview.py` + test moved from local; T44 (mesh export options) in backlog | `e51cf7b` |
 | T36: analysis: renderer draw lists (Phase 8 start) | 2026-10-19 | Local profiler build (VIF1 cost per DMA call target, VU1 per program entry, GS front end per path; same cycles) + chain fingerprints from a RAM dump: the pilot engine sends matrices, lights and material state per object, then calls the mesh's static VIF chain; racing frame: pre-lit static meshes ~32%, root list ~18%, car meshes ~16%; two VU1 program paths 95% of VU1 time; window racing at owner settings 59-62 fps (2 s samples), render thread ~80% at scale 3; D31 (owner: Phases 8, 9, then fully native, then other games), D32 (go: handlers at the chain calls, then a GPU mesh path; est. -70% VU thread, -35% render thread); racing save state; backlog re-ordered (T45-T52, T40 after fully native) | `7542466` |
-| T45: recomp: draw-list profiler and frame-time log (Phase 8) | 2026-10-19 | Opt-in `PS2_DRAW_PROFILE` (headless: VIF1 per DMA call target, VU1 per entry, GS per path) + `recomp/drawlist.py` (kinds by VIF fingerprint, share of the frame, `--match` names chains in a folder's files; unit test): T36 shares within a point; window `PS2_FRAME_LOG` (`play.json` `frame_log`): per-frame time and EE/VU/render waits, limit, summary; window pacing by timer with audio correction (menus: presents 2-30 → 13-20 ms apart); menu dips (owner: menus, D33) = pacing bursts (fixed), texture pack loads on the render thread, GPU-bound menu screens at scale 3 (T53); unset: frames and cycles unchanged | this commit |
+| T45: recomp: draw-list profiler and frame-time log (Phase 8) | 2026-10-19 | Opt-in `PS2_DRAW_PROFILE` (headless: VIF1 per DMA call target, VU1 per entry, GS per path) + `recomp/drawlist.py` (kinds by VIF fingerprint, share of the frame, `--match` names chains in a folder's files; unit test): T36 shares within a point; window `PS2_FRAME_LOG` (`play.json` `frame_log`): per-frame time and EE/VU/render waits, limit, summary; window pacing by timer with audio correction (menus: presents 2-30 → 13-20 ms apart); menu dips (owner: menus, D33) = pacing bursts (fixed), texture pack loads on the render thread, GPU-bound menu screens at scale 3 (T53); unset: frames and cycles unchanged | `1450207` |
+| T53: recomp: menu dips (pack loads off the render thread) | 2026-10-19 | Texture pack images decoded by loader threads from the start (pilot pack 1.3 s), a lookup decodes or waits so frames never depend on timing: window menu run at scale 3 max frame 782 → 73 ms, frames over 33 ms 31 → 8, p99 32.6 → 28.1 ms; race intro max 194 → 40 ms; frames with the pack byte-identical, no pack 107/107 and same cycles; options, dialogs and main menu clean (max 21.5 ms); GPU-bound fade screens at scale 3 found (game draws the full screen many times per frame, ~40 ms GPU), not fixed: T54, owner pick | this commit |

@@ -379,8 +379,9 @@ PSMCT24, PSMCT16, PSMT8, PSMT4, any wrap mode but region repeat.
 in PCSX2 dumps and `textures/` output), exactly 1, 2, 4 or 8 times the
 texture's TW×TH (the dump's size); other sizes are ignored. The raster shader
 samples the image at its own resolution (nearest, or bilinear when the game
-asks for it; wrap and clamp at the image's resolution). Images are decoded on
-first use (own PNG reader, no new library) and kept in a GPU buffer (up to
+asks for it; wrap and clamp at the image's resolution). Images are decoded
+(own PNG reader, no new library) by loader threads from the start (T53,
+below) and kept in a GPU buffer (up to
 1 GiB; when full the buffer is flushed and refilled). Mipmaps: the renderer
 only samples level 0, so packs hold base levels only.
 
@@ -390,7 +391,8 @@ who already have PCSX2 replacements, `python textures/pack.py <SERIAL>
 matched to a PCSX2 dump by pixels and the replacement of the match is
 copied as `<key>.png` into `local/games/<SERIAL>/textures/`.
 
-The log shows `[tex] pack <folder>: N textures` at start and, at exit,
+The log shows `[tex] pack <folder>: N textures` at start, `[tex] pack
+decoded in X s` when every image is decoded and, at exit,
 `[tex] lookups N: replaced R, render targets D, unsupported U, untagged T;
 textures K (replaced L)` (lookups = texture setups the renderer built).
 
@@ -507,6 +509,40 @@ drain below 80 ms, which released frames in bursts of the audio device's
 pulls: in calm menus presents came 2-30 ms apart (p5/p95) at a 60 fps
 mean; now 13-20 ms.
 
+### Menu dips (T53)
+
+**Pack loads off the render thread.** With a pack, the render thread used
+to decode a PNG the first time a texture appeared: 50-800 ms stalls at
+scene changes and loading screens. Now `texpack::init` starts loader
+threads (a quarter of the hardware threads, at least one) that decode the
+whole pack in the background (pilot pack, 517 images, ~1 GB decoded:
+1.3 s with 4 threads); `[tex] pack decoded in X s` marks the end. A
+lookup of an image not decoded yet decodes it on the render thread (as
+before) or waits for the loader that has it, so what is drawn never
+depends on timing: frames with a pack are byte-identical to the previous
+build, same cycles. Memory: the decoded pack stays in RAM (as before once
+every image had been met). Without a pack nothing starts.
+
+Check (pilot, window, scale 3, 16:9, pack; same states and presses
+before/after): menu run max frame 782 → 73 ms, frames over 33 ms 31 → 8,
+p99 32.6 → 28.1 ms; race intro max 194 → 40 ms, over 33 ms 8 → 1; menu
+run headless with the pack, 120 frames byte-identical; without a pack
+107/107 frames and 52,595,993,647 cycles.
+
+**GPU-bound screens at scale 3 (not fixed).** Some menu screens draw the
+full screen many times per frame (pilot: a title fade-in ~22 rounds of
+upload + ~6 full-screen passes, a menu fade-out 64 rounds of 3 full-screen
+copy/fill passes). The generic raster shader then needs ~40 ms of GPU per
+frame at scale 3 (~8 ms at scale 1), so the surface acquire waits. Found
+by waiting for the queue before the acquire (GPU time) and timing each
+dispatch alone (submit + wait): the per-pass timestamps of
+`PS2_GPU_PROFILE` read far too low on the pilot machine (a 5 MB copy in
+1.6 µs), so they cannot rank dispatches there. *Assumption:* the game
+redraws as fast as the EE allows while it loads, and the port's GS
+costs no emulated time, so it loops more often per frame than a real GS
+could fill (55 M pixels per frame in the fade-out). Options are in
+`docs/tasks.md`.
+
 ### Patches and overrides (T31)
 
 **Patches:** the top-level `game.json` `patches` (the Phase 4 recipe, see
@@ -580,6 +616,7 @@ except:
 | `runtime/src/dispatch.cpp` (`g_reached`, `write_coverage`), `runtime/include/ps2/system.hpp`, `runtime/src/system.cpp` (`run()`) | Code coverage (T39): with `PS2_COVERAGE=<file>`, dispatch marks each EE RAM address it enters translated code at (one byte per word), and `run()` writes the marked addresses (hex, one per line) at exit. The exploration's progress signal. Unset: one extra test of an empty vector per dispatch; frames and cycle counts unchanged. |
 | `runtime/src/draw_profile.cpp`, `draw_profile.hpp` (new), `CMakeLists.txt`, `runtime/src/dmac.cpp` (`run_chain`, `start`, channel 2), `runtime/src/vif.cpp` (`run_vu`), `runtime/src/gs/gif.cpp` (`transfer`), `runtime/src/system.cpp` (`vblank`) | Draw profile (T45): `PS2_DRAW_PROFILE=<from>,<count>` times VIF1 tags per DMA `call` target, VU1 runs per entry and GIF paths 1/2 per target, headless only; `[draw]` lines after the last frame. Unset: one test of a false flag per VIF1 tag, VU1 run and GIF packet; frames and cycles unchanged. |
 | `runtime/src/gs/queue.hpp`, `queue.cpp` (`time_waits`, `wait_began`, `wait_ended`, `waited_ms`, `wait` kind), `runtime/src/gs/gs.cpp`, `gs.hpp` (`post_present(frame)`, `presented_frame`), `runtime/src/system.cpp`, `runtime/include/ps2/system.hpp` (wrappers, present timed), `host/window.cpp` (`PS2_FRAME_LOG`, `pace`) | Frame-time log (T45): time each thread waits by kind (only after `time_waits()`, i.e. with `PS2_FRAME_LOG`); the present carries its guest frame in the queue header. Pacing: timer-spaced frames with an audio-queue correction instead of waiting for the audio queue (window only; headless unchanged). |
+| `runtime/src/gs/gpu/texpack.cpp` (`Slot`, `load`, `claim`, `start_loaders`, `find`) | Pack loader threads (T53): with `PS2_TEXTURES` set, `init` starts threads that decode every pack image; `find` decodes or waits for an image not decoded yet, so frames do not depend on timing. Without a pack nothing starts; frames and cycles unchanged. |
 
 The headless Windows build (T22) needs no changes to upstream: the headless path
 leaves out `host/window.cpp` (SDL2), `host/profile.cpp` (Linux only) and the
