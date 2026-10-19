@@ -8,7 +8,7 @@ and are created with defaults on first use:
   memcard     memory card file for slot 1 (relative to the repo or absolute)
   scale       GPU internal resolution, 1-3 (PS2_SCALE)
   fullscreen  start fullscreen (F11 toggles in the window)
-  aspect      "4:3" or "16:9" (PS2_ASPECT; 16:9 for a game in its own widescreen mode)
+  aspect      "4:3" or "16:9" (PS2_ASPECT); default: game.json recomp.aspect when patches are on
   textures    texture pack folder (PS2_TEXTURES, relative to the repo or absolute); "" = off
 
 Usage:
@@ -24,9 +24,9 @@ import sys
 from port import BUILD_SUFFIX, GAMES_DIR, REPO, WORK_DIR
 
 
-def load_settings(serial):
+def load_settings(serial, aspect):
     path = GAMES_DIR / serial / "play.json"
-    defaults = {"memcard": f"local/games/{serial}/memcard.ps2", "scale": 1, "fullscreen": False, "aspect": "4:3", "textures": ""}
+    defaults = {"memcard": f"local/games/{serial}/memcard.ps2", "scale": 1, "fullscreen": False, "aspect": aspect, "textures": ""}
     if not path.exists():
         path.write_text(json.dumps(defaults, indent=2) + "\n")
         print(f"created {path} with defaults")
@@ -39,7 +39,8 @@ def main():
     args = ap.parse_args()
 
     game = json.loads((GAMES_DIR / args.serial / "game.json").read_text(encoding="utf-8"))
-    settings = load_settings(args.serial)
+    # A widescreen patch makes the game draw 16:9; a 4:3 window would squeeze it.
+    settings = load_settings(args.serial, game.get("recomp", {}).get("aspect", "4:3") if game.get("patches") else "4:3")
     out = WORK_DIR / args.serial / "recomp"
     runner = out / f"build-window{BUILD_SUFFIX}" / "ps2run"
     elf = out / ("patched" if game.get("patches") else "disc") / game["disc"]["elf"]

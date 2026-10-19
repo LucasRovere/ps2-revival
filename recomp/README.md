@@ -48,6 +48,7 @@ them (D21, T25). Programs not recorded run on the VU1 interpreter;
 | Key | Meaning |
 |---|---|
 | `entries` | Extra entry points, the runtime's miss format (hex without `0x`; `module:offset` for modules) |
+| `aspect` | `"16:9"` when the recipe patches put the game in its own widescreen mode: `play.py`'s default `aspect` |
 | `explore_frames` | Frames per exploring run (presses: start at 300, cross every 300) |
 | `menu` | Optional scripted run from boot: `frames`, `frame_every`, `presses` (`frame:button[+button][:hold]`) |
 | `overrides` | Optional `{"0x00123456": "name"}`: guest function entry → our C++ function `name` (below) |
@@ -104,7 +105,7 @@ git-ignored), created with defaults on first use:
 | `memcard` | `local/games/<SERIAL>/memcard.ps2` | Slot 1 card file (relative to the repo or absolute) |
 | `scale` | `1` | GPU internal resolution 1-3 (`PS2_SCALE`) |
 | `fullscreen` | `false` | Start fullscreen (F11 toggles) |
-| `aspect` | `"4:3"` | `"16:9"` presents the image at 16:9 (`PS2_ASPECT`), for a game running its own widescreen mode (e.g. through recipe patches) |
+| `aspect` | `game.json` `recomp.aspect` when patches are on, else `"4:3"` | `"16:9"` presents the image at 16:9 (`PS2_ASPECT`), for a game running its own widescreen mode (e.g. through recipe patches) |
 | `textures` | `""` | Texture pack folder (`PS2_TEXTURES`, relative to the repo or absolute), e.g. `local/games/<SERIAL>/textures`; `""` = off (below) |
 
 Keys missing from an older `play.json` take the defaults. The log shows
