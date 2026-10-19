@@ -6,74 +6,69 @@ fits in one session.
 
 ## Next task
 
-### T39: conversion tool: automatic exploration
+### T40: conversion tool: second-game trial
 
-**Goal:** Conversion tool step (c) (D26): the exploring runs drive a game
-through its intro, title and menus with generated input and stop or
-change tactics when it is stuck, with no hand-written press script. They
-record the VU1 programs of the scenes they reach (D21) and find missed
-entry points, so `port.py init` gives a port folder whose common scenes
-run on compiled VU1 code.
+**Goal:** Conversion tool step (d) (D26): run a second game from the
+owner's discs through the whole tool (`port.py init`, automatic
+exploration, port folder) with no game-specific help, and record what
+works and what breaks. Measures how generic the tool is (D6) and turns
+each break into a task.
 
 **Context:**
-- T38 done: `port.py init <iso> [--serial S]` writes `game.json`
-  (`recomp.entries: []`, `explore_frames: 3600`) and `notes.md`, then runs
-  the pipeline to the port folder (~5 min for the pilot disc). Found
-  entries are written into `game.json` (`add_entries`).
-- `explore()` in `recomp/port.py` today: one fixed pattern (start at 300,
-  cross every 300) for `explore_frames`, repeated until a round finds no
-  new entry. On the pilot game 3600 frames stay in the intro movies:
-  no VU1 program recorded, so the build runs VU1 on the interpreter. The
-  hand-written `recomp.menu` reaches title, name entry, menus, loading
-  screen and race intro (local notes, "Task details", "For T39").
-- Tools in `ps2run`: `--press frame:button[+button][:hold]` (scripted
-  input), `--frames-dir`/`--frame-every` (PPM dumps), `--misses`,
-  `--save-state frame:file` / `--load-state file`, `PS2_VU_RECORD=<dir>`
-  (one `.bin` per new VU1 program). Buttons: see `parse_press` in
-  `runtime/src/system.cpp`. All input is fixed before the run starts;
-  reacting to frames needs either short runs chained by save states or a
-  runtime hook (vendored patch, listed in the README).
-- Stalls to detect: identical (or black) frames for N seconds; no new
-  VU1 programs or entries for a long stretch; a run that halts. Reference
-  stall: the T27 post-intro black screen (`recomp/README.md`, ioman
-  `AddDrv`).
-- Windows: `. work/t22/env.ps1` (local/MACHINE.md). Baselines and
-  scripts: `work/t38/` (`run.ps1 <tag> 100`); cycle counts depend on the
-  ELF's host path (T37 note in `recomp/README.md`).
+- T38: `port.py init <iso> [--serial S]` reads serial, boot ELF and CRC
+  from the disc, writes `local/games/<serial>/game.json` and `notes.md`
+  (never overwritten) and builds the port folder `work/<serial>/port/`.
+- T39 (D28): the exploration plays `explore_frames` (18,000 for a new
+  game) with generated press patterns in 600-frame segments chained by
+  save states; progress = at least 25 new functions entered
+  (`PS2_COVERAGE`), a new VU1 program or a missed entry point; stalled
+  segments are retried with other patterns; missed entries are translated
+  and VU1 programs compiled during the run. Log: one line per try and a
+  summary; scenes in `work/<serial>/recomp/explore-frames/`, last segment
+  (state, card, frames, log) in `explore/`. Pilot baseline: `init` 8 min,
+  race intro reached, every VU1 program the scripted run meets (local
+  notes, "For T40").
+- Known weak spots: a direction pattern kept after a menu choice can
+  wreck the next screen (pilot: name entry, several thousand frames lost);
+  the memory card is not in save states (a card write less than 50 frames
+  before a segment end is lost); dual-layer discs keep layer-1 files in
+  `sectors.bin` (untested); the pilot needed two runtime fixes (SIF bind
+  wait, ioman `AddDrv`), a second game may need others (method:
+  `--trace-syscalls`, `--trace-iop-hle`, PCSX2 IOP log, see the T27 row
+  and `recomp/README.md`).
+- Windows toolchain: `. work/t22/env.ps1` (local/MACHINE.md).
 
 **Scope:**
-0. Owner approvals: none expected (no downloads).
-1. Generated input for the exploring runs: button patterns that get past
-   intros, title prompts and menus (e.g. start/cross bursts, directions
-   plus cross, back-outs with circle/triangle), chosen per segment.
-   Segments chained with save states (or a small runtime hook) so a
-   segment can be retried with another pattern.
-2. Stall detection from frame dumps: identical/black frames for N
-   seconds, no new VU1 programs; a stalled segment switches pattern; the
-   run ends after a frame budget or when nothing new shows up.
-3. `port.py` uses it in `explore()` (and so in `init`); the hand-written
-   `recomp.menu` stays as an option. Report per run: scenes reached
-   (frames kept), VU1 programs recorded, entries found.
-4. Tests: unit tests for the pure parts (stall detection on synthetic
-   frames, pattern choice), no game data in fixtures.
-5. Docs: `recomp/README.md`, local notes, roadmap, AGENTS current state,
-   this file (Done row).
+0. **Owner input needed first:** the owner picks one of their games and
+   puts its ISO path into `local/MACHINE.md` ("Discs"). Ideally a game
+   with a different engine and publisher than the pilot game. No downloads.
+1. `port.py init <iso>` on it (serial from the disc, or `--serial`).
+   Record every failure in its `local/games/<serial>/notes.md`: disc
+   reading, translation (errors, unresolved targets), build, boot,
+   exploration (scenes reached, stalls, halts, missed entries), VU1
+   programs, folder build, a short window run (frame dumps, not
+   screenshots; never fullscreen).
+2. Fix what is small and generic inside the tool (`port.py`,
+   `explore.py`, runtime patches listed in `recomp/README.md`); anything
+   bigger becomes a backlog task with a concrete failure description.
+3. Pilot game unchanged: its scripted menu run gives the same frames and
+   cycles as before (T39 `work/t39/run.ps1 <tag> 100`, 107 frames).
+4. Docs: what worked and broke (game-neutral) in `recomp/README.md` and
+   `docs/roadmap.md`, game findings in the game's local notes, new tasks
+   in this file.
 
 **Success criteria:**
-- Pilot game, scratch onboarding (`port.py init <iso> --serial
-  TEST-00001`, deleted afterwards) with no script: the exploring runs
-  reach at least the scenes the menu script reaches (title, menus, a
-  loading screen, race intro; frames looked at) and record at least the
-  VU1 programs those scenes use (compare with the pilot's `vu1/`).
-- A forced stall (e.g. a run that never presses start) is detected and
-  left by another pattern.
-- Existing `port.py <SERIAL>` runs with `recomp.menu` unchanged (pilot
-  menu run: same frames and cycles as T38).
-- Full `init` time stays reasonable (report it).
-- No game data and nothing game-specific in git.
+- The second game went through `init` once; its notes list each stage
+  with worked / broke and the evidence (logs, frames looked at).
+- Each break has a fix in this change or a backlog task with enough
+  detail to start.
+- Pilot scripted menu run unchanged; unit tests pass.
+- No game data and nothing game-specific in git (`git grep -i` for the
+  new game's title and serial before committing).
 
-**Out of scope:** the second game itself (T40), gameplay beyond the first
-race intro (driving, winning), image recognition of menu text, recipes.
+**Out of scope:** making the second game fully playable when that needs
+large runtime work (becomes tasks), patches or widescreen for it, texture
+packs, the agent skills (T41).
 
 ## Backlog
 
@@ -85,12 +80,7 @@ details". Each item is one session; split it if it is bigger.
 
 Conversion tool (D26), in this order:
 
-1. **T40: conversion tool: second-game trial.** Needs owner input: the
-   owner picks one of their games. Run it through `port.py init` and the
-   folder build; record every failure in its local notes. Output: what
-   worked, what broke, and new tasks for the breaks. Measures how generic
-   the tool is (D6).
-2. **T41: conversion tool: agent skills.** Game-neutral skills in
+1. **T41: conversion tool: agent skills.** Game-neutral skills in
    `.claude/skills/` from what was manual: `/port-game` (onboard, build,
    run, triage), `/diagnose-hang` (syscall/SIF traces, compare with a
    PCSX2 IOP log: the method that found the pilot game's post-intro
@@ -100,7 +90,7 @@ Conversion tool (D26), in this order:
 
 Phase 9 / Phase 8 (after the conversion tool):
 
-3. **T42: mods: mod folder over the disc files (was T35).** A mods folder
+2. **T42: mods: mod folder over the disc files (was T35).** A mods folder
    whose files replace folder files by disc path at runtime, without
    touching the port folder; files that grow get a new sector range (past
    the end of the disc) and the lookup returns it. Launcher key `mods`.
@@ -110,11 +100,11 @@ Phase 9 / Phase 8 (after the conversion tool):
    and the game's own lookups read the records from `sectors.bin`).
    Check on the pilot game: a changed text table and a texture inside the
    game's archives (local tool rebuilds the archive entry), seen in frames.
-4. **T14: assets: pilot game mesh format (Phase 9, feeds Phase 8).** Owner:
+3. **T14: assets: pilot game mesh format (Phase 9, feeds Phase 8).** Owner:
    "this can be done later". Decode the pilot game's binary model meshes and
    export one to glTF, checked by a render. Engine-specific: the tool lives
    in `local/games/<serial>/tools/`, not in the repo (D24).
-5. **T36: analysis: pilot game renderer draw lists (Phase 8 start).** From
+4. **T36: analysis: pilot game renderer draw lists (Phase 8 start).** From
    the Ghidra export and the T14 mesh format: how the engine turns meshes,
    materials, matrices and lights into VIF/GS packets; which functions to
    override to draw a model natively next to the GS output. Output: local
@@ -130,7 +120,7 @@ Texture work (small, owner-driven, open from T33):
 
 Parked by the owner:
 
-6. **T29: recomp: speed headroom for racing.** After T28 the race intro is
+5. **T29: recomp: speed headroom for racing.** After T28 the race intro is
    60 fps paced but only ~71 fps unpaced, with the VU and render threads both
    near 100% there (at 60 fps: VU ~83%, render ~80%). Record VU1 programs
    during real gameplay (`PS2_VU_RECORD` / `port.py`) and check how many
@@ -142,7 +132,7 @@ Parked by the owner:
    loop, `memcpy` into the rings); `x86-64-v3` builds (AVX2, no FMA, needs
    the owner's OK to drop CPUs without AVX2, D22). Same save-state runs and
    byte-identical frame checks as T25-T28.
-7. **T30: recomp: decouple IOP/SPU2 from the EE clock.** Owner request: audio
+6. **T30: recomp: decouple IOP/SPU2 from the EE clock.** Owner request: audio
    must not depend on the frame rate. Today the EE, IOP and SPU2 share one
    emulated clock, so when the EE falls behind real time the SPU2 makes
    fewer samples and the audio underruns. On a real PS2 the IOP/SPU2 run on
@@ -196,4 +186,5 @@ Results with game-specific numbers: `local/games/<serial>/notes.md`.
 | T33: recomp: texture packs in the GPU renderer | 2026-10-19 | Packs of `<key>.png` (`play.json` `textures`, `PS2_TEXTURES`), dump mode `PS2_TEX_DUMP`, `textures/pack.py` (PCSX2 replacements via pixel match); key from per-column upload hashes (D25), stable across frames and runs; replaced textures seen in frames (solid test pack, real upscales); no pack = byte-identical frames and cycles; window 60 fps with a pack, +1.6-2 ms/frame headless; Phase 7 items done | `e86061b` |
 | Plan: conversion tool track | 2026-10-19 | D26 (owner): end goal ISO → native Windows game, automated per game; final intent fully native; estimates at agent pace (Phases 0–7 ≈ 30 h); conversion tool track (T37–T41) before Phases 8–9; T35 merged into T37/T42 | `7c67840` |
 | T37: conversion tool: standalone folder build | 2026-10-19 | `port.py --folder` writes a port folder (window exe, ELF, disc files + `layout.txt` + `sectors.bin`, D27; rebuilds the ISO byte for byte); runtime folder backend (`--disc <dir>`) and no-argument folder mode (vendored patch); `play.py` uses the folder; pilot game: menu run frames and cycles as the ISO run, window run with no ISO reaches the race intro, a same-size string edit in a folder copy shows in frames | `c1532bd` |
-| T38: conversion tool: one-command onboarding | 2026-10-19 | `port.py init <iso> [--serial S]`: serial, ELF, CRC from the disc, `game.json` + `notes.md` written (never overwritten), pipeline to the port folder (found entries saved); folder `settings.json` (from `play.json` or recipe defaults, kept once written) read by `ps2run` in folder mode (vendored patch); pilot disc under a scratch serial: one command, ~5 min, title/menus/race intro in frames, generated C++ = unpatched translation; pilot runs unchanged | this commit |
+| T38: conversion tool: one-command onboarding | 2026-10-19 | `port.py init <iso> [--serial S]`: serial, ELF, CRC from the disc, `game.json` + `notes.md` written (never overwritten), pipeline to the port folder (found entries saved); folder `settings.json` (from `play.json` or recipe defaults, kept once written) read by `ps2run` in folder mode (vendored patch); pilot disc under a scratch serial: one command, ~5 min, title/menus/race intro in frames, generated C++ = unpatched translation; pilot runs unchanged | `06bb71c` |
+| T39: conversion tool: automatic exploration | 2026-10-19 | `recomp/explore.py` + `port.py` `Explorer`: generated press patterns in 600-frame segments chained by save states; progress = new functions entered (vendored `PS2_COVERAGE` list, D28), new VU1 programs or missed entries; stalled segments retried with other patterns, VU1 programs compiled mid-run; pilot game with no script (scratch `init`, 8 min): intro, menus, card dialogs, loading screen, race intro, every VU1 program the scripted run meets; pilot menu run unchanged | this commit |

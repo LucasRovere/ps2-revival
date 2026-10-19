@@ -1,10 +1,11 @@
 """Port a game with the vendored ps2-web-recomp (WSL or Windows).
 
 Reads the `recomp` block of local/games/<serial>/game.json. Builds the tools,
-translates the boot ELF to C++, builds the native runner, runs the game
-headless to find missed entry points (adding them and translating again),
-then plays the scripted menu run. The runs record the VU1 microprograms they
-meet; `vurecomp` turns them into C++ and the runner is rebuilt with them.
+translates the boot ELF to C++, builds the native runner, explores the game
+headless with generated input (explore.py, T39; missed entry points are added
+and translated), then plays the scripted menu run if game.json has one. The
+runs record the VU1 microprograms they meet; `vurecomp` turns them into C++
+and the runner is rebuilt with them.
 Everything goes to work/<serial>/recomp/.
 
 The game.json `patches` words are applied to a copy of the ELF (original
@@ -36,6 +37,7 @@ points found by exploring go into game.json.
 """
 
 import argparse
+import collections
 import datetime
 import json
 import os
@@ -52,8 +54,8 @@ WORK_DIR = REPO / "work"
 UPSTREAM = REPO / "recomp" / "ps2-web-recomp"
 OVERRIDES_DIR = REPO / "recomp" / "overrides"
 EXPLORE_ROUNDS = 8
-# One minute at NTSC, the pilot game's value (it ends inside the intro movies there; T39).
-DEFAULT_EXPLORE_FRAMES = 3600
+# Five minutes at NTSC: room for intro movies, title and menus (T39).
+DEFAULT_EXPLORE_FRAMES = 18000
 # Separate build dirs so the WSL and Windows builds don't clobber each other.
 BUILD_SUFFIX = "-win" if os.name == "nt" else ""
 # Windows window build (T23): official prebuilt releases, git-ignored under tools/bin.
@@ -65,6 +67,7 @@ sys.path.insert(0, str(REPO / "patches"))
 from build import apply_writes, check_writes  # noqa: E402
 from extract import boot_path, parse_system_cnf, pcsx2_crc  # noqa: E402
 from iso9660 import SECTOR, Iso  # noqa: E402
+import explore as ex  # noqa: E402
 
 
 def run(cmd, log=None, env=None):
@@ -285,22 +288,140 @@ def check_saves(runner, elf, iso, out, cfg):
     print("save and load runs done: look at save-frames/ and load-frames/")
 
 
-def explore(runner, eerecomp, elf, iso, out, entries, overrides, generated, frames):
-    """Runs the game until a run finds no new entry points (port.sh's loop)."""
-    presses = ["300:start"] + [f"{f}:cross" for f in range(600, frames, 300)]
-    found = []
-    for round_ in range(1, EXPLORE_ROUNDS + 1):
-        known = set(entries.read_text().split())
-        new = sorted({m for m in play(runner, elf, iso, out, "explore", frames, presses, 300)} - known)
-        print(f"round {round_}: {len(new)} new entry points")
-        if not new:
-            break
-        found += new
-        with open(entries, "a") as f:
-            f.write("".join(m + "\n" for m in new))
-        translate(eerecomp, elf, entries, overrides, generated)
-        runner = build_runner(out, generated)
-    return found
+def explore_runner(out, generated):
+    """The headless runner the exploring runs use: on Windows the window build (it draws on the GPU,
+    menus ~20x faster than the CPU rasterizer), else the native build."""
+    if os.name == "nt" and SDL2_DIR.exists() and WGPU_DIR.exists():
+        return build_window_runner(out, generated) / "ps2run"
+    return build_runner(out, generated)
+
+
+def run_segment(runner, elf, iso, out, seg, start, end, presses, state, card):
+    """One exploring segment: frames start..end from a save state (or boot), on a copy of card.
+    Returns (misses, code entered, halt reason or None when the run reached its end)."""
+    shutil.rmtree(seg, ignore_errors=True)
+    (seg / "frames").mkdir(parents=True)
+    if card.exists():
+        shutil.copy2(card, seg / "card.ps2")
+    args = [runner, elf, "--disc", iso, "--memcard", seg / "card.ps2", "--misses", seg / "misses.txt",
+            "--frames", str(end + 1), "--save-state", f"{end}:{seg / 'state'}",
+            "--frames-dir", seg / "frames", "--frame-every", str(ex.SHOT_EVERY)]
+    if state:
+        args += ["--load-state", state]
+    for p in presses:
+        args += ["--press", p]
+    run(args, seg / "run.log", {**os.environ, "PS2_VU_RECORD": str(out / "vu1"), "PS2_COVERAGE": str(seg / "code.txt")})
+    read = lambda name: (seg / name).read_text().split() if (seg / name).exists() else []
+    halt = re.findall(r"\[ee\] halted: (.*)", (seg / "run.log").read_text(errors="replace"))
+    return read("misses.txt"), set(read("code.txt")), None if (seg / "state").exists() else (halt or ["no state saved"])[0]
+
+
+# One pattern's run over one segment: its dir, whether it made progress, how many functions it entered
+# first, the frames and signatures of its new scenes, and every function it entered.
+Try = collections.namedtuple("Try", "pattern seg progress new_code shots sigs code")
+
+
+class Explorer:
+    """Plays `frames` frames with generated input (explore.py): segments chained by save states, a
+    stalled segment retried with other patterns. A run that stops at a missed entry point gets it
+    translated and runs again; new VU1 programs are compiled in as they come. Keeps the new scenes of
+    segments that made progress in explore-frames/."""
+
+    def __init__(self, build, eerecomp, elf, iso, out, entries, overrides, generated):
+        self.build, self.eerecomp, self.elf, self.iso, self.out = build, eerecomp, elf, iso, out
+        self.entries, self.overrides, self.generated = entries, overrides, generated
+        self.work, self.kept, self.vu1 = out / "explore", out / "explore-frames", out / "vu1"
+        self.card = self.work / "card.ps2"
+        self.code, self.scenes, self.found, self.programs = set(), [], [], set(self.vu1.glob("*.bin"))
+        self.rounds = 0
+
+    def __call__(self, frames):
+        """Returns the entry points found."""
+        for d in (self.work, self.kept):
+            shutil.rmtree(d, ignore_errors=True)
+            d.mkdir()
+        self.runner = self.build()
+        state, last, stalls, turn, frame, begin = None, 0, 0, 0, 0, time.time()
+        programs = compiled = len(self.programs)
+        while frame < frames and stalls < ex.MAX_STALLS:
+            end = min(frame + ex.SEGMENT, frames)
+            chosen = self.segment(frame, end, state, ex.pattern_order(last, turn))
+            if not chosen:
+                print(f"frames {frame}-{end}: every pattern halted, exploring stops")
+                break
+            stalls = 0 if chosen.progress or chosen.shots else stalls + 1
+            if not chosen.progress:
+                turn += ex.TRIES - 1
+                print(f"frames {frame}-{end}: stalled, going on with {ex.PATTERNS[chosen.pattern][0]}"
+                      + ("" if chosen.shots else f" (nothing new on screen: {stalls} of {ex.MAX_STALLS})"))
+            self.keep(chosen)
+            if len(self.programs) > compiled:
+                compile_vu(self.eerecomp.with_name("vurecomp"), self.vu1, self.generated)
+                self.runner, compiled = self.build(), len(self.programs)
+            last, frame, state = chosen.pattern, end, chosen.seg / "state"
+        print(f"explored {frame} frames in {time.time() - begin:.0f} s: {len(list(self.kept.iterdir()))} scenes in {self.kept},"
+              f" {len(self.code)} functions entered, {len(self.programs) - programs} new VU1 programs (in {self.vu1}),"
+              f" {len(self.found)} new entry points")
+        return self.found
+
+    def segment(self, start, end, state, order):
+        """Tries the patterns in order until one makes progress. Returns its Try, else the one that entered
+        the most new code; None if all halted."""
+        chosen = None
+        for p in order:
+            tried = self.attempt(p, start, end, state)
+            if tried and (not chosen or tried.new_code > chosen.new_code):
+                chosen = tried
+            if tried and tried.progress:
+                chosen = tried
+                break
+        if chosen:
+            self.code |= chosen.code
+            self.scenes += chosen.sigs
+        return chosen
+
+    def attempt(self, p, start, end, state):
+        """One pattern over one segment; None if it halted."""
+        name = ex.PATTERNS[p][0]
+        seg, new_entries = self.work / f"{end:06d}-{name}", []
+        while True:
+            misses, code, halt = run_segment(self.runner, self.elf, self.iso, self.out, seg, start, end,
+                                             ex.presses(ex.PATTERNS[p], start, end), state, self.card)
+            new = sorted(set(misses) - set(self.entries.read_text().split()))
+            if not new or self.rounds == EXPLORE_ROUNDS:
+                break
+            print(f"frames {start}-{end} {name}: {len(new)} new entry points, translating again")
+            self.rounds += 1
+            new_entries += new
+            with open(self.entries, "a") as f:
+                f.write("".join(m + "\n" for m in new))
+            translate(self.eerecomp, self.elf, self.entries, self.overrides, self.generated)
+            self.runner = self.build()
+        self.found += new_entries
+        new_programs = set(self.vu1.glob("*.bin")) - self.programs
+        self.programs |= new_programs
+        if halt:
+            print(f"frames {start}-{end} {name}: halted: {halt}")
+            return None
+        shots = sorted((seg / "frames").glob("*.ppm"))
+        sigs = [ex.signature(s.read_bytes()) for s in shots]
+        new_scenes = ex.new_scenes(sigs, list(self.scenes))
+        new_code = code - self.code
+        print(f"frames {start}-{end} {name}: {len(new_code)} new functions, {len(new_programs)} new VU1 programs,"
+              f" {len(new_entries)} new entry points, {len(new_scenes)} new scenes", flush=True)
+        return Try(p, seg, not ex.stalled(new_code, new_programs, new_entries), len(new_code),
+                   [shots[i] for i in new_scenes], [sigs[i] for i in new_scenes], code)
+
+    def keep(self, chosen):
+        """The chosen try's card and state carry on; its new scene frames go to explore-frames/ when it
+        made progress."""
+        for s in chosen.shots if chosen.progress else []:
+            shutil.copy2(s, self.kept / s.name)
+        if (chosen.seg / "card.ps2").exists():
+            shutil.copy2(chosen.seg / "card.ps2", self.card)
+        for d in self.work.iterdir():
+            if d.is_dir() and d != chosen.seg:
+                shutil.rmtree(d)
 
 
 def add_entries(serial, found):
@@ -404,7 +525,8 @@ def port(args, save_entries=False):
     install_overrides(args.serial, cfg.get("overrides", {}), generated)
     runner = build_runner(out, generated)
     if not args.no_explore:
-        found = explore(runner, eerecomp, elf, iso, out, entries, overrides, generated, cfg["explore_frames"])
+        found = Explorer(lambda: explore_runner(out, generated), eerecomp, elf, iso, out, entries, overrides,
+                         generated)(cfg["explore_frames"])
         if found and save_entries:
             add_entries(args.serial, found)
         elif found:

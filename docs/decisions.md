@@ -572,3 +572,25 @@ an in-place edit.
 **Revisit if:** files must grow or be added (T42: relocation past the end
 of the disc), or a dual-layer disc needs its layer-1 files unpacked (today
 they stay in `sectors.bin`; untested).
+
+## D28: Exploration progress is new code, not new frames
+
+**Decision (T39, 2026-10-19):** the automatic exploration judges a segment
+by the code the game runs: progress is at least 25 function entries never
+entered before (the runtime's `PS2_COVERAGE` list, a vendored patch), a new
+VU1 program or a missed entry point. Frame dumps only give the scenes for
+the report and end a run that shows nothing new on screen (black, frozen or
+repeated frames).
+
+**Why:** the first version used frame novelty (whole frames, then the still
+parts of a segment). On the pilot game the menus sit on looping videos, so
+every frame looked new while the input went round a menu and a dialog for
+10,000 frames; still-layer comparisons were too noisy (translucent boxes,
+blown-out video). New code separates the cases: a loop re-runs the same
+functions (a trickle of 1-47 new ones per segment from video and idle
+paths), a new screen or mode enters 25-2,000. It needs no image recognition
+and works for any game the recompiler runs.
+
+**Revisit if:** a game's menus enter so little new code that 25 misses
+real screens (then the threshold goes per game or relative), or the
+coverage check costs measurable speed.

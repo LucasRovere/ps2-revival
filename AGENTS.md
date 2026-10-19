@@ -146,6 +146,10 @@ in the vendored code under `recomp/` (D23); no separate `runtime/` or
   overwrites; runs the pipeline to the port folder, found entries saved).
   The folder's `settings.json` (from `play.json` or recipe defaults, kept
   once written) sets aspect/scale/pack/card for a double-click start.
+- Conversion tool (D26): `port.py --folder` port folder (T37, D27),
+  `port.py init <iso>` one-command onboarding (T38), automatic exploration
+  with generated input and new-code progress (T39, D28; `recomp/explore.py`):
+  the pilot game reaches its race intro with no script.
 - Repo policy (D24): nothing game-specific in git; recipes, notes and
   game-specific code in `local/games/<serial>/`.
 - Phases 6–9 re-planned (D23): build on the vendored runtime and GS renderer;

@@ -20,6 +20,8 @@ std::uint32_t g_origin = 0;
 std::uint32_t g_unit_size = 1;
 std::set<std::uint32_t> g_misses;
 std::set<std::string> g_module_misses;
+// PS2_COVERAGE: one flag per EE RAM word, set when dispatch enters translated code there.
+std::vector<std::uint8_t> g_reached;
 
 constexpr std::uint32_t kModuleMagic = 0x32524E53u;
 
@@ -98,6 +100,15 @@ void register_units(const UnitInfo *units, std::uint32_t count) {
     g_unit_size = g_units.front().size;
     g_index.assign((g_units.back().base - g_origin) / g_unit_size + 1, nullptr);
     for (const UnitInfo &u : g_units) g_index[(u.base - g_origin) / g_unit_size] = &u;
+    if (std::getenv("PS2_COVERAGE")) g_reached.assign(kRamSize / 4, 0);
+}
+
+void write_coverage() {
+    const char *path = std::getenv("PS2_COVERAGE");
+    if (!path || g_reached.empty()) return;
+    std::ofstream out(path);
+    for (std::uint32_t i = 0; i < g_reached.size(); ++i)
+        if (g_reached[i]) out << std::hex << (i << 2) << "\n";
 }
 
 void register_modules(const ModuleInfo *modules, std::uint32_t count) {
@@ -142,6 +153,7 @@ void dispatch(Cpu &c, std::uint32_t, std::uint32_t depth) {
         c.pc = pc | kUnwind;
         return;
     }
+    if (!g_reached.empty() && pc < kRamSize) g_reached[pc >> 2] = 1;
     u->function(c, id, depth);
 }
 

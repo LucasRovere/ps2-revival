@@ -397,6 +397,7 @@ int run() {
     kernel::dump();
     iop::dump();
     sif::dump();
+    write_coverage();
     if (const char *peek = std::getenv("PS2_PEEK")) {
         std::uint32_t at = 0, len = 0;
         if (std::sscanf(peek, "%x,%x", &at, &len) == 2)

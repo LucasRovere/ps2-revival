@@ -26,14 +26,15 @@ Reads `SYSTEM.CNF`, the boot ELF and its CRC from the disc; the serial
 comes from the boot ELF's name (`ABCD_123.45` → `ABCD-12345`), else
 `--serial` is needed. Writes `local/games/<serial>/game.json` (`serial`,
 `title` = serial, `disc.elf`, `disc.crc`, `recomp.entries: []`,
-`recomp.explore_frames: 3600`) and `notes.md` (template of
+`recomp.explore_frames: 18000`) and `notes.md` (template of
 [games.md](../docs/games.md), identity filled in). If either exists it stops
 and changes nothing. Then it runs `port.py <serial> --iso <iso> --folder`:
 link, translate, exploring runs (entry points found are written into
 `game.json`), VU1 compile, window build, port folder. Last line: where the
 folder is (`work/<serial>/port/ps2run.exe`, double-click). No menu run (a new
-game has no `recomp.menu`), so only the VU1 programs the exploring runs met
-are compiled; the rest run on the interpreter until a later run records them.
+game has no `recomp.menu`): the automatic exploration (T39, below) drives the
+game through its intro and menus, and the VU1 programs it meets are compiled;
+the rest run on the interpreter until a later run records them.
 
 Windows (T22): same command with Windows Python 3.12 and a Windows ISO path.
 Needs LLVM (clang++), CMake, Ninja and the Visual Studio 2022 Build Tools
@@ -58,9 +59,9 @@ SDL). Without `--window` it runs headless but still draws on the GPU;
 runs upstream's `setup.sh`/`port.sh` (they download wgpu-native and emsdk).
 Steps: extract the boot ELF from the ISO, apply the `game.json` `patches`
 (below), build `eerecomp`, translate,
-build `ps2run` (headless, CPU rasterizer), exploring runs that add missed
-entry points and translate again (upstream `port.sh`'s loop), the
-scripted menu run, then `vurecomp` on the VU1 microprograms the runs
+build `ps2run` (headless, CPU rasterizer), the automatic exploration
+(below; it adds missed entry points and translates again, like upstream
+`port.sh`'s loop), the scripted menu run, then `vurecomp` on the VU1 microprograms the runs
 recorded (`PS2_VU_RECORD`, into `vu1/`) and a rebuild of the runners with
 them (D21, T25). Programs not recorded run on the VU1 interpreter;
 `PS2_VU_INTERPRET=1` forces the interpreter for all (for comparisons). Reads the `recomp` block of `local/games/<SERIAL>/game.json`:
@@ -69,7 +70,7 @@ them (D21, T25). Programs not recorded run on the VU1 interpreter;
 |---|---|
 | `entries` | Extra entry points, the runtime's miss format (hex without `0x`; `module:offset` for modules) |
 | `aspect` | `"16:9"` when the recipe patches put the game in its own widescreen mode: `play.py`'s default `aspect` |
-| `explore_frames` | Frames per exploring run (presses: start at 300, cross every 300) |
+| `explore_frames` | Frames the automatic exploration plays from boot (below) |
 | `menu` | Optional scripted run from boot: `frames`, `frame_every`, `presses` (`frame:button[+button][:hold]`) |
 | `overrides` | Optional `{"0x00123456": "name"}`: guest function entry → our C++ function `name` (below) |
 | `save`, `load` | Optional scripted runs for `--saves` (same keys as `menu`, below) |
@@ -77,9 +78,72 @@ them (D21, T25). Programs not recorded run on the VU1 interpreter;
 Output (game-derived, never commit): `work/<SERIAL>/recomp/`: `generated/`
 (C++, incl. `vu1_*.cpp`, `overrides.cpp` and copies of the override
 sources), `patched/` (the patched ELF), `vu1/` (recorded VU1 program
-images), `build-tools/`, `build-native/`, `explore.log`/`menu.log`,
-`*-frames/` (PPM), memory cards. New entry points found by exploring are
+images), `build-tools/`, `build-native/`, `explore/` (the exploration's
+last segment: state, card, frames, log), `explore-frames/` (its new
+scenes), `menu.log`, `*-frames/` (PPM), memory cards. New entry points found by exploring are
 printed; add them to `entries` (`init` writes them itself).
+
+### Automatic exploration (T39)
+
+The exploring run plays `explore_frames` frames from boot with generated
+input, no script (`explore.py` + `Explorer` in `port.py`). It is cut into
+segments of 600 frames chained by save states (`--save-state`,
+`--load-state`); each segment is one `ps2run` process with one press pattern:
+`cross`, `start`+`cross`, a direction+`cross` (down, up, right, left),
+`circle`+`triangle` (back out), or a seeded random mix, a press every 40
+frames.
+
+**Progress** is new code: the runtime lists every function entry dispatch
+enters (`PS2_COVERAGE=<file>`, vendored patch below), and a segment that
+enters at least 25 functions never entered before, records a new VU1
+program or misses an entry point made progress. Frames do not decide
+progress: menus often sit on a looping video or 3D background, so their
+frames always look new even when the input goes in a circle (the pilot
+game's first menu and a memory card dialog looped for 10,000 frames that
+way). A **stalled** segment is retried from its start state with two other
+patterns (the next ones in the list, rotating with each stall, so stalls in
+a row try every pattern); the run goes on with the try that made progress,
+else the one that entered the most new code. A pattern that made progress
+is kept for the next segment.
+
+**Frames** (dumped every 30 frames) give the scenes: a frame is a new scene
+when its 16×12 block luma differs from every scene so far by more than
+0.025 (black frames never count). New scenes of segments that made
+progress are kept in `explore-frames/`. The run ends at `explore_frames` or
+after 5 stalled segments in a row whose frames were all black, frozen or
+already seen (a hang such as the T27 black screen; a movie still shows new
+frames, so the run waits it out).
+
+**Entry points:** a segment that halts at a missed entry point gets it
+added to `entries.txt`, translated, the runner rebuilt and the segment run
+again (8 rounds at most); `init` writes them into `game.json`. **VU1:** new
+programs (`PS2_VU_RECORD`) are compiled with `vurecomp` and the runner
+rebuilt after the segment that met them, so the following segments (and
+gameplay) run them compiled. On Windows the exploration uses the window
+build headless (GPU renderer, menus ~20× faster than the CPU rasterizer);
+in WSL the native build.
+
+The log prints one line per try (`frames A-B pattern: N new functions, V
+new VU1 programs, E new entry points, S new scenes`), stalls, and a summary
+(`explored F frames in T s: scenes, functions entered, new VU1 programs,
+new entry points`). The hand-written `recomp.menu` run still plays after
+it when `game.json` has one.
+
+Check (pilot game, scratch serial through `port.py init`, no script,
+18,000 frames; frames looked at): the exploration skipped the intro movies
+(`cross` does not skip them: that try stalled, `start` took over), went
+through the first menu, memory card dialogs, profile creation and name
+entry, the save prompts (the game formatted the fresh card and saved), a
+mode menu, a loading screen and the race intro: the scenes of the pilot's
+hand-written menu run. A scripted menu run on the explored build
+with `PS2_VU_RECORD` on recorded no program the exploration had missed.
+In an earlier version without the 25-function threshold, `cross` alone sat
+at the title for 6,000 frames until `start` was tried; with it the stall is
+left in the next segment. `init` took 8 min (exploring ~5 min). The pilot's
+scripted menu run is byte-identical with `PS2_COVERAGE` on and off (same
+cycle count). Weak spot: a direction pattern kept after a menu choice typed
+into the name entry for several thousand frames before another pattern got
+out (two full runs reached the race intro at ~9,000 and ~15,000 frames).
 
 ### Saves (T34)
 
@@ -359,6 +423,7 @@ except:
 | `runtime/src/gs/gpu/texpack.cpp`, `texpack.hpp` (new), `gpu.cpp` (upload tags, `replacement` in the setup cache, `g_repl` binding 8, plan_decodes skips replaced setups, `[tex]` stats), `gpu.hpp` (`texture_dump`), `gs.wgsl` (`sample_repl`), `gs.cpp` (`cpu_memory`: CPU copy of GS memory for the dump), `CMakeLists.txt` (texpack.cpp) | Texture packs (T33, D25): setup word 24 = `0x80000000 | log2(scale) << 29 | offset/16` points the raster shader at a pack image instead of GS memory. Without `PS2_TEXTURES`/`PS2_TEX_DUMP` the new code does not run and frames and cycle counts are unchanged. |
 | `runtime/src/disc.cpp` (`open`, folder backend), `host/main.cpp` (no-ELF folder mode) | Port folder (T37, D27): `disc::open` on a directory reads `layout.txt`, `disc/` and `sectors.bin` through the existing `Reader` hook; one `[disc] folder/image backend` log line. `ps2run` without an ELF argument takes the ELF named in `disc/SYSTEM.CNF`, the disc and `memcard.ps2` from its own folder, and opens the window when started with no arguments. ISO runs: frames and cycle counts unchanged. |
 | `host/main.cpp` (`apply_folder_settings`) | Folder settings (T38): in folder mode `settings.json` next to `ps2run` sets `PS2_ASPECT`, `PS2_SCALE`, `PS2_TEXTURES` (only when not already set), the card, and fullscreen for a no-argument start. Runs with an ELF argument are unchanged. |
+| `runtime/src/dispatch.cpp` (`g_reached`, `write_coverage`), `runtime/include/ps2/system.hpp`, `runtime/src/system.cpp` (`run()`) | Code coverage (T39): with `PS2_COVERAGE=<file>`, dispatch marks each EE RAM address it enters translated code at (one byte per word), and `run()` writes the marked addresses (hex, one per line) at exit. The exploration's progress signal. Unset: one extra test of an empty vector per dispatch; frames and cycle counts unchanged. |
 
 The headless Windows build (T22) needs no changes to upstream: the headless path
 leaves out `host/window.cpp` (SDL2), `host/profile.cpp` (Linux only) and the
@@ -394,6 +459,7 @@ python recomp/tests/oracle.py [--mode rec interp ...]     # Windows: vectors on 
 | `tests/harness.py` | ELF writer, runs `eerecomp` per case, builds and runs the harness, compares with `ref.py`; `OVERRIDE_CASE`: a function reached through `jal` and `jalr` runs its override (`harness/override.cpp`) both times and returns to the caller |
 | `tests/oracle.py` | One test ELF for all eligible vectors, run on PCSX2 (own data folder in `work/`), end states parsed from the EE console log |
 | `tests/test_port.py` | `port.py`'s pure parts: serial from the boot ELF name, default `game.json`, refusal to overwrite, folder `settings.json` |
+| `tests/test_explore.py` | `explore.py` on synthetic frames: frame signature, black/frozen/repeated frames are not new scenes, stall rule, pattern order (stalls in a row try every pattern), generated presses |
 | `tests/harness/` | C++ harness (`main.cpp`: load state, `dispatch`, print state as JSON), `override.cpp` (the override case's C++) and its CMake project (links upstream `ps2runtime`) |
 
 Harness output (fixture C++, build): `work/recomp-tests/`.

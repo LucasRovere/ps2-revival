@@ -65,6 +65,7 @@ std::uint64_t scheduled_at(int event);
 bool preempt(Cpu &c);
 
 bool has_code(std::uint32_t pc);
+void write_coverage();
 void raise_intc(unsigned cause);
 void request_reschedule();
 void request_iop_sync();
