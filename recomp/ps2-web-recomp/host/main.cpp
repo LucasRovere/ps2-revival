@@ -63,13 +63,14 @@ void default_env(const char *name, const std::string &value) {
 #endif
 }
 
-// settings.json next to ps2run (written by port.py --folder): aspect, scale, textures, memcard, fullscreen.
+// settings.json next to ps2run (written by port.py --folder): aspect, scale, textures, mods, memcard, fullscreen.
 bool apply_folder_settings(const std::filesystem::path &dir) {
     std::ifstream in(dir / "settings.json");
     const std::string json((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     default_env("PS2_ASPECT", setting(json, "aspect"));
     default_env("PS2_SCALE", setting(json, "scale"));
     if (const auto textures = setting(json, "textures"); !textures.empty()) default_env("PS2_TEXTURES", (dir / textures).string());
+    if (const auto mods = setting(json, "mods"); !mods.empty()) default_env("PS2_MODS", (dir / mods).string());
     if (const auto card = setting(json, "memcard"); !card.empty()) ps2::g_options.memcard_path = (dir / card).string();
     return setting(json, "fullscreen") == "true";
 }

@@ -51,14 +51,15 @@ class FolderSettingsTest(unittest.TestCase):
 
     def test_defaults(self):
         self.assertEqual(folder_settings(self.GAME, True, None),
-                         {"aspect": "16:9", "scale": 1, "fullscreen": False, "textures": "", "memcard": "memcard.ps2"})
+                         {"aspect": "16:9", "scale": 1, "fullscreen": False, "textures": "", "mods": "", "memcard": "memcard.ps2"})
         self.assertEqual(folder_settings(self.GAME, False, None)["aspect"], "4:3")
 
     def test_play_json(self):
-        play = {"memcard": "local/x.ps2", "scale": 3, "aspect": "4:3", "textures": "local/pack"}
+        play = {"memcard": "local/x.ps2", "scale": 3, "aspect": "4:3", "textures": "local/pack", "mods": "local/mods"}
         settings = folder_settings(self.GAME, True, play)
         self.assertEqual((settings["scale"], settings["aspect"], settings["memcard"]), (3, "4:3", "memcard.ps2"))
         self.assertEqual(settings["textures"], str(REPO / "local/pack"))
+        self.assertEqual(settings["mods"], str(REPO / "local/mods"))
 
 
 if __name__ == "__main__":

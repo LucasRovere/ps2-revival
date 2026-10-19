@@ -191,6 +191,7 @@ git-ignored), created with defaults on first use:
 | `fullscreen` | `false` | Start fullscreen (F11 toggles) |
 | `aspect` | `game.json` `recomp.aspect` when patches are on, else `"4:3"` | `"16:9"` presents the image at 16:9 (`PS2_ASPECT`), for a game running its own widescreen mode (e.g. through recipe patches) |
 | `textures` | `""` | Texture pack folder (`PS2_TEXTURES`, relative to the repo or absolute), e.g. `local/games/<SERIAL>/textures`; `""` = off (below) |
+| `mods` | `""` | Mod folder (`PS2_MODS`, relative to the repo or absolute): replacement disc files ([Mods](#mods-t42)); `""` = off |
 
 Keys missing from an older `play.json` take the defaults. The log shows
 `settings: ...`, `[gpu] scale N`, `[gpu] aspect W:H` and
@@ -220,14 +221,14 @@ work\<SERIAL>\port\ps2run.exe          # or double-click it; no ISO needed
 | `settings.json` | Picture settings for a start in folder mode (T38, below) |
 
 `settings.json` (flat JSON) is written once from `play.json` (`aspect`,
-`scale`, `fullscreen`, `textures`; a repo-relative pack becomes absolute)
+`scale`, `fullscreen`, `textures`, `mods`; a repo-relative pack or mod folder becomes absolute)
 or, without one, the defaults (`aspect` as `play.py` picks it: the recipe's
 `recomp.aspect` when patches are on, else `"4:3"`; scale 1; not
-fullscreen; no pack), plus `"memcard": "memcard.ps2"` (the folder's own
+fullscreen; no pack, no mods), plus `"memcard": "memcard.ps2"` (the folder's own
 card). An existing file is kept (`settings kept: ...`), so edit it by hand.
 `ps2run` in folder mode reads it: `aspect` → `PS2_ASPECT`, `scale` →
-`PS2_SCALE`, `textures` → `PS2_TEXTURES` (relative to the folder or
-absolute), `memcard` (same; `--memcard` still wins); environment variables
+`PS2_SCALE`, `textures` → `PS2_TEXTURES`, `mods` → `PS2_MODS` (both
+relative to the folder or absolute), `memcard` (same; `--memcard` still wins); environment variables
 already set win over the file (that is how `play.py` keeps `play.json`).
 `fullscreen: true` only applies to a start with no arguments
 (double-click). Without the file the defaults are as before (4:3, scale 1).
@@ -246,7 +247,8 @@ it opens the window. The log says `[disc] folder backend: <dir>` or
 
 Editing a file in `disc/` in place changes what the game reads, as long as
 the file keeps its size (the disc's directory records keep the old size).
-Limits: files that grow, new files and a mod overlay are T42; layer-1 files
+To change files without touching the folder, or to let them grow: a mod
+folder ([Mods](#mods-t42)). Limits: layer-1 files
 of a dual-layer disc are not unpacked (they stay in `sectors.bin`; no
 dual-layer disc tested). The exe needs the Microsoft Visual
 C++ 2015-2022 runtime (`MSVCP140.dll`, `VCRUNTIME140.dll`), already present
@@ -266,6 +268,52 @@ Note: on Windows `boot()` passes the host ELF path as the guest's `argv[0]`
 (its `cdrom0:\NAME;1` conversion skips paths with a `:`, and `C:` has one),
 so the cycle count depends on the length of the ELF's path. Not changed
 (upstream behaviour; changing it changes ISO-run cycle counts).
+
+### Mods (T42)
+
+`PS2_MODS=<folder>` (`mods` in `play.json` or in the port folder's
+`settings.json`) replaces disc files at runtime. The mod folder holds
+replacement files at their disc paths: `<mods>/DATA/FILE.BIN` replaces
+`DATA/FILE.BIN` (case does not matter). The port folder and the ISO stay
+untouched; it works in ISO and folder mode.
+
+For a modder:
+
+1. Make a folder, e.g. `local/games/<SERIAL>/mods/` (game data, never
+   commit).
+2. Copy the disc file to change from `work/<SERIAL>/port/disc/` into it at
+   the same relative path, and edit the copy. It may grow or shrink.
+3. Set `"mods": "local/games/<SERIAL>/mods"` in `play.json` and run
+   `python recomp/play.py <SERIAL>`. Or, for the port folder alone, add
+   `"mods": "<path>"` to its `settings.json` (relative to the folder or
+   absolute). Or set `PS2_MODS` for any `ps2run` run.
+
+A file that fits the original's sectors is read at the original's place; a
+bigger one gets new sectors past the end of the disc. The new sector and
+size are written into the file's directory record in the sectors the game
+reads, and the runtime's file index is rebuilt from them. So both the
+runtime's lookups (`sceCdSearchFile`, `cdrom0:` opens, IRX loads) and a game
+that parses directories itself see the new file. Files not on the disc are
+skipped with a log line (they would need a new directory record). The log:
+
+```
+[mods] DATA/FILE.BIN: 123456 bytes at sector 400000 (moved past the disc end)
+[mods] <folder>: N files
+```
+
+A game that reads a file by sector numbers stored in its own data (not by a
+lookup) would still read the old place; for such a file a mod must keep its
+size (unverified: not met yet). Files inside a game's own archives need an
+engine-specific tool that rebuilds the archive (D24: in
+`local/games/<serial>/tools/`).
+
+Check (pilot game, menu run from boot, ISO and folder mode): without
+`PS2_MODS` frames and cycles are unchanged (107/107). A same-size archive
+(text entry recompressed in place, a texture's palette changed) and a grown
+archive pair (both entries appended: two data files moved past the disc
+end, their index files changed in place) both show the new loading-screen
+text and banner colours in frames; the run goes on to the race intro. The
+folder still rebuilds the ISO byte for byte afterwards.
 
 ### Widescreen and resolution (T32)
 
@@ -422,7 +470,8 @@ except:
 | `runtime/src/gs/gpu/gpu.cpp` (blit viewport in `submit`, `present`), `host/window.cpp` (window size, SDL logical size) | 16:9 presentation (T32): `PS2_ASPECT=16:9` replaces the fixed 4:3 of the blit viewport and the SDL fallback with 16:9 and opens a 1280×720 window; `[gpu] aspect W:H` at GPU start. Unset, the arithmetic is the same as upstream's. |
 | `runtime/src/gs/gpu/texpack.cpp`, `texpack.hpp` (new), `gpu.cpp` (upload tags, `replacement` in the setup cache, `g_repl` binding 8, plan_decodes skips replaced setups, `[tex]` stats), `gpu.hpp` (`texture_dump`), `gs.wgsl` (`sample_repl`), `gs.cpp` (`cpu_memory`: CPU copy of GS memory for the dump), `CMakeLists.txt` (texpack.cpp) | Texture packs (T33, D25): setup word 24 = `0x80000000 | log2(scale) << 29 | offset/16` points the raster shader at a pack image instead of GS memory. Without `PS2_TEXTURES`/`PS2_TEX_DUMP` the new code does not run and frames and cycle counts are unchanged. |
 | `runtime/src/disc.cpp` (`open`, folder backend), `host/main.cpp` (no-ELF folder mode) | Port folder (T37, D27): `disc::open` on a directory reads `layout.txt`, `disc/` and `sectors.bin` through the existing `Reader` hook; one `[disc] folder/image backend` log line. `ps2run` without an ELF argument takes the ELF named in `disc/SYSTEM.CNF`, the disc and `memcard.ps2` from its own folder, and opens the window when started with no arguments. ISO runs: frames and cycle counts unchanged. |
-| `host/main.cpp` (`apply_folder_settings`) | Folder settings (T38): in folder mode `settings.json` next to `ps2run` sets `PS2_ASPECT`, `PS2_SCALE`, `PS2_TEXTURES` (only when not already set), the card, and fullscreen for a no-argument start. Runs with an ELF argument are unchanged. |
+| `host/main.cpp` (`apply_folder_settings`) | Folder settings (T38): in folder mode `settings.json` next to `ps2run` sets `PS2_ASPECT`, `PS2_SCALE`, `PS2_TEXTURES` (only when not already set), the card, and fullscreen for a no-argument start. Runs with an ELF argument are unchanged. T42: `mods` → `PS2_MODS`. |
+| `runtime/src/disc.cpp` (`apply_mods`, `index_disc`) | Mods (T42): with `PS2_MODS` set, `disc::open` wraps the reader: replacement files over the original sectors or past the disc end, new LBA/size written into the directory records as read, index rebuilt, `[mods]` log lines. Without `PS2_MODS`: frames and cycle counts unchanged. |
 | `runtime/src/dispatch.cpp` (`g_reached`, `write_coverage`), `runtime/include/ps2/system.hpp`, `runtime/src/system.cpp` (`run()`) | Code coverage (T39): with `PS2_COVERAGE=<file>`, dispatch marks each EE RAM address it enters translated code at (one byte per word), and `run()` writes the marked addresses (hex, one per line) at exit. The exploration's progress signal. Unset: one extra test of an empty vector per dispatch; frames and cycle counts unchanged. |
 
 The headless Windows build (T22) needs no changes to upstream: the headless path

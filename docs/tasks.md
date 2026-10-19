@@ -90,21 +90,11 @@ Conversion tool (D26), in this order:
 
 Phase 9 / Phase 8 (after the conversion tool):
 
-2. **T42: mods: mod folder over the disc files (was T35).** A mods folder
-   whose files replace folder files by disc path at runtime, without
-   touching the port folder; files that grow get a new sector range (past
-   the end of the disc) and the lookup returns it. Launcher key `mods`.
-   Builds on the T37 folder backend (`runtime/src/disc.cpp`, D27): a mod
-   file of the same size is one more span over the original's sectors; a
-   larger one needs a new LBA and a changed directory record (the index
-   and the game's own lookups read the records from `sectors.bin`).
-   Check on the pilot game: a changed text table and a texture inside the
-   game's archives (local tool rebuilds the archive entry), seen in frames.
-3. **T14: assets: pilot game mesh format (Phase 9, feeds Phase 8).** Owner:
+2. **T14: assets: pilot game mesh format (Phase 9, feeds Phase 8).** Owner:
    "this can be done later". Decode the pilot game's binary model meshes and
    export one to glTF, checked by a render. Engine-specific: the tool lives
    in `local/games/<serial>/tools/`, not in the repo (D24).
-4. **T36: analysis: pilot game renderer draw lists (Phase 8 start).** From
+3. **T36: analysis: pilot game renderer draw lists (Phase 8 start).** From
    the Ghidra export and the T14 mesh format: how the engine turns meshes,
    materials, matrices and lights into VIF/GS packets; which functions to
    override to draw a model natively next to the GS output. Output: local
@@ -120,7 +110,7 @@ Texture work (small, owner-driven, open from T33):
 
 Parked by the owner:
 
-5. **T29: recomp: speed headroom for racing.** After T28 the race intro is
+4. **T29: recomp: speed headroom for racing.** After T28 the race intro is
    60 fps paced but only ~71 fps unpaced, with the VU and render threads both
    near 100% there (at 60 fps: VU ~83%, render ~80%). Record VU1 programs
    during real gameplay (`PS2_VU_RECORD` / `port.py`) and check how many
@@ -132,7 +122,7 @@ Parked by the owner:
    loop, `memcpy` into the rings); `x86-64-v3` builds (AVX2, no FMA, needs
    the owner's OK to drop CPUs without AVX2, D22). Same save-state runs and
    byte-identical frame checks as T25-T28.
-6. **T30: recomp: decouple IOP/SPU2 from the EE clock.** Owner request: audio
+5. **T30: recomp: decouple IOP/SPU2 from the EE clock.** Owner request: audio
    must not depend on the frame rate. Today the EE, IOP and SPU2 share one
    emulated clock, so when the EE falls behind real time the SPU2 makes
    fewer samples and the audio underruns. On a real PS2 the IOP/SPU2 run on
@@ -187,4 +177,5 @@ Results with game-specific numbers: `local/games/<serial>/notes.md`.
 | Plan: conversion tool track | 2026-10-19 | D26 (owner): end goal ISO → native Windows game, automated per game; final intent fully native; estimates at agent pace (Phases 0–7 ≈ 30 h); conversion tool track (T37–T41) before Phases 8–9; T35 merged into T37/T42 | `7c67840` |
 | T37: conversion tool: standalone folder build | 2026-10-19 | `port.py --folder` writes a port folder (window exe, ELF, disc files + `layout.txt` + `sectors.bin`, D27; rebuilds the ISO byte for byte); runtime folder backend (`--disc <dir>`) and no-argument folder mode (vendored patch); `play.py` uses the folder; pilot game: menu run frames and cycles as the ISO run, window run with no ISO reaches the race intro, a same-size string edit in a folder copy shows in frames | `c1532bd` |
 | T38: conversion tool: one-command onboarding | 2026-10-19 | `port.py init <iso> [--serial S]`: serial, ELF, CRC from the disc, `game.json` + `notes.md` written (never overwritten), pipeline to the port folder (found entries saved); folder `settings.json` (from `play.json` or recipe defaults, kept once written) read by `ps2run` in folder mode (vendored patch); pilot disc under a scratch serial: one command, ~5 min, title/menus/race intro in frames, generated C++ = unpatched translation; pilot runs unchanged | `06bb71c` |
-| T39: conversion tool: automatic exploration | 2026-10-19 | `recomp/explore.py` + `port.py` `Explorer`: generated press patterns in 600-frame segments chained by save states; progress = new functions entered (vendored `PS2_COVERAGE` list, D28), new VU1 programs or missed entries; stalled segments retried with other patterns, VU1 programs compiled mid-run; pilot game with no script (scratch `init`, 8 min): intro, menus, card dialogs, loading screen, race intro, every VU1 program the scripted run meets; pilot menu run unchanged | this commit |
+| T39: conversion tool: automatic exploration | 2026-10-19 | `recomp/explore.py` + `port.py` `Explorer`: generated press patterns in 600-frame segments chained by save states; progress = new functions entered (vendored `PS2_COVERAGE` list, D28), new VU1 programs or missed entries; stalled segments retried with other patterns, VU1 programs compiled mid-run; pilot game with no script (scratch `init`, 8 min): intro, menus, card dialogs, loading screen, race intro, every VU1 program the scripted run meets; pilot menu run unchanged | `721b64f` |
+| T42: mods: mod folder over the disc files | 2026-10-19 | `PS2_MODS` (`mods` in `play.json` / folder `settings.json`, D29): replacement files by disc path over the ISO or port folder; bigger files move past the disc end, LBA/size written into their directory records as read (vendored `disc.cpp` patch); files not on the disc skipped; pilot game: a text entry and a texture palette inside its archives (local archive tool), same size and grown, seen in frames in ISO and folder mode; no mods = frames and cycles unchanged; port folder untouched | this commit |

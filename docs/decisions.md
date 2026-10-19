@@ -594,3 +594,26 @@ and works for any game the recompiler runs.
 **Revisit if:** a game's menus enter so little new code that 25 misses
 real screens (then the threshold goes per game or relative), or the
 coverage check costs measurable speed.
+
+## D29: Mods replace disc files by path; bigger files move past the disc end
+
+**Decision (T42, 2026-10-19):** a mod folder (`PS2_MODS`) holds
+replacement files at their disc paths. The runtime overlays them on the
+disc reader (ISO or port folder): a file that fits its original sectors is
+read there; a bigger one gets sectors after the last sector of the disc.
+The changed sector and size are written into the file's directory record
+in the sectors as read, and the file index is rebuilt from those records.
+Files that are not on the disc are skipped (logged).
+
+**Why:** games look files up by name and then read sectors (D27), either
+through the runtime's lookups or by parsing directory records themselves.
+Changing the records as read covers both with one mechanism, and leaves
+the port folder and the ISO untouched (a mod is removed by removing its
+folder). Space after the disc end is free; no other file has to move.
+
+**Limits:** a game that reads a file by sector numbers kept in its own data
+sees the old place (keep the size there); new files need a new directory
+record (not done).
+
+**Revisit if:** a game needs new files on the disc, or reads files by
+stored sector numbers.

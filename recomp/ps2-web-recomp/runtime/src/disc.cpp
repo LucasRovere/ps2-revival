@@ -1,8 +1,10 @@
 #include "ps2/disc.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -19,6 +21,13 @@ Probe g_probe;
 std::uint64_t g_size = 0;
 std::uint32_t g_layer1 = 0;
 std::map<std::string, Entry> g_index;
+
+// Where each file's directory record sits on the disc (byte offset) and its layer's first sector.
+struct Record {
+    std::uint64_t offset;
+    std::uint32_t base;
+};
+std::map<std::string, Record> g_records;
 
 std::uint32_t u32(const std::uint8_t *p) {
     std::uint32_t v;
@@ -43,6 +52,7 @@ void walk(std::uint32_t base, std::uint32_t lba, std::uint32_t size, const std::
             continue;
         }
         const std::uint8_t *rec = &data[off];
+        const std::uint64_t rec_offset = static_cast<std::uint64_t>(base + lba) * kSector + off;
         off += length;
         const std::uint8_t name_len = rec[32];
         std::string name(reinterpret_cast<const char *>(rec + 33), name_len);
@@ -53,6 +63,7 @@ void walk(std::uint32_t base, std::uint32_t lba, std::uint32_t size, const std::
         const bool dir = rec[25] & 2;
         const Entry entry{base + u32(rec + 2), u32(rec + 10), dir};
         g_index[path] = entry;
+        g_records[path] = {rec_offset, base};
         if (dir) walk(base, u32(rec + 2), u32(rec + 10), path + "/", depth + 1);
     }
 }
@@ -152,6 +163,72 @@ void index_layer(std::uint32_t pvd_sector, std::uint32_t base) {
     walk(base, u32(pvd + 158), u32(pvd + 166), "", 0);
 }
 
+void index_disc() {
+    g_index.clear();
+    g_records.clear();
+    index_layer(16, 0);
+    if (g_layer1) index_layer(g_layer1 + 16, g_layer1);
+}
+
+void put_both_endian(std::uint8_t *p, std::uint32_t v) {
+    std::memcpy(p, &v, 4);
+    for (int i = 0; i < 4; ++i) p[4 + i] = static_cast<std::uint8_t>(v >> (24 - 8 * i));
+}
+
+// Mods (T42): PS2_MODS names a folder of replacement files at their disc paths. A file that fits the
+// original's sectors is read there; a bigger one gets sectors past the end of the disc. The new sector
+// and size go into the file's directory record as read from the disc, so the index and the game's own
+// directory lookups both see them.
+void apply_mods(const std::string &dir) {
+    if (!std::filesystem::is_directory(dir)) {
+        std::fprintf(stderr, "[mods] no folder %s\n", dir.c_str());
+        return;
+    }
+    auto mods = std::make_shared<Folder>();
+    std::vector<std::pair<std::uint64_t, std::array<std::uint8_t, 16>>> records;
+    auto end = static_cast<std::uint32_t>((g_size + kSector - 1) / kSector);
+    for (const auto &item : std::filesystem::recursive_directory_iterator(dir)) {
+        if (!item.is_regular_file()) continue;
+        const std::string path = upper(item.path().lexically_relative(dir).generic_string());
+        const auto entry = g_index.find(path);
+        if (entry == g_index.end() || entry->second.directory) {
+            std::fprintf(stderr, "[mods] not a file on the disc, skipped: %s\n", path.c_str());
+            continue;
+        }
+        const auto size = static_cast<std::uint32_t>(item.file_size());
+        const std::uint32_t sectors = (size + kSector - 1) / kSector;
+        std::uint32_t sector = entry->second.sector;
+        const bool moved = sectors > (entry->second.size + kSector - 1) / kSector;
+        if (moved) {
+            sector = end;
+            end += sectors;
+        }
+        mods->files.push_back({sector, size, item.path().string(), 0});
+        const Record &rec = g_records[path];
+        std::array<std::uint8_t, 16> fields;
+        put_both_endian(fields.data(), sector - rec.base);
+        put_both_endian(fields.data() + 8, size);
+        records.push_back({rec.offset + 2, fields});
+        std::fprintf(stderr, "[mods] %s: %u bytes at sector %u%s\n", path.c_str(), size, sector, moved ? " (moved past the disc end)" : "");
+    }
+    g_size = std::max<std::uint64_t>(g_size, static_cast<std::uint64_t>(end) * kSector);
+    g_reader = [disc = std::move(g_reader), mods, records, size = g_size](std::uint64_t offset, void *out, std::size_t bytes) {
+        if (offset >= size) return std::size_t{0};
+        bytes = static_cast<std::size_t>(std::min<std::uint64_t>(bytes, size - offset));
+        auto *dst = static_cast<std::uint8_t *>(out);
+        const std::size_t got = disc(offset, dst, bytes);
+        std::memset(dst + got, 0, bytes - got);
+        mods->copy(mods->files, offset, dst, bytes);
+        for (const auto &[at, fields] : records) {
+            const std::uint64_t lo = std::max(offset, at), hi = std::min<std::uint64_t>(offset + bytes, at + fields.size());
+            if (lo < hi) std::memcpy(dst + (lo - offset), fields.data() + (lo - at), static_cast<std::size_t>(hi - lo));
+        }
+        return bytes;
+    };
+    index_disc();
+    std::fprintf(stderr, "[mods] %s: %zu files\n", dir.c_str(), mods->files.size());
+}
+
 }
 
 bool open(const std::string &path) {
@@ -182,8 +259,6 @@ bool open(const std::string &name, std::uint64_t size, Reader reader, Probe prob
     g_reader = std::move(reader);
     g_probe = std::move(probe);
     g_size = size;
-    g_index.clear();
-    index_layer(16, 0);
     std::uint8_t pvd[kSector];
     read(16, 1, pvd);
     const std::uint32_t layer0 = u32(pvd + 80);
@@ -191,10 +266,11 @@ bool open(const std::string &name, std::uint64_t size, Reader reader, Probe prob
         std::uint8_t probe[kSector];
         if (read(s, 1, probe) && std::memcmp(probe, "\x01" "CD001", 6) == 0) {
             g_layer1 = s - 16;
-            index_layer(s, g_layer1);
             break;
         }
     }
+    index_disc();
+    if (const char *mods = std::getenv("PS2_MODS"); mods && *mods) apply_mods(mods);
     std::fprintf(stderr, "[disc] %s: %zu files, %llu sectors, layer 1 at %u\n", name.c_str(), g_index.size(),
                  static_cast<unsigned long long>(g_size / kSector), g_layer1);
     return true;

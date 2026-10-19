@@ -234,11 +234,12 @@ def default_aspect(game, patched):
 
 def folder_settings(game, patched, play):
     """The port folder's settings.json: play.json's picture settings (when there is one), else the defaults.
-    The folder keeps its own card; a repo-relative texture pack becomes absolute."""
-    settings = {"aspect": default_aspect(game, patched), "scale": 1, "fullscreen": False, "textures": ""}
+    The folder keeps its own card; a repo-relative texture pack or mod folder becomes absolute."""
+    settings = {"aspect": default_aspect(game, patched), "scale": 1, "fullscreen": False, "textures": "", "mods": ""}
     settings.update({k: v for k, v in (play or {}).items() if k in settings})
-    if settings["textures"]:
-        settings["textures"] = str(REPO / settings["textures"])
+    for key in ("textures", "mods"):
+        if settings[key]:
+            settings[key] = str(REPO / settings[key])
     return {**settings, "memcard": "memcard.ps2"}
 
 

@@ -150,12 +150,15 @@ in the vendored code under `recomp/` (D23); no separate `runtime/` or
   `port.py init <iso>` one-command onboarding (T38), automatic exploration
   with generated input and new-code progress (T39, D28; `recomp/explore.py`):
   the pilot game reaches its race intro with no script.
+- Mods (Phase 9, T42, D29): `play.json` / folder `settings.json` `mods`
+  (`PS2_MODS`): replacement files by disc path over the ISO or port folder;
+  bigger files move past the disc end. Pilot game: archive edits seen in frames.
 - Repo policy (D24): nothing game-specific in git; recipes, notes and
   game-specific code in `local/games/<serial>/`.
 - Phases 6–9 re-planned (D23): build on the vendored runtime and GS renderer;
   6 port hooks (override table, recipe patches, saves, launcher done), 7 look better
   (widescreen, resolution, texture packs), 8 selective native draw paths,
-  9 mods and assets. Plan: [docs/native-port-plan.md](docs/native-port-plan.md).
+  9 mods (mod folder done) and assets. Plan: [docs/native-port-plan.md](docs/native-port-plan.md).
 - Plan (D26, 2026-10-19): conversion tool track next (T37 folder build,
   T38 `port.py init`, T39 automatic exploration, T40 second game, T41 agent
   skills), then Phases 8–9; final intent fully native. Plan at agent pace:

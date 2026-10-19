@@ -12,6 +12,7 @@ and are created with defaults on first use:
   fullscreen  start fullscreen (F11 toggles in the window)
   aspect      "4:3" or "16:9" (PS2_ASPECT); default: game.json recomp.aspect when patches are on
   textures    texture pack folder (PS2_TEXTURES, relative to the repo or absolute); "" = off
+  mods        mod folder: replacement files at their disc paths (PS2_MODS, relative to the repo or absolute); "" = off
 
 Usage:
   python recomp/play.py <SERIAL>
@@ -28,7 +29,7 @@ from port import BUILD_SUFFIX, GAMES_DIR, REPO, WORK_DIR, default_aspect
 
 def load_settings(serial, aspect):
     path = GAMES_DIR / serial / "play.json"
-    defaults = {"memcard": f"local/games/{serial}/memcard.ps2", "scale": 1, "fullscreen": False, "aspect": aspect, "textures": ""}
+    defaults = {"memcard": f"local/games/{serial}/memcard.ps2", "scale": 1, "fullscreen": False, "aspect": aspect, "textures": "", "mods": ""}
     if not path.exists():
         path.write_text(json.dumps(defaults, indent=2) + "\n")
         print(f"created {path} with defaults")
@@ -55,11 +56,13 @@ def main():
             sys.exit(f"No window build: run python recomp/port.py {args.serial} --window first")
         cmd = [runner, elf, "--disc", out / "disc.iso"]
     card = REPO / settings["memcard"]
-    print(f"settings: memcard {card}, scale {settings['scale']}, fullscreen {settings['fullscreen']}, aspect {settings['aspect']}, textures {settings['textures'] or 'off'}", flush=True)
+    print(f"settings: memcard {card}, scale {settings['scale']}, fullscreen {settings['fullscreen']}, aspect {settings['aspect']}, textures {settings['textures'] or 'off'}, mods {settings['mods'] or 'off'}", flush=True)
     cmd += ["--memcard", card, "--fullscreen" if settings["fullscreen"] else "--window"]
     env = {**os.environ, "PS2_SCALE": str(settings["scale"]), "PS2_ASPECT": settings["aspect"]}
     if settings["textures"]:
         env["PS2_TEXTURES"] = str(REPO / settings["textures"])
+    if settings["mods"]:
+        env["PS2_MODS"] = str(REPO / settings["mods"])
     subprocess.run(cmd, env=env)
 
 
