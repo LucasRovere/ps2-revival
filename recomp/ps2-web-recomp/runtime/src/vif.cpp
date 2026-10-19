@@ -1,6 +1,7 @@
 #include "vif.hpp"
 
 #include "dmac.hpp"
+#include "draw_profile.hpp"
 #include "gs/gif.hpp"
 #include "gs/queue.hpp"
 #include "hw.hpp"
@@ -66,6 +67,12 @@ void run_vu(int unit, std::uint32_t address) {
     } else {
         u.itop = u.itops;
         vu::set_tops(0, u.itop);
+    }
+    if (unit == 1 && draw_profile::g_on) {
+        const std::uint64_t start = draw_profile::now_ns();
+        vu::run(unit, address);
+        draw_profile::vu_ran(address, draw_profile::now_ns() - start);
+        return;
     }
     vu::run(unit, address);
 }

@@ -1,4 +1,5 @@
 #include "dmac.hpp"
+#include "draw_profile.hpp"
 #include "gs/gif.hpp"
 #include "vif.hpp"
 #include "vu_micro.hpp"
@@ -132,6 +133,7 @@ void time_frames() {
 
 void vblank() {
     ++g_frames;
+    draw_profile::frame(g_frames);
     time_frames();
     apply_presses();
     if (g_options.on_vblank) g_options.on_vblank();
@@ -472,7 +474,12 @@ void run_vu_thread() {
         g_vu_idle_ms.store(g_vu_idle_ms.load() + std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
     }
 }
-void post_present() { gs::post_present(); }
+void post_present() { gs::post_present(static_cast<std::uint32_t>(g_frames)); }
+std::uint32_t presented_frame() { return gs::presented_frame(); }
+void time_waits() { gs::queue::time_waits(); }
+void pace_began() { gs::queue::wait_began(gs::queue::kWaitPace); }
+void pace_ended() { gs::queue::wait_ended(); }
+double waited_ms(int thread, int kind) { return gs::queue::waited_ms(static_cast<gs::queue::Role>(thread), static_cast<gs::queue::Wait>(kind)); }
 
 Rendered render_pending(bool surface, const std::function<void(const std::uint32_t *, std::uint32_t, std::uint32_t)> &copy,
                         const std::function<void()> &before_present, double budget_ms) {
@@ -480,7 +487,9 @@ Rendered render_pending(bool surface, const std::function<void(const std::uint32
     return gs::render_pending([&](const gs::DisplayRegs &regs) {
         if (before_present) before_present();
         if (surface) {
+            gs::queue::wait_began(gs::queue::kWaitPresent);
             gs::present(regs);
+            gs::queue::wait_ended();
             return;
         }
         std::uint32_t width = 0, height = 0;

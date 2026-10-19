@@ -103,6 +103,13 @@ void run_vu_thread();
 double vu_thread_idle_ms();
 std::uint64_t vu1_interpreted_calls();
 void post_present();
+// Frame-time log (PS2_FRAME_LOG): guest frame of the present being drawn, waits per thread (0 EE, 1 VU, 2 render)
+// and kind (0 ring full, 1 present queue, 2 pacing, 3 other, 4 idle) in ms since time_waits(), a wait in progress included.
+std::uint32_t presented_frame();
+void time_waits();
+void pace_began();
+void pace_ended();
+double waited_ms(int thread, int kind);
 enum class Rendered { idle, presented, busy };
 Rendered render_pending(bool surface, const std::function<void(const std::uint32_t *rgba, std::uint32_t width, std::uint32_t height)> &copy,
                         const std::function<void()> &before_present, double budget_ms);

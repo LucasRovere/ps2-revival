@@ -259,13 +259,19 @@ void present() {
 constexpr Uint32 kAudioBytesPerMs = 48 * 4;
 
 void pace() {
-    if (g_audio) {
-        // The audio device clock paces emulation: wait while more than ~80 ms of sound is queued.
-        while (SDL_GetQueuedAudioSize(g_audio) > 80 * kAudioBytesPerMs) SDL_Delay(1);
-        return;
-    }
     const std::uint64_t frequency = SDL_GetPerformanceFrequency();
-    const std::uint64_t period = frequency / (ps2::g_options.pal ? 50 : 60);
+    std::uint64_t period = frequency / (ps2::g_options.pal ? 50 : 60);
+    if (g_audio) {
+        // The timer spaces the frames evenly; the audio device clock only corrects the speed: no wait while less than
+        // ~40 ms of sound is queued, 5% slower while more than ~80 ms is. (Waiting for the queue to drain alone released
+        // the frames in bursts of the device's 21 ms pulls: presents 2-30 ms apart.)
+        const Uint32 queued = SDL_GetQueuedAudioSize(g_audio);
+        if (queued < 40 * kAudioBytesPerMs) {
+            g_last = 0;
+            return;
+        }
+        if (queued > 80 * kAudioBytesPerMs) period += period / 20;
+    }
     const std::uint64_t now = SDL_GetPerformanceCounter();
     if (g_last && now - g_last < period) {
         SDL_Delay(static_cast<Uint32>((period - (now - g_last)) * 1000 / frequency));
@@ -329,6 +335,91 @@ void show_speed() {
     gpu_start = gpu;
 }
 
+// PS2_FRAME_LOG=<file>: one line per presented frame with the time since the last present and each thread's waits in it;
+// the thread that waited least was the limit (the render thread's surface present counts as its work), "pace" when no
+// thread worked half the frame (the frame was held back by pacing). A summary of the slow frames at the end.
+struct LoggedWait {
+    int thread, kind;
+    const char *name;
+    bool waiting;
+};
+
+constexpr LoggedWait kLoggedWaits[] = {{0, 1, "ee_present", true}, {0, 0, "ee_ring", true}, {0, 2, "ee_pace", true}, {0, 3, "ee_other", true},
+                                       {1, 0, "vu_ring", true},    {1, 4, "vu_idle", true}, {2, 4, "render_idle", true}, {2, 1, "render_present", false}};
+constexpr const char *kLimitNames[] = {"ee", "vu", "render", "pace"};
+constexpr double kSlowMs[] = {17.0, 20.0, 33.0};
+
+std::FILE *g_frame_log = nullptr;
+bool g_vu_thread = false;
+std::uint64_t g_logged_frames = 0;
+double g_logged_ms = 0.0;
+std::uint64_t g_slow[3][5] = {};
+
+void open_frame_log() {
+    const char *path = std::getenv("PS2_FRAME_LOG");
+    if (!path) return;
+    g_frame_log = std::fopen(path, "w");
+    if (!g_frame_log) {
+        std::fprintf(stderr, "[window] cannot write the frame log %s\n", path);
+        return;
+    }
+    ps2::time_waits();
+    std::fprintf(stderr, "[window] frame log: %s\n", path);
+    std::fprintf(g_frame_log, "# frame ms");
+    for (const LoggedWait &w : kLoggedWaits) std::fprintf(g_frame_log, " %s", w.name);
+    std::fprintf(g_frame_log, " audio_ms limit\n");
+}
+
+void log_frame() {
+    static std::uint64_t last = 0;
+    static double before[std::size(kLoggedWaits)] = {};
+    const std::uint64_t now = SDL_GetPerformanceCounter();
+    double waits[std::size(kLoggedWaits)];
+    for (std::size_t i = 0; i < std::size(kLoggedWaits); ++i) {
+        const double total = ps2::waited_ms(kLoggedWaits[i].thread, kLoggedWaits[i].kind);
+        waits[i] = total - before[i];
+        before[i] = total;
+    }
+    const std::uint64_t previous = last;
+    last = now;
+    if (!previous) return;
+    const double ms = static_cast<double>(now - previous) * 1000.0 / static_cast<double>(SDL_GetPerformanceFrequency());
+    double busy[3] = {ms, g_vu_thread ? ms : 0.0, ms};
+    for (std::size_t i = 0; i < std::size(kLoggedWaits); ++i)
+        if (kLoggedWaits[i].waiting) busy[kLoggedWaits[i].thread] -= waits[i];
+    int limit = static_cast<int>(std::max_element(busy, busy + 3) - busy);
+    if (busy[limit] < ms / 2) limit = 3;
+    std::fprintf(g_frame_log, "%u %.2f", ps2::presented_frame(), ms);
+    for (const double w : waits) std::fprintf(g_frame_log, " %.2f", w);
+    const double audio = g_audio ? SDL_GetQueuedAudioSize(g_audio) / static_cast<double>(kAudioBytesPerMs) : 0.0;
+    std::fprintf(g_frame_log, " %.0f %s\n", audio, kLimitNames[limit]);
+    ++g_logged_frames;
+    g_logged_ms += ms;
+    for (int i = 0; i < 3; ++i)
+        if (ms > kSlowMs[i]) {
+            ++g_slow[i][0];
+            ++g_slow[i][1 + limit];
+        }
+}
+
+void close_frame_log() {
+    if (!g_frame_log) return;
+    char line[512];
+    int n = std::snprintf(line, sizeof line, "frames %llu, mean %.2f ms", static_cast<unsigned long long>(g_logged_frames), g_logged_frames ? g_logged_ms / static_cast<double>(g_logged_frames) : 0.0);
+    for (int i = 0; i < 3; ++i)
+        n += std::snprintf(line + n, sizeof line - static_cast<std::size_t>(n), "; over %.0f ms: %llu (ee %llu, vu %llu, render %llu, pace %llu)", kSlowMs[i],
+                           static_cast<unsigned long long>(g_slow[i][0]), static_cast<unsigned long long>(g_slow[i][1]), static_cast<unsigned long long>(g_slow[i][2]),
+                           static_cast<unsigned long long>(g_slow[i][3]), static_cast<unsigned long long>(g_slow[i][4]));
+    std::fprintf(g_frame_log, "# %s\n", line);
+    std::fprintf(stderr, "[window] frame log: %s\n", line);
+    std::fclose(g_frame_log);
+}
+
+void before_present() {
+    show_speed();
+    if (g_frame_log) log_frame();
+}
+
 void on_vblank() {
     show_speed();
     poll();
@@ -381,12 +472,16 @@ int run_window(const std::function<int()> &emulate) {
         ps2::g_options.on_vblank = on_vblank;
         return emulate();
     }
+    open_frame_log();
     ps2::g_options.on_vblank = [] {
         ps2::post_present();
+        ps2::pace_began();
         pace();
+        ps2::pace_ended();
     };
     ps2::start_render_thread();
-    if (!std::getenv("PS2_NO_VU_THREAD")) {
+    g_vu_thread = !std::getenv("PS2_NO_VU_THREAD");
+    if (g_vu_thread) {
         ps2::start_vu_thread();
         std::thread(ps2::run_vu_thread).detach();
     }
@@ -400,9 +495,10 @@ int run_window(const std::function<int()> &emulate) {
     const std::function<void(const std::uint32_t *, std::uint32_t, std::uint32_t)> copy = show_pixels, none;
     while (!done.load()) {
         poll();
-        if (ps2::render_pending(g_gpu_present, g_gpu_present ? none : copy, show_speed, 8.0) == ps2::Rendered::idle) ps2::wait_render_work(4);
+        if (ps2::render_pending(g_gpu_present, g_gpu_present ? none : copy, before_present, 8.0) == ps2::Rendered::idle) ps2::wait_render_work(4);
     }
     emulation.join();
+    close_frame_log();
     SDL_Quit();
     std::fflush(nullptr);
     std::_Exit(result);

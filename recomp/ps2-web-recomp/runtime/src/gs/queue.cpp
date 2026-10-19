@@ -1,6 +1,7 @@
 #include "queue.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <cmath>
 #include <cstring>
@@ -14,7 +15,6 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #else
-#include <chrono>
 #include <thread>
 #endif
 
@@ -25,6 +25,18 @@ namespace {
 constexpr std::uint64_t align16(std::uint64_t n) { return (n + 15) & ~15ull; }
 
 Ring g_render, g_vu;
+
+// one wait at a time per thread; since != 0 while it waits, so a reader sees a wait in progress too
+struct Waits {
+    std::atomic<std::uint64_t> ns[kWaitKinds] = {};
+    std::atomic<std::uint64_t> since{0};
+    std::atomic<int> kind{0};
+};
+
+bool g_timing = false;
+Waits g_waits[3];
+
+std::uint64_t now_ns() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
 #if defined(__linux__) && !defined(__EMSCRIPTEN__)
 void futex_wait(std::atomic<std::uint32_t> &word, std::uint32_t seen, int timeout_ms) {
@@ -44,7 +56,31 @@ EM_ASYNC_JS(void, ps2_wait_async, (std::atomic<std::uint32_t> *word, std::uint32
 });
 #endif
 
-void wait(std::atomic<std::uint32_t> &value, std::uint32_t seen) {
+void time_waits() { g_timing = true; }
+
+void wait_began(Wait kind) {
+    if (!g_timing) return;
+    Waits &w = g_waits[static_cast<int>(t_role)];
+    w.kind.store(kind);
+    w.since.store(now_ns());
+}
+
+void wait_ended() {
+    if (!g_timing) return;
+    Waits &w = g_waits[static_cast<int>(t_role)];
+    w.ns[w.kind.load()].fetch_add(now_ns() - w.since.exchange(0));
+}
+
+double waited_ms(Role role, Wait kind) {
+    Waits &w = g_waits[static_cast<int>(role)];
+    std::uint64_t ns = w.ns[kind].load();
+    const std::uint64_t since = w.since.load();
+    if (since && w.kind.load() == kind) ns += now_ns() - since;
+    return static_cast<double>(ns) / 1e6;
+}
+
+void wait(std::atomic<std::uint32_t> &value, std::uint32_t seen, Wait kind) {
+    wait_began(kind);
 #ifdef __EMSCRIPTEN__
     emscripten_futex_wait(&value, seen, INFINITY);
 #elif defined(__linux__)
@@ -52,6 +88,7 @@ void wait(std::atomic<std::uint32_t> &value, std::uint32_t seen) {
 #else
     value.wait(seen);
 #endif
+    wait_ended();
 }
 
 void notify(std::atomic<std::uint32_t> &value) {
@@ -100,7 +137,7 @@ void Ring::post(Type type, std::uint32_t arg0, std::uint32_t arg1, const void *d
         }
         producer_waiting_.store(1);
         const std::uint32_t seen = freed_.load();
-        if (head + pad + need - tail_.load() > capacity_) wait(freed_, seen);
+        if (head + pad + need - tail_.load() > capacity_) wait(freed_, seen, kWaitRing);
     }
     if (producer_waiting_.load(std::memory_order_relaxed)) producer_waiting_.store(0);
     std::uint8_t *at = buffer_.get() + (head & (capacity_ - 1));
@@ -146,6 +183,7 @@ void Ring::wait_for_work(int timeout_ms) {
         consumer_waiting_.store(0);
         return;
     }
+    wait_began(kWaitIdle);
 #ifdef __EMSCRIPTEN__
     if (emscripten_is_main_browser_thread()) ps2_wait_async(&posted_, seen, timeout_ms);
     else emscripten_futex_wait(&posted_, seen, timeout_ms);
@@ -155,6 +193,7 @@ void Ring::wait_for_work(int timeout_ms) {
     (void)seen;
     std::this_thread::sleep_for(std::chrono::milliseconds(std::min(timeout_ms, 1)));
 #endif
+    wait_ended();
 }
 
 }

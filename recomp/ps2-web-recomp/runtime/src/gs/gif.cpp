@@ -1,5 +1,6 @@
 #include "gif.hpp"
 
+#include "../draw_profile.hpp"
 #include "gs.hpp"
 #include "queue.hpp"
 
@@ -167,6 +168,12 @@ void render(int path, const std::uint8_t *data, std::uint32_t qwc) {
 
 void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {
     if (!gs::queue::active()) {
+        if (draw_profile::g_on && path != 3) {
+            const std::uint64_t start = draw_profile::now_ns();
+            render(path, data, qwc);
+            draw_profile::gif_ran(path, qwc, draw_profile::now_ns() - start);
+            return;
+        }
         render(path, data, qwc);
         return;
     }

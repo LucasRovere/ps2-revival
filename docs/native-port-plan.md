@@ -170,13 +170,37 @@ MSCAL) and matched by bytes against the disc's mesh files. Findings:
 - Owner settings (scale 3, 16:9, texture pack) held 59–62 fps in a 25 s
   racing run (2 s samples); short stutters are not visible that way.
 
+**Baselines (T45, pilot game, numbers in the local notes).** Tools:
+`PS2_DRAW_PROFILE` + `recomp/drawlist.py` (headless shares per chain
+kind), `PS2_FRAME_LOG` (window, per-frame time and thread waits), see
+`recomp/README.md`.
+
+- Draw profile with the runtime feature: racing and race intro shares as
+  in T36 within a point (pre-lit static meshes ~32% of a racing frame, root
+  list ~17%, lit cars ~16%; cars ~19% in the race intro); the car chains
+  are named by `--match` against the unpacked car files.
+- Window, owner settings (scale 3, 16:9, pack), 60 s per scene: racing
+  holds 57-60 presents per second (1 s windows; the low ones at pack
+  stalls); the race intro at scale 3 is render-thread-bound (render idle
+  ~0, mean 17.2 ms, 1 s windows down to 50, audio queue under 30 ms in
+  about half the frames). Scale 1: 58-60 in racing, 51-60 in the intro.
+- The dips the owner sees are in the menus (D33), and they are not
+  VU1/GS-front-end work: (1) frame pacing on the audio queue released
+  frames in bursts (presents 2-30 ms apart in calm menus at a 60 fps
+  mean; fixed in T45: 13-20 ms); (2) texture pack images decoded on the
+  render thread at first use: stalls of 50-800 ms at scene changes and
+  loading screens (gone without a pack); (3) a few menu screens are
+  GPU-bound at scale 3 (render thread blocked ~20 ms per frame in the
+  surface acquire: ~30 fps for 1-2 s; fine at scale 1). These need their
+  own fixes (backlog), not the native draw path.
+
 **Plan (D32).** The hook is a generic runtime seam: a handler registered
 for static mesh chains is called where VIF1 `call`s the chain (on the VU
 thread in the window, so GS ordering stays right) and may draw the mesh
 itself. Steps, one session each:
 
 1. Profiler and frame-time log as opt-in runtime features, with a report
-   script (T45).
+   script (T45, done).
 2. Chain handlers in the runtime; first handler: the pilot's pre-lit
    static meshes, VU1 program path re-implemented on the CPU, primitives
    into the GS renderer, frames compared with the VU path (T46).

@@ -162,6 +162,9 @@ the same change.
 - Mods (Phase 9, T42, D29): `play.json` / folder `settings.json` `mods`
   (`PS2_MODS`): replacement files by disc path over the ISO or port folder;
   bigger files move past the disc end. Pilot game: archive edits seen in frames.
+- Phase 8 (D32): draw-list survey (T36); draw profile (`PS2_DRAW_PROFILE`,
+  `recomp/drawlist.py`) and window frame-time log (`PS2_FRAME_LOG`, T45);
+  window pacing by timer with audio correction (T45); menu dips: D33.
 - Repo policy (D24): nothing game-specific in git; recipes, notes and
   game-specific code in `local/games/<serial>/`.
 - Phases 6–9 re-planned (D23): build on the vendored runtime and GS renderer;

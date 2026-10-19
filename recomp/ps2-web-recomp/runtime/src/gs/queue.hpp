@@ -53,7 +53,14 @@ bool active();
 bool vu_active();
 void post(Type type, std::uint32_t arg0, std::uint32_t arg1, const void *data, std::uint32_t bytes);
 
-void wait(std::atomic<std::uint32_t> &value, std::uint32_t seen);
+// Frame-time log (PS2_FRAME_LOG, window): time each thread waits, by kind; counted only after time_waits().
+enum Wait : int { kWaitRing, kWaitPresent, kWaitPace, kWaitOther, kWaitIdle, kWaitKinds };
+void time_waits();
+void wait_began(Wait kind);
+void wait_ended();
+double waited_ms(Role role, Wait kind);
+
+void wait(std::atomic<std::uint32_t> &value, std::uint32_t seen, Wait kind = kWaitOther);
 void notify(std::atomic<std::uint32_t> &value);
 
 }

@@ -723,3 +723,26 @@ overrides (D5). The GS renderer stays for everything else (D23).
 fog, clipping) within a session or two; the GPU path does not cut the
 render thread as estimated; or another engine has no static chains (then
 hook its VU1 programs by key instead).
+
+## D33: The menu fps dips get their own fixes; Phase 8 order kept
+
+**Owner answers (2026-10-19, T45):** the fps dips are seen in the menus;
+native draw path order: scenery first (T46), then cars (T47); car
+replacement models and better lighting matter equally (T49, then T50);
+the second game waits until the pilot game is fully native.
+
+**Finding (T45, frame-time log, pilot game, local notes):** the menu dips
+are not VU1 or GS front-end work, so the Phase 8 native draw path (D31's
+intended fix) does not remove them:
+1. Frame pacing on the audio queue released frames in bursts (presents
+   2-30 ms apart in calm menus at a 60 fps mean). Fixed in T45: frames
+   spaced by the timer, the audio queue only corrects the speed.
+2. Texture pack images are decoded on the render thread at first use:
+   50-800 ms stalls at scene changes and loading screens.
+3. Some menu screens are GPU-bound at scale 3 (~30 fps for 1-2 s).
+
+**Decision:** 2 and 3 become their own backlog task (T53); Phase 8 goes
+on in the owner's order (T46 next). D31 stays; its "revisit if the native
+draw path does not remove the dips" is answered for the menu dips by T53.
+
+**Revisit if:** the owner still sees dips after T45's pacing fix and T53.

@@ -956,6 +956,7 @@ bool copy_frame(const DisplayRegs &r, std::vector<std::uint32_t> &rgba, std::uin
 
 std::atomic<std::uint32_t> g_presented{0};
 std::uint32_t g_posted_presents = 0;
+std::uint32_t g_presented_frame = 0;
 
 void flush_and_wait() {
 #ifdef PS2_GPU
@@ -965,12 +966,14 @@ void flush_and_wait() {
 
 void start_thread() { queue::render().start(32u << 20); }
 
-void post_present() {
+void post_present(std::uint32_t frame) {
     const DisplayRegs regs = display_regs();
-    queue::post(queue::kPresent, 0, 0, &regs, sizeof regs);
+    queue::post(queue::kPresent, frame, 0, &regs, sizeof regs);
     ++g_posted_presents;
-    for (std::uint32_t done = g_presented.load(); g_posted_presents - done > 2; done = g_presented.load()) queue::wait(g_presented, done);
+    for (std::uint32_t done = g_presented.load(); g_posted_presents - done > 2; done = g_presented.load()) queue::wait(g_presented, done, queue::kWaitPresent);
 }
+
+std::uint32_t presented_frame() { return g_presented_frame; }
 
 Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_present, double budget_ms) {
     queue::role() = queue::Role::Render;
@@ -993,6 +996,7 @@ Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_prese
         case queue::kPresent: {
             DisplayRegs regs;
             std::memcpy(&regs, payload, sizeof regs);
+            g_presented_frame = h.arg0;
             on_present(regs);
             presented = true;
             break;

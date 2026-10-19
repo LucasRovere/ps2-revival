@@ -2,7 +2,7 @@
 
 EE (R5900) → C++ static recompiler (Phase 5). The recompiler and runtime are
 [ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp) (MIT), vendored
-in `ps2-web-recomp/` (D14, D16). Our own code: `port.py` (incl. the port folder), `play.py` (launcher), the function
+in `ps2-web-recomp/` (D14, D16). Our own code: `port.py` (incl. the port folder), `play.py` (launcher), `drawlist.py` (draw-list report), the function
 override hook (vendored patch, below), generic overrides in `overrides/`
 (none yet; created with the first) and the instruction tests in `tests/`.
 
@@ -193,6 +193,7 @@ git-ignored), created with defaults on first use:
 | `aspect` | `game.json` `recomp.aspect` when patches are on, else `"4:3"` | `"16:9"` presents the image at 16:9 (`PS2_ASPECT`), for a game running its own widescreen mode (e.g. through recipe patches) |
 | `textures` | `""` | Texture pack folder (`PS2_TEXTURES`, relative to the repo or absolute), e.g. `local/games/<SERIAL>/textures`; `""` = off (below) |
 | `mods` | `""` | Mod folder (`PS2_MODS`, relative to the repo or absolute): replacement disc files ([Mods](#mods-t42)); `""` = off |
+| `frame_log` | `false` | `true`: frame-time log in `frame_log.txt` next to the card (`PS2_FRAME_LOG`, [below](#draw-profile-and-frame-time-log-t45)) |
 
 Keys missing from an older `play.json` take the defaults. The log shows
 `settings: ...`, `[gpu] scale N`, `[gpu] aspect W:H` and
@@ -444,6 +445,68 @@ details, placement and alpha right, no garbling; the glare-star sprites
 get longer, harder rays (open owner check, as in T33). Same cycle count
 with and without the pack.
 
+### Draw profile and frame-time log (T45)
+
+Two opt-in measurements for Phase 8. Unset, frames and cycle counts are
+unchanged (pilot menu run 107/107 frames, 52,595,993,647 cycles) and the
+headless speed is within noise.
+
+**Draw profile** (headless only): `PS2_DRAW_PROFILE=<from>,<count>` times
+the VIF1 DMA list per `call` target for frames from..from+count and prints
+`[draw]` lines when the run passes from+count: per target the calls, VIF1
+ms (each DMA tag's time, including the VU1 programs and GS front end it
+starts) and qwords; VU1 ms per (target, program entry); GS front-end ms per
+(target, GIF path 1/2); root chains per frame and channel 2 (path 3)
+totals. About 20% slower while on, same cycles. In the window the VU
+thread does that work, so the variable is ignored there (one log line);
+headless shares map onto the threads (VIF1 + VU1 → VU thread, GS front end
+→ render thread). Report:
+
+```powershell
+$env:PS2_DRAW_PROFILE = "<from>,<count>"; $env:PS2_TIME = "<from>,<count>"; $env:PS2_DUMP = "work\prof.ram"
+work\<SERIAL>\recomp\build-window-win\ps2run.exe <elf> --disc <iso> --load-state <state> --frames <from+count> 2> work\prof.log
+python recomp/drawlist.py work\prof.log work\prof.ram [--match work\<SERIAL>\files\<dir>] [--kinds N]
+```
+
+`drawlist.py` reads each target's chain from the `PS2_DUMP` RAM dump
+(cnt/ref tags up to `ret`), fingerprints it by its VIF commands (unpack
+format @ VU1 address, `MSCAL`, `MSCNT`, `DIRECT`, `MPG`) and groups targets
+with the same fingerprint into kinds: targets, calls, VIF1 ms, VU1 ms (top
+entries), GS ms per path and share of the frame (from a `[time]` line of
+the same frames, else of the VIF1 total). `--match <dir>` names the chains
+found byte for byte in the files under a folder (e.g. a game's unpacked
+mesh files; ~25 s for 400 MB).
+
+**Frame-time log** (threaded window): `PS2_FRAME_LOG=<file>` (`play.json`
+`"frame_log": true` → `frame_log.txt` next to the card) writes one line per
+presented frame:
+
+| Column | Meaning |
+|---|---|
+| `frame` | guest frame of the present |
+| `ms` | real time since the previous present (render thread) |
+| `ee_present` | EE waited for the present queue (more than 2 presents in flight: VU or render behind) |
+| `ee_ring` | EE waited for room in the VU ring |
+| `ee_pace` | EE waited in the frame pacing (timer, audio correction) |
+| `ee_other` | EE waited for the other threads (fences, GS downloads, state saves) |
+| `vu_ring` | VU thread waited for room in the render ring (render behind) |
+| `vu_idle`, `render_idle` | thread had no work |
+| `render_present` | render thread inside the surface present (blocks there while the GPU is behind) |
+| `audio_ms` | sound queued for the device |
+| `limit` | the thread with the most time not waiting (`render_present` counts as work); `pace` when none worked half the frame |
+
+A wait counts in the frame it is in (a wait in progress is split at the
+present). At exit: `# frames N, mean X ms; over 17/20/33 ms: count (per
+limit)`, also on stderr as `[window] frame log: ...`. Not written in
+one-thread mode (`PS2_ONE_THREAD`, `PS2_TIME`, frame dumps).
+
+**Pacing (T45):** the window spaces frames with the timer at the guest
+rate; the audio queue only corrects the speed (no wait under ~40 ms
+queued, 5% slower over ~80 ms). Before, the EE waited for the queue to
+drain below 80 ms, which released frames in bursts of the audio device's
+pulls: in calm menus presents came 2-30 ms apart (p5/p95) at a 60 fps
+mean; now 13-20 ms.
+
 ### Patches and overrides (T31)
 
 **Patches:** the top-level `game.json` `patches` (the Phase 4 recipe, see
@@ -515,6 +578,8 @@ except:
 | `runtime/src/disc.cpp` (`apply_mods`, `index_disc`) | Mods (T42): with `PS2_MODS` set, `disc::open` wraps the reader: replacement files over the original sectors or past the disc end, new LBA/size written into the directory records as read, index rebuilt, `[mods]` log lines. Without `PS2_MODS`: frames and cycle counts unchanged. |
 | `runtime/src/system.cpp` (`boot`) | Boot path (T43, D30): a host ELF path (no `:` or a drive letter) becomes `cdrom0:\NAME;1` as `argv[0]`, also on Windows (upstream converted only paths without a `:`); `[ee] boot path ...` log line. Pilot menu run: frames unchanged, cycles 52,595,993,473 → 52,595,993,647 (ISO), folder mode the same. |
 | `runtime/src/dispatch.cpp` (`g_reached`, `write_coverage`), `runtime/include/ps2/system.hpp`, `runtime/src/system.cpp` (`run()`) | Code coverage (T39): with `PS2_COVERAGE=<file>`, dispatch marks each EE RAM address it enters translated code at (one byte per word), and `run()` writes the marked addresses (hex, one per line) at exit. The exploration's progress signal. Unset: one extra test of an empty vector per dispatch; frames and cycle counts unchanged. |
+| `runtime/src/draw_profile.cpp`, `draw_profile.hpp` (new), `CMakeLists.txt`, `runtime/src/dmac.cpp` (`run_chain`, `start`, channel 2), `runtime/src/vif.cpp` (`run_vu`), `runtime/src/gs/gif.cpp` (`transfer`), `runtime/src/system.cpp` (`vblank`) | Draw profile (T45): `PS2_DRAW_PROFILE=<from>,<count>` times VIF1 tags per DMA `call` target, VU1 runs per entry and GIF paths 1/2 per target, headless only; `[draw]` lines after the last frame. Unset: one test of a false flag per VIF1 tag, VU1 run and GIF packet; frames and cycles unchanged. |
+| `runtime/src/gs/queue.hpp`, `queue.cpp` (`time_waits`, `wait_began`, `wait_ended`, `waited_ms`, `wait` kind), `runtime/src/gs/gs.cpp`, `gs.hpp` (`post_present(frame)`, `presented_frame`), `runtime/src/system.cpp`, `runtime/include/ps2/system.hpp` (wrappers, present timed), `host/window.cpp` (`PS2_FRAME_LOG`, `pace`) | Frame-time log (T45): time each thread waits by kind (only after `time_waits()`, i.e. with `PS2_FRAME_LOG`); the present carries its guest frame in the queue header. Pacing: timer-spaced frames with an audio-queue correction instead of waiting for the audio queue (window only; headless unchanged). |
 
 The headless Windows build (T22) needs no changes to upstream: the headless path
 leaves out `host/window.cpp` (SDL2), `host/profile.cpp` (Linux only) and the
@@ -551,6 +616,7 @@ python recomp/tests/oracle.py [--mode rec interp ...]     # Windows: vectors on 
 | `tests/oracle.py` | One test ELF for all eligible vectors, run on PCSX2 (own data folder in `work/`), end states parsed from the EE console log |
 | `tests/test_port.py` | `port.py`'s pure parts: serial from the boot ELF name, default `game.json`, refusal to overwrite, folder `settings.json` |
 | `tests/test_explore.py` | `explore.py` on synthetic frames: frame signature, black/frozen/repeated frames are not new scenes, stall rule, pattern order (stalls in a row try every pattern), generated presses |
+| `tests/test_drawlist.py` | `drawlist.py` on a synthetic chain: log parsing, chain read and VIF fingerprint, kinds and shares, `--match` at an odd file offset |
 | `tests/harness/` | C++ harness (`main.cpp`: load state, `dispatch`, print state as JSON), `override.cpp` (the override case's C++) and its CMake project (links upstream `ps2runtime`) |
 
 Harness output (fixture C++, build): `work/recomp-tests/`.

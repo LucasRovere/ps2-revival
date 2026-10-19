@@ -1,5 +1,6 @@
 #include "dmac.hpp"
 
+#include "draw_profile.hpp"
 #include "kernel.hpp"
 
 #include "gs/gif.hpp"
@@ -70,7 +71,15 @@ void deliver(int ch, std::uint32_t address, std::uint32_t qwc) {
     switch (ch) {
     case 0: vif::transfer(0, data, qwc); break;
     case 1: vif::transfer(1, data, qwc); break;
-    case 2: gif::transfer(3, data, qwc); break;
+    case 2:
+        if (draw_profile::g_on) {
+            const std::uint64_t start = draw_profile::now_ns();
+            gif::transfer(3, data, qwc);
+            draw_profile::channel2_ran(qwc, draw_profile::now_ns() - start);
+        } else {
+            gif::transfer(3, data, qwc);
+        }
+        break;
     case 9:
         for (std::uint32_t i = 0; i < qwc; ++i)
             std::memcpy(g_spr + ((g_ch[9].sadr + i * 16) & (kScratchpadSize - 1)), data + i * 16, 16);
@@ -219,6 +228,9 @@ void run_chain(int ch) {
         const bool irq = (tag >> 31) & 1u;
         const std::uint32_t addr = static_cast<std::uint32_t>(tag >> 32) & 0x7FFFFFF0u;
         const std::uint32_t addr_full = addr | (static_cast<std::uint32_t>(tag >> 63) << 31);
+        const bool profiled = ch == 1 && draw_profile::g_on;
+        const std::uint64_t profile_start = profiled ? draw_profile::now_ns() : 0;
+        const std::uint32_t profile_owner = profiled ? draw_profile::target() : 0;
         if (tte && (ch == 0 || ch == 1)) {
             std::uint8_t q[16];
             std::memcpy(q, tagp, 16);
@@ -238,10 +250,12 @@ void run_chain(int ch) {
             if (asp < 2) c.asr[asp] = data + qwc * 16;
             c.chcr = (c.chcr & ~0x30u) | (std::min(asp + 1, 2u) << 4);
             c.tadr = addr_full;
+            if (profiled) draw_profile::call(addr_full);
             break;
         }
         case 6: {
             const std::uint32_t asp = (c.chcr >> 4) & 3u;
+            if (profiled) draw_profile::ret();
             if (asp > 0) {
                 c.tadr = c.asr[asp - 1];
                 c.chcr = (c.chcr & ~0x30u) | ((asp - 1) << 4);
@@ -270,6 +284,7 @@ void run_chain(int ch) {
             deliver(ch, data, qwc);
             c.madr = data + qwc * 16;
         }
+        if (profiled) draw_profile::tag_done(profile_owner, qwc, draw_profile::now_ns() - profile_start);
         if (vif_stalled(ch)) {
             pause(ch, end || (tie && irq));
             return;
@@ -285,6 +300,7 @@ void start(int ch) {
     c.paused = false;
     c.tag_end = c.qwc && chain_ends_after_current(c);
     ++g_starts[ch];
+    if (ch == 1 && draw_profile::g_on && ((c.chcr >> 2) & 3u) == 1) draw_profile::chain_start();
     static const bool trace = std::getenv("PS2_TRACE_DMA") != nullptr;
     if (trace) std::fprintf(stderr, "[dma] ch%d chcr 0x%08X madr 0x%08X qwc %u tadr 0x%08X thread %d%s\n", ch, c.chcr, c.madr, c.qwc, c.tadr,
                             kernel::current_thread(), kernel::in_handler() ? " (handler)" : "");
