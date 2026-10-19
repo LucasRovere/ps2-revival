@@ -1,10 +1,12 @@
 # Native port plan (Phases 5–9, conversion tool)
 
-Status: **Phases 5–7 done; conversion tool track next (D26, 2026-10-19),
-then Phases 8–9.** Phases 6–9 were re-planned (D23, 2026-10-18) around the
+Status: **Phases 5–7 and the conversion tool done (except the
+second-game trial); Phase 8 started (T36, D32).** Order (owner, D31):
+Phase 8 → Phase 9 → fully native for the pilot game → wrap-up → other
+games (T40). Phases 6–9 were re-planned (D23, 2026-10-18) around the
 vendored ps2-web-recomp, which already provides most of what the original
 Phases 6 and 7 planned to build. Strategy decisions: D3, D5, D6, D9, D14,
-D16, D23, D26 in [decisions.md](decisions.md).
+D16, D23, D26, D31, D32 in [decisions.md](decisions.md).
 
 End goal (D26): a tool that turns a PS2 ISO into a native Windows game,
 per-game work automated as far as possible. Final intent: **fully native**
@@ -111,7 +113,7 @@ The vendored GS renderer (option B) is accurate and fast; it stays the base
   own timestep (D11); whether the port can present faster than the emulated
   VBlank is *unverified*.
 
-## Conversion tool (next, D26)
+## Conversion tool (D26; done except the second game, which moves after fully native, D31)
 
 Make "ISO in, playable Windows folder out" one command, and turn what was
 manual on the pilot game into tooling and agent skills. Order (owner):
@@ -142,15 +144,56 @@ Each step is about one session; split if bigger.
 ## Phase 8: native draw paths (option C), selective
 
 Only where Phase 7 can't reach: replacing models, FOV and draw distance,
-LOD, modern lighting/AA, HUD layout for 16:9. Per engine (D6):
+LOD, modern lighting/AA, HUD layout for 16:9; and, since D31, the fps dips
+at scale 2–3. Per engine (D6).
 
-1. Survey the engine's draw lists (meshes, materials, matrices, lights)
-   before they become VIF/GS packets (Ghidra export + the mesh format, T14).
-2. Hook them with overrides (Phase 6) and draw that part natively next to
-   the GS output; the GS path stays the fallback.
-3. Start with the best-known mesh format, then the rest.
+**Survey (T36, pilot game; details in the local notes).** Method, generic:
+a profiler build times the VIF1 DMA list per `call` target (VIF1, VU1 per
+program entry, GS front end per GIF path), a RAM dump gives each target's
+chain, and the chains are grouped by their VIF commands (unpack addresses,
+MSCAL) and matched by bytes against the disc's mesh files. Findings:
 
-Each step needs a concrete goal the GS path can't meet; otherwise skip it.
+- The engine writes one VIF1 DMA list per frame. Per object it sends the
+  world matrix, lights and material GS state (VIF unpacks to VU1 memory and
+  DIRECT packets), then `call`s the mesh's static chain: the mesh file's
+  ready-made VIF data as loaded (T14), which runs the VU1 program per
+  batch and ends with `ret`. Its renderer is a thin layer over VU1
+  (constant ids mapped to VU1 addresses, material bind, virtual submesh
+  draw methods): the seam for the fully native renderer later.
+- Racing frame (headless, shares of the frame): pre-lit static meshes
+  ~32%, the root list (object packets and texture uploads) ~18%, lit car
+  meshes ~16%, other VIF1 work ~4%, the rest (game code, GPU submission)
+  ~30%. Two VU1 program paths take 95% of the VU1 time. The race intro
+  (more cars) is the same picture. In the window the VU thread does the
+  VIF1/VU1 work (~55% of a core while racing), the render thread the GS
+  front end and GPU submission (~80% at scale 3: the limit).
+- Owner settings (scale 3, 16:9, texture pack) held 59–62 fps in a 25 s
+  racing run (2 s samples); short stutters are not visible that way.
+
+**Plan (D32).** The hook is a generic runtime seam: a handler registered
+for static mesh chains is called where VIF1 `call`s the chain (on the VU
+thread in the window, so GS ordering stays right) and may draw the mesh
+itself. Steps, one session each:
+
+1. Profiler and frame-time log as opt-in runtime features, with a report
+   script (T45).
+2. Chain handlers in the runtime; first handler: the pilot's pre-lit
+   static meshes, VU1 program path re-implemented on the CPU, primitives
+   into the GS renderer, frames compared with the VU path (T46).
+3. Lit car meshes the same way (T47).
+4. GPU mesh path: chain vertex data cached on the GPU, a compute pass
+   builds the GS primitives (skips the VU1 work and the GS front end);
+   fps and thread load measured at scale 3 (T48).
+5. Model replacement through the handler (a glTF model in place of a
+   car's chain) (T49).
+6. Look extras, decided after 4 and 5: forced best LOD (EE override),
+   better lighting in the GPU path (T50). Per-pixel lighting and MSAA need
+   a native raster stage: fully native renderer.
+
+Expected gains (racing, *estimate* from the shares): both mesh kinds on
+the GPU path take about 70% off the VU thread and about 35% off the render
+thread, which leaves scale 3 at 60 fps with headroom. Cars alone: about
+30% of the VU thread, under 10% of the render thread.
 
 ## Phase 9: assets and mods
 
@@ -168,6 +211,13 @@ Each step needs a concrete goal the GS path can't meet; otherwise skip it.
 - **Model improvement:** no reliable automatic method for game meshes:
   export → artists improve → re-import. Texture upscaling reuses `textures/`.
 
+Done: disc-file mods (T42), texture packs (T33, T43), car mesh export on
+the pilot game (T14). Left (D31): mesh export options for part variants
+and paint (T44, local tools), and a generic scene capture: the meshes the
+game draws, with their world matrices and materials, exported to glTF
+from the chain handlers (T51; covers the track geometry whose disc format
+is not decoded).
+
 ## Fully native (final intent, D26)
 
 The end state of a converted game has no PS2 hardware layer: a native
@@ -178,8 +228,12 @@ way (native draw paths, own asset formats). The route is the override table
 until the runtime's emulation parts are no longer called. Game-specific code
 stays in `local/games/<serial>/` (D24).
 
-The detailed plan is written when we do this for the first game. Target
-pace: about a week of agent work per game (D26).
+The detailed plan is written when we do this for the first game (T52,
+after Phase 9, D31). Target pace: about a week of agent work per game
+(D26). Starting point from T36: the pilot engine's renderer is a thin
+layer over VU1 (constants by id, material bind, virtual submesh draw
+methods); implementing that layer natively replaces the VU1/GS path for the
+whole scene, and Phase 8's handlers and GPU mesh path are its first pieces.
 
 ## Generalising
 

@@ -180,4 +180,8 @@ the same change.
   exploration's textures and upscales them into a pack keyed by the port's
   keys, copied into the port folder; the game gets `cdrom0:\<ELF>;1` as
   `argv[0]` in every mode. PCSX2 modules for PCSX2 players stay.
+- Phase 8 started (T36, D32): draw-list survey of the pilot game; go for
+  native draw paths hooked where VIF1 calls the engine's static mesh
+  chains. Order (owner, D31): Phase 8 → Phase 9 → fully native for the
+  pilot game → wrap-up → other games (T40).
 - Next up: see [docs/tasks.md](docs/tasks.md). The owner runs tasks with `/next-task`.

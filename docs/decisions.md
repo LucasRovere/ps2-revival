@@ -664,3 +664,62 @@ re-recorded in the local notes).
 code (then a reference run is worth discussing with the owner), or the
 automatic pack misses textures a game only shows in scenes the
 exploration can't reach.
+
+## D31: Finish Phases 8 and 9, then make the pilot game fully native, then more games
+
+**Decision (owner, 2026-10-19, quoted):** "We're still getting fps dips. I
+think I rather finish phases 8 and 9 and move on to the new plan to make
+the game full windows native. After that we can wrap up all of the
+important work and go ahead with other games to improve the automation
+scripts."
+
+**New order:** Phase 8 (native draw paths) → Phase 9 (remaining assets and
+mods) → fully native for the pilot game (planned in detail when we get
+there, D26) → wrap-up → other games. The second-game trial (T40) moves
+after that. T29/T30 stay parked: the native renderer is the intended fix
+for the fps dips at scale 2-3.
+
+**Why:** the owner's choice. It supersedes the D26 order ("conversion
+tool, then Phases 8 and 9") for the remaining steps; the conversion tool
+track is done except T40.
+
+**Revisit if:** the native draw path does not remove the dips (then T29
+comes back), or the owner wants a second game earlier.
+
+## D32: Phase 8 go: native draw paths hook the static mesh chains in the VIF1 stream
+
+**Decision (T36, 2026-10-19):** go for native draw paths on the pilot game.
+The hook is generic and sits in the runtime: when VIF1 DMA `call`s a
+static mesh chain, a registered handler (per engine, game-specific code in
+`local/games/<serial>/`, D24) may draw that mesh itself and skip the chain.
+It runs at that point of the stream (on the VU thread in the window), so
+ordering with the GS output, render-to-texture and post effects stays
+right. Order: the mechanism with a CPU re-implementation of a mesh kind's
+VU1 program (output into the GS renderer, frames compared with the VU
+path), then a GPU path that builds the primitives from mesh data cached on
+the GPU (skips both the VU1 work and the GS front end), then model
+replacement. Engine decisions (which LOD, which parts) stay with EE
+overrides (D5). The GS renderer stays for everything else (D23).
+
+**Why (measured on the pilot game, racing and race intro, local notes):**
+- The engine draws objects as matrices, lights and material state in a
+  per-frame DMA list, each followed by a `call` to the mesh's static chain
+  (the mesh file as loaded). Everything a native path needs is visible at
+  that call; no engine function has to be rewritten to start.
+- Two mesh kinds (pre-lit static meshes, lit car meshes) use two VU1
+  program paths that take 95% of the VU1 time; with the root chain they
+  make up most of the VIF1, VU1 and GS front-end work per frame.
+- Speed: CPU-made primitives into the GS front end save only the VU part
+  (VU thread, not the limit at scale 3). Drawing both kinds from GPU-side
+  data removes about 70% of the VU thread's work and about 35% of the
+  render thread's (the limit at scale 3) in racing (*estimate* from the
+  shares, *unverified* until built).
+- Look: replaced or higher-detail models are not possible on the VU path
+  (VU1 time grows with vertices; car VU cost is already ~3 ms per racing
+  frame for one or two cars). Per-pixel lighting and MSAA need a native
+  raster stage; that is left to the fully native renderer.
+
+**Revisit if:** the handler cannot match the VU path's look (lighting,
+fog, clipping) within a session or two; the GPU path does not cut the
+render thread as estimated; or another engine has no static chains (then
+hook its VU1 programs by key instead).
