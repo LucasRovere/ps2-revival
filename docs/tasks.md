@@ -6,81 +6,54 @@ fits in one session.
 
 ## Next task
 
-### T33: recomp: texture packs in the GPU renderer
+### T35: mods: disc-file mod folder
 
-**Goal:** Phase 7 (D23): the window port shows replacement textures (PNGs,
-e.g. the `textures/` upscales) in place of the game's own, found by our
-own content hash, as a launcher setting.
+**Goal:** Phase 9 (D23, D9): the port reads files from a mods folder before
+the disc, by disc path, so data mods (text tables, textures inside the
+game's own files) work without rebuilding the ISO, as a launcher setting.
 
 **Context:**
-- The GPU renderer (vendored `runtime/src/gs/gpu/gpu.cpp`, `gs.wgsl`) has
-  no texture objects: the raster shader samples GS memory (`g_vram`, kept
-  on the GPU in GS layout, scaled by `PS2_SCALE`) through the draw's TEX0
-  fields (`make_setup`: TBP0 `w[12]`, TBW `w[13]`, PSM `w[14]`, TW/TH
-  `w[15]`, CPSM/CSA `w[16]`/`w[17]`). CLUTs go into `g_clut` slots
-  (`load_clut`). Batches with more than `kDecodePrims` prims pre-decode
-  their textures into `g_decoded` (`plan_decodes`, `decode` pass; setup
-  word 24 points at the decoded copy). That decode cache is the natural
-  place to swap in replacement texels: a setup can point at a replacement
-  instead of a decoded copy.
-- The texel data lives on the GPU, so a content hash needs either a CPU
-  copy of what the game uploads (GIF image transfers pass through
-  `gs.cpp` before `gpu::upload`) or a GPU-side hash. *Unverified:* that a
-  texture's hash is stable across uploads (same bytes each time) and that
-  uploads map 1:1 to draws' TEX0 (partial uploads, textures packed into
-  one upload, render-to-texture). The pilot game uploads some paletted
-  textures as PSMCT32 and draws them as PSMT8/PSMT4 (local notes T7), so
-  the key likely belongs at draw/decode time, not per upload.
-- `textures/` (Phase 1) works from PCSX2 dumps named by PCSX2's own hash
-  (`docs/textures.md`); PCSX2's hash is not ours. So the pack needs a map
-  from our hash to PNG: e.g. a dump mode in the port (`PS2_TEX_DUMP=<dir>`:
-  write each new texture as PNG named by our hash), then match those to
-  PCSX2 dumps by pixels (the pilot game's PCSX2 dumps decode
-  pixel-identical to its local decoder, local notes T7).
-- Alpha: PS2 alpha 0-128 (128 = opaque) in dumps and replacements
-  (`docs/textures.md`). Replacements may be 2× or 4× larger (`textures.scale`);
-  sampling must map the draw's texel coordinates to the larger image.
-- T32: `play.py` passes settings as env vars (`PS2_SCALE`, `PS2_ASPECT`);
-  frame dumps (`--frames-dir`) are the internal buffer at the scaled size.
-  Test runs: `work/t32/` scripts (`shots.ps1`: short run from a patched
-  race-intro state; `run.ps1`: menu run from boot), T28
-  window fps runs (`work/t28/threads_window.ps1`). Race intro at scale 1
-  holds ~56-60 fps in the window; the render thread is near its limit
-  (T29), so the replacement path must not add per-draw CPU work.
+- Phase 7 is done (T32 widescreen/resolution, T33 texture packs). The next
+  phase with planned work is 9; Phase 8 waits for T14/T36.
+- The runtime's disc layer: `runtime/src/disc.cpp` (ISO9660 index of all
+  files: `find(path)` → LBA and size, sector `read`), used by the IOP side
+  (`iop/cdvd.cpp`, `iop/cdvdfsv.cpp`: the game's CD/DVD RPCs). Games usually
+  look a file up (`sceCdSearchFile` → LBA, size) and then read sectors, so a
+  mod file of another size needs its own sector range (e.g. virtual LBAs past
+  the end of the disc) and the lookup must return it. *Unverified:* which
+  calls the pilot game uses (check `[iop]`/`[disc]` logs, `PS2_TRACE_*`).
+- Engine archives: games that pack files into their own archives need a
+  game-specific writer (D24: `local/games/<serial>/tools/`, not in the repo).
+  Pilot game: archive format and reader in the local notes (T4, T8);
+  game-specific details for this task: local notes, "Task details".
+- Settings: `play.py` passes `play.json` keys as env vars (`PS2_SCALE`,
+  `PS2_ASPECT`, `PS2_TEXTURES`); test runs and baselines: `work/t33/`
+  scripts (`run.ps1` menu run from boot, 107 frames, 52,595,993,473
+  cycles; `shots.ps1` race intro from `work/t32/p10400.state`).
+- Vendored code: minimal patches, each in the `recomp/README.md` list.
 
 **Scope:**
-0. Owner approvals: none expected (no downloads; PCSX2 dumps are only read).
-1. Hash: define our texture key (PSM, size, texel bytes, CLUT for paletted
-   formats) and where it is computed; measure stability on real runs
-   (same texture → same hash across frames and runs; count distinct
-   hashes in the race intro).
-2. Dump mode: the port writes each new texture as PNG named by its hash
-   (game-derived output, `work/` only).
-3. Replacement: a pack folder (`local/games/<serial>/textures/` or a
-   `play.json` key `textures`) of `<hash>.png`; matching draws sample the
-   replacement (at its own resolution) instead of GS memory. Vendored
-   patches minimal, README patch list.
-4. Map PCSX2 dumps / `textures/` replacements to our hashes offline (a
-   small tool in `textures/`, generic) so the existing upscales can be
-   used.
-5. Check: a race-intro frame with replaced textures (looked at; e.g. a
-   test pack with solid-colour PNGs first, then real upscales); hit/miss
-   counts in the log; fps cost in the window; with no pack, frames
-   byte-identical and the same cycle count.
-6. Docs: README (pack format, dump mode, results), `docs/textures.md`,
-   local notes, roadmap, AGENTS.
+0. Owner approvals: none expected (no downloads; mods are made from the
+   owner's own disc into `local/` or `work/`).
+1. Runtime: `PS2_MODS=<folder>`: a file at `<folder>/<disc path>` replaces
+   that disc file (lookup and reads); log `[mods] N files` and each file
+   served once. Without the setting, nothing changes.
+2. Launcher: `play.json` key `mods` (default `""`).
+3. Pilot game: a changed text table and one changed texture inside the
+   game's files (local tool rebuilds the archive with the changed entry),
+   seen in frames.
+4. Docs: README (mod folder format, limits), local notes, roadmap, AGENTS.
 
 **Success criteria:**
-- With a pack, replaced textures show in the window and in frame dumps;
-  hit/miss counts logged.
-- Without a pack, frames byte-identical and the menu run reaches the race
-  intro with the same cycle count as the previous build.
-- Hash stability measured and written down (*Unverified* items marked).
-- fps cost measured.
+- With a mods folder, the changed text and texture show in frames; the log
+  lists the served files.
+- Without it, menu-run frames byte-identical and the same cycle count as
+  the previous build.
+- A mod file larger than the original works (or the limit is written down).
 - No game data and nothing game-specific in git.
 
-**Out of scope:** making new upscales (Phase 1 does that), model or mesh
-replacement (Phase 8/9), the disc-file mod folder (T35), speed work (T29).
+**Out of scope:** new file formats beyond what the check needs, model
+replacement (Phase 8/9), texture packs (T33), speed (T29).
 
 ## Backlog
 
@@ -89,22 +62,17 @@ with the same level of detail as above. Plan:
 [native-port-plan.md](native-port-plan.md) (D23). Game-specific details of
 each item: `local/games/<serial>/notes.md`, section "Task details".
 
-1. **T35: mods: disc-file mod folder (Phase 9).** The runtime's disc layer
-   (`disc.cpp`/`cdvdfsv.cpp`) serves files from a mods folder before the
-   ISO, by disc path. Games that pack files in engine archives need a local
-   archive writer (game-specific, in `local/games/<serial>/tools/`). Check
-   with a changed text table and one texture, seen in game.
-2. **T14: assets: pilot game mesh format (Phase 9, feeds Phase 8).** Owner:
+1. **T14: assets: pilot game mesh format (Phase 9, feeds Phase 8).** Owner:
    "this can be done later". Decode the pilot game's binary model meshes and
    export one to glTF, checked by a render. Engine-specific: the tool lives
    in `local/games/<serial>/tools/`, not in the repo (D24).
-3. **T36: analysis: pilot game renderer draw lists (Phase 8 start).** From
+2. **T36: analysis: pilot game renderer draw lists (Phase 8 start).** From
    the Ghidra export and the T14 mesh format: how the engine turns meshes,
    materials, matrices and lights into VIF/GS packets; which functions to
    override to draw a model natively next to the GS output. Output: local
    notes and a go/no-go for a native draw path with a concrete goal (model
    replacement, LOD, lighting) the GS path can't meet.
-4. **T29: recomp: speed headroom for racing.** After T28 the race intro is
+3. **T29: recomp: speed headroom for racing.** After T28 the race intro is
    60 fps paced but only ~71 fps unpaced, with the VU and render threads both
    near 100% there (at 60 fps: VU ~83%, render ~80%). Record VU1 programs
    during real gameplay (`PS2_VU_RECORD` / `port.py`) and check how many
@@ -116,7 +84,7 @@ each item: `local/games/<serial>/notes.md`, section "Task details".
    loop, `memcpy` into the rings); `x86-64-v3` builds (AVX2, no FMA, needs
    the owner's OK to drop CPUs without AVX2, D22). Same save-state runs and
    byte-identical frame checks as T25-T28.
-5. **T30: recomp: decouple IOP/SPU2 from the EE clock.** Owner request: audio
+4. **T30: recomp: decouple IOP/SPU2 from the EE clock.** Owner request: audio
    must not depend on the frame rate. Today the EE, IOP and SPU2 share one
    emulated clock, so when the EE falls behind real time the SPU2 makes
    fewer samples and the audio underruns. On a real PS2 the IOP/SPU2 run on
@@ -166,4 +134,5 @@ Results with game-specific numbers: `local/games/<serial>/notes.md`.
 | Policy: nothing game-specific in the repo | 2026-10-18 | D24 (owner): per-game recipes, notes and engine-specific tools moved to `local/games/<serial>/`; tools read `local/games/<serial>/game.json`; docs game-neutral | `3eb8a1a` |
 | T31: recomp: function overrides and recipe patches in the port | 2026-10-19 | `port.py` applies the `game.json` patches to the translated ELF (`--no-patches`); `eerecomp --overrides` + runtime `register_override` (vendored patch); pilot game: 16:9 camera in the port, identity override and screen-type override byte-identical, harness override case passes | `1688122` |
 | T34: recomp: saves and launcher | 2026-10-19 | `port.py --saves`: the pilot game formats the card, saves a new profile, a new boot loads it (frames looked at); the card has PCSX2's `.ps2` layout (superblock byte-identical, ECC right) and the port loads a PCSX2-made save; `recomp/play.py` launches the window port with `local/games/<serial>/play.json` (card, scale, fullscreen); two vendored log lines | `7081f3c` |
-| T32: recomp: widescreen and resolution in the window | 2026-10-19 | `play.json` `aspect: "16:9"` (`PS2_ASPECT`, vendored patch: blit viewport, SDL fallback, 1280×720 window) presents the game's own 16:9 image unsqueezed (presented surface read back and looked at); 4:3 default frames byte-identical, same cycle count; `PS2_SCALE` 2/3 sharper, no new artefacts, +2-3 ms/frame headless, small race-intro fps dips in the window; default 1, clamp 3; owner check pending | this commit |
+| T32: recomp: widescreen and resolution in the window | 2026-10-19 | `play.json` `aspect: "16:9"` (`PS2_ASPECT`, vendored patch: blit viewport, SDL fallback, 1280×720 window) presents the game's own 16:9 image unsqueezed (presented surface read back and looked at); 4:3 default frames byte-identical, same cycle count; `PS2_SCALE` 2/3 sharper, no new artefacts, +2-3 ms/frame headless, small race-intro fps dips in the window; default 1, clamp 3; owner check pending | `c21e2a7` |
+| T33: recomp: texture packs in the GPU renderer | 2026-10-19 | Packs of `<key>.png` (`play.json` `textures`, `PS2_TEXTURES`), dump mode `PS2_TEX_DUMP`, `textures/pack.py` (PCSX2 replacements via pixel match); key from per-column upload hashes (D25), stable across frames and runs; replaced textures seen in frames (solid test pack, real upscales); no pack = byte-identical frames and cycles; window 60 fps with a pack, +1.6-2 ms/frame headless; Phase 7 items done | this commit |

@@ -491,3 +491,27 @@ folder must be created (or copied) on each machine. Template:
 [games.md](games.md). Supersedes the "per-game recipes in git" part of D1.
 
 **Revisit if:** the owner wants to share recipes publicly again.
+
+## D25: Port texture packs use our own key from upload hashes
+
+**Decision:** The port's texture packs (T33) name images by our own 64-bit
+key: per 64-byte GS column, a hash of the bytes the last upload wrote to all
+of it; a texture's key mixes its format, size, the tags of its columns and
+of the CLUT entries it reads. Packs are folders of `<key>.png` (PS2 alpha,
+1/2/4/8× size). PCSX2 replacements are converted with `textures/pack.py`
+(pixel match port dump ↔ PCSX2 dump). Details: [recomp/README.md](../recomp/README.md).
+
+**Why:** the GPU renderer keeps GS memory on the GPU, so hashing texels at
+draw time needs a CPU copy of GS memory. Keeping one costs ~22 ms per
+frame in the pilot game's race intro (~2,500 uploads, ~6 MB per frame) and
+the key is needed for every texture the game re-uploads. Hashing the upload
+bytes as they arrive costs ~1.5 ms per frame headless and none visible in
+the window. Column tags (not whole uploads) keep the key independent of how
+the game splits uploads and where it puts textures. PCSX2's hash format is
+not used: its code is GPL-3 and its key depends on its own texture cache.
+
+**Limits:** textures narrower than a GS column, memory restored from a save
+state and render targets get no key (never replaced).
+
+**Revisit if:** a game uploads its textures in partial columns (most of its
+textures untagged), or the CPU cost matters (T29).

@@ -105,6 +105,7 @@ git-ignored), created with defaults on first use:
 | `scale` | `1` | GPU internal resolution 1-3 (`PS2_SCALE`) |
 | `fullscreen` | `false` | Start fullscreen (F11 toggles) |
 | `aspect` | `"4:3"` | `"16:9"` presents the image at 16:9 (`PS2_ASPECT`), for a game running its own widescreen mode (e.g. through recipe patches) |
+| `textures` | `""` | Texture pack folder (`PS2_TEXTURES`, relative to the repo or absolute), e.g. `local/games/<SERIAL>/textures`; `""` = off (below) |
 
 Keys missing from an older `play.json` take the defaults. The log shows
 `settings: ...`, `[gpu] scale N`, `[gpu] aspect W:H` and
@@ -139,6 +140,64 @@ lined up). Recommendation: scale 2 or 3 for looks, with small fps dips in
 heavy scenes until the render thread gets faster (T29); default stays 1.
 Scale 3 already gives ~1340 lines, about a 1440p display's height, so the
 clamp stays at 3.
+
+### Texture packs (T33)
+
+`PS2_TEXTURES=<folder>` (`textures` in `play.json`) replaces textures with
+PNGs from a pack folder; `PS2_TEX_DUMP=<folder>` writes each new texture the
+game draws as a PNG (game-derived: keep it in `work/`). Both use the same file
+name, `<key>.png`: 16 hex digits of our texture key. Only the GPU renderer
+uses packs.
+
+**Key.** The texel data lives on the GPU, so the key is built from the bytes
+the game uploads, not from GS memory. Each image transfer tags every 64-byte
+GS column it writes completely with a hash of its bytes (in upload order);
+a column it writes partly gets no tag. A CLUT load tags the CLUT entries it
+writes with the tags of its source columns. A texture's key mixes its PSM,
+TW/TH, the tags of all columns under it (row order) and, for 4/8-bit
+textures, the tags of the CLUT entries it reads (for 16/24-bit colours also
+TEXA/AEM). The key does not depend on the address, so a texture uploaded to
+another place keeps its key. Textures get no key (are never replaced or
+dumped) when a column under them has no tag: textures narrower than a GS
+column (4-bit < 32 px, 8-bit < 16 px wide, often mip levels), memory loaded
+from a save state until the game uploads it again, and pages the GPU drew to
+or copied into (render targets, page granularity). Formats replaced: PSMCT32,
+PSMCT24, PSMCT16, PSMT8, PSMT4, any wrap mode but region repeat.
+
+**Pack images.** 8-bit RGBA (or RGB, alpha 0x80) PNGs, PS2 alpha (0-128, as
+in PCSX2 dumps and `textures/` output), exactly 1, 2, 4 or 8 times the
+texture's TW×TH (the dump's size); other sizes are ignored. The raster shader
+samples the image at its own resolution (nearest, or bilinear when the game
+asks for it; wrap and clamp at the image's resolution). Images are decoded on
+first use (own PNG reader, no new library) and kept in a GPU buffer (up to
+1 GiB; when full the buffer is flushed and refilled). Mipmaps: the renderer
+only samples level 0, so packs hold base levels only.
+
+`python textures/pack.py <SERIAL> --dumps <dump folder>` builds a pack from
+the PCSX2 replacements (`docs/textures.md`): each port dump is matched to a
+PCSX2 dump by pixels and the replacement of the match is copied as
+`<key>.png` into `local/games/<SERIAL>/textures/`.
+
+The log shows `[tex] pack <folder>: N textures` at start and, at exit,
+`[tex] lookups N: replaced R, render targets D, unsupported U, untagged T;
+textures K (replaced L)` (lookups = texture setups the renderer built).
+
+Without `PS2_TEXTURES`/`PS2_TEX_DUMP` nothing runs (no tags, no lookups).
+With `PS2_TEX_DUMP` gs.cpp also keeps GS memory on the CPU to decode the
+dumped textures, which costs a lot (debug mode only).
+
+Check (pilot game, race intro from a patched state, 600 frames): two dump
+runs gave the same files byte for byte (a texture re-uploaded every frame
+keeps its key); ~10% of lookups untagged (tiny/narrow textures). A test pack
+of solid colours replaced every dumped texture in the frames; the real pack
+(`pack.py`; under a third of the port's dumps matched a PCSX2 dump, the rest
+were never dumped by PCSX2) shows the upscales in place, sharper at
+`PS2_SCALE` 3, no garbled or misplaced textures. The menu run from boot with
+the pack replaces the same textures (keys from boot equal keys from the
+state) and keeps the same cycle count; without a pack its 107 frames are
+byte-identical to the previous build. Cost: headless race intro 27.3 →
+28.9-29.3 ms/frame with a pack (CPU: tagging ~6 MB of uploads per frame);
+window 60 fps with and without a pack (3 runs each).
 
 ### Patches and overrides (T31)
 
@@ -205,6 +264,7 @@ except:
 | `recomp/main.cpp`, `recomp/codegen.hpp`, `recomp/codegen.cpp`, `runtime/include/ps2/generated.hpp`, `runtime/src/dispatch.cpp` | Function overrides (T31, D5): `eerecomp --overrides <file>` (each address must be a function entry, else an error); at each listed entry of the main program the unit emits `if (run_override(c, k)) { c.pc = ra; return; }` (k = place in the sorted list); `table.cpp` gets `kOverrides[]` and `register_generated_code` calls `register_overrides()` (written by `port.py`) and `check_overrides`. Runtime: `register_override(addr, fn)`, `check_overrides` (exits on a listed address without an override or an extra registration), `run_override` (counts calls; counts printed at exit). Without `--overrides` the output is byte-identical (pilot game: all 238 units and `table.cpp`). |
 | `runtime/src/iop/sio2.cpp` (`flush_cards`), `runtime/src/gs/gpu/gpu.cpp` (scale) | Log lines (T34): `[mc] card saved: <file>` after each card file write, `[gpu] scale N` at GPU start, so save runs and the launcher's settings show in the log. |
 | `runtime/src/gs/gpu/gpu.cpp` (blit viewport in `submit`, `present`), `host/window.cpp` (window size, SDL logical size) | 16:9 presentation (T32): `PS2_ASPECT=16:9` replaces the fixed 4:3 of the blit viewport and the SDL fallback with 16:9 and opens a 1280×720 window; `[gpu] aspect W:H` at GPU start. Unset, the arithmetic is the same as upstream's. |
+| `runtime/src/gs/gpu/texpack.cpp`, `texpack.hpp` (new), `gpu.cpp` (upload tags, `replacement` in the setup cache, `g_repl` binding 8, plan_decodes skips replaced setups, `[tex]` stats), `gpu.hpp` (`texture_dump`), `gs.wgsl` (`sample_repl`), `gs.cpp` (`cpu_memory`: CPU copy of GS memory for the dump), `CMakeLists.txt` (texpack.cpp) | Texture packs (T33, D25): setup word 24 = `0x80000000 | log2(scale) << 29 | offset/16` points the raster shader at a pack image instead of GS memory. Without `PS2_TEXTURES`/`PS2_TEX_DUMP` the new code does not run and frames and cycle counts are unchanged. |
 
 The headless Windows build (T22) needs no changes to upstream: the headless path
 leaves out `host/window.cpp` (SDL2), `host/profile.cpp` (Linux only) and the

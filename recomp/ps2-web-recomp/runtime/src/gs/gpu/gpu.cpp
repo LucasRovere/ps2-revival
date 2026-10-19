@@ -1,4 +1,5 @@
 #include "gpu.hpp"
+#include "texpack.hpp"
 #include "ps2/system.hpp"
 
 #include <webgpu/webgpu.h>
@@ -16,6 +17,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 extern const char kGsShader[];
 extern const char kBlitShader[];
@@ -66,8 +68,34 @@ std::uint64_t g_measured_ns = 0, g_measured = 0, g_total_passes = 0;
 WGPUDevice g_device = nullptr;
 WGPUQueue g_queue = nullptr;
 WGPUBuffer g_vram = nullptr, g_tables = nullptr, g_params = nullptr, g_data = nullptr, g_clut = nullptr, g_scratch = nullptr, g_readback = nullptr, g_decoded = nullptr;
+WGPUBuffer g_repl = nullptr;
 std::uint32_t g_decoded_used = 0;
 bool g_rendered[512] = {};
+
+// Texture packs (texpack.cpp): setup word 24 = 0x80000000 | log2(scale) << 29 | offset / 16 bytes into g_repl.
+constexpr std::uint32_t kNoDecode = 0xFFFFFFFFu;
+bool g_textures = false;
+bool g_tex_drawn[512] = {};
+std::uint64_t g_page_stamp[512] = {}, g_stamp = 0, g_repl_size = 16, g_repl_used = 0;
+struct TexelMemo {
+    std::uint64_t stamp = 0, key = 0;
+    bool valid = false;
+};
+std::unordered_map<std::uint64_t, TexelMemo> g_texel_memo;
+struct PaletteMemo {
+    std::uint32_t slot = ~0u, fields[4] = {};
+    std::uint64_t key = 0;
+} g_palette_memo;
+std::unordered_map<std::uint64_t, std::uint32_t> g_resident;
+std::vector<std::uint8_t> g_upload;
+// Recent lookups by texture fields, valid while their pages are not uploaded again.
+struct RecentLookup {
+    std::uint32_t fields[6] = {}, slot = ~0u, code = kNoDecode;
+    std::uint64_t stamp = 0;
+    bool untagged = false;
+} g_recent[64];
+std::unordered_set<std::uint64_t> g_seen_keys, g_replaced_keys;
+std::uint64_t g_tex_lookups = 0, g_tex_hits = 0, g_tex_drawn_skips = 0, g_tex_unsupported = 0, g_tex_untagged = 0;
 bool g_decode = true;
 std::uint64_t g_params_size = 0, g_data_size = 0;
 WGPUBindGroupLayout g_layout = nullptr;
@@ -450,7 +478,12 @@ Range pages(std::uint32_t bp, std::uint32_t bw, std::uint32_t psm, int x0, int y
 }
 
 void mark_rendered(const Range &r) {
-    for (std::uint64_t at = r.lo; at < r.hi; at += 8192) g_rendered[(at >> 13) & 511u] = true;
+    for (std::uint64_t at = r.lo; at < r.hi; at += 8192) g_rendered[(at >> 13) & 511u] = g_tex_drawn[(at >> 13) & 511u] = true;
+}
+
+void stamp_pages(const Range &r) {
+    ++g_stamp;
+    for (std::uint64_t at = r.lo; at < r.hi; at += 8192) g_page_stamp[(at >> 13) & 511u] = g_stamp;
 }
 
 bool rendered(const Range &r) {
@@ -472,7 +505,7 @@ void plan_decodes(std::uint32_t prims) {
     static const int kKey[] = {12, 13, 14, 15, 16, 17, 20, 22};
     for (std::uint32_t i = 0; i < setups; ++i) {
         std::uint32_t *w = b.setups.data() + i * kSetupWords;
-        if (!(w[0] & 2u)) continue;
+        if (!(w[0] & 2u) || w[24] != kNoDecode) continue;
         bool shared = false;
         for (const Decode &d : g_decodes) {
             const std::uint32_t *o = b.setups.data() + d.setup * kSetupWords;
@@ -762,19 +795,31 @@ std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uin
     return used;
 }
 
+// Tags the image's GS memory for texture-pack keys; memory without tags counts as drawn.
+void tag_image(const Image &im) {
+    const Range r = region(im.dbp, im.dbw, im.dpsm, static_cast<int>(im.dsax), static_cast<int>(im.dsay), static_cast<int>(im.dsax + im.rrw - 1), static_cast<int>(im.dsay + im.total / im.rrw - 1));
+    if (!texpack::tag_upload(im.dbp, im.dbw, im.dpsm, im.dsax, im.dsay, im.rrw, im.total / im.rrw, g_upload.data(), g_upload.size()))
+        for (std::uint64_t at = r.lo; at < r.hi; at += 8192) g_tex_drawn[(at >> 13) & 511u] = true;
+    stamp_pages(r);
+    g_upload.clear();
+}
+
 void finish_image_if_done() {
     Image &im = g_image;
     if (im.done < im.total) return;
     im.active = false;
     im.pending.clear();
+    if (g_textures) tag_image(im);
     const std::uint32_t psm = im.dpsm;
     if (psm != PSMCT32 && psm != PSMCT16 && psm != PSMCT16S && psm != PSMT8 && psm != PSMT4 && psm != PSMZ32 && psm != PSMZ16 && psm != PSMZ16S) return;
     std::uint32_t pw, ph;
     page_size(psm, pw, ph);
     const std::uint32_t per_row = std::max<std::uint32_t>(1, im.dbw * 64 / pw), rows = im.rrw ? im.total / im.rrw : 0;
     for (std::uint32_t py = (im.dsay + ph - 1) / ph; py < (im.dsay + rows) / ph; ++py)
-        for (std::uint32_t px = (im.dsax + pw - 1) / pw; px < (im.dsax + im.rrw) / pw; ++px)
-            g_rendered[((im.dbp * 256 + (px + py * per_row) * 8192) >> 13) & 511u] = false;
+        for (std::uint32_t px = (im.dsax + pw - 1) / pw; px < (im.dsax + im.rrw) / pw; ++px) {
+            const std::uint32_t page = ((im.dbp * 256 + (px + py * per_row) * 8192) >> 13) & 511u;
+            g_rendered[page] = g_tex_drawn[page] = false;
+        }
 }
 
 void flush_image() {
@@ -819,9 +864,9 @@ WGPUBuffer make_buffer(std::uint64_t size, WGPUBufferUsage usage) {
 
 void rebuild_group() {
     if (g_group) wgpuBindGroupRelease(g_group);
-    WGPUBindGroupEntry e[8] = {};
-    WGPUBuffer buffers[8] = {g_vram, g_tables, g_params, g_data, g_clut, g_scratch, g_cache, g_decoded};
-    for (int i = 0; i < 8; ++i) {
+    WGPUBindGroupEntry e[9] = {};
+    WGPUBuffer buffers[9] = {g_vram, g_tables, g_params, g_data, g_clut, g_scratch, g_cache, g_decoded, g_repl};
+    for (int i = 0; i < 9; ++i) {
         e[i] = WGPU_BIND_GROUP_ENTRY_INIT;
         e[i].binding = static_cast<std::uint32_t>(i);
         e[i].buffer = buffers[i];
@@ -829,7 +874,7 @@ void rebuild_group() {
     }
     WGPUBindGroupDescriptor d = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
     d.layout = g_layout;
-    d.entryCount = 8;
+    d.entryCount = 9;
     d.entries = e;
     g_group = wgpuDeviceCreateBindGroup(g_device, &d);
 }
@@ -1169,9 +1214,106 @@ void attrs(std::uint32_t *rec, int n, const Vertex &v, bool fst, const Vertex *c
     rec[11] |= static_cast<std::uint32_t>(v.f) << (8 * n);
 }
 
+// Calls f with each page under the texture's blocks (a texture need not start on a page).
+template <typename F>
+void texture_pages(const std::uint32_t *w, F &&f) {
+    std::uint32_t pw, ph;
+    page_size(w[14], pw, ph);
+    const std::uint32_t per_row = std::max<std::uint32_t>(1, w[13] * 64 / pw);
+    const std::uint32_t cols = std::max(1u, (1u << (w[15] & 0xFFu)) / pw), rows = std::max(1u, (1u << (w[15] >> 8)) / ph);
+    for (std::uint32_t py = 0; py < rows; ++py)
+        for (std::uint32_t px = 0; px < cols; ++px) {
+            const std::uint64_t at = w[12] * 256ull + (px + py * per_row) * 8192ull;
+            f(static_cast<std::uint32_t>(at >> 13) & 511u);
+            f(static_cast<std::uint32_t>((at + 8191) >> 13) & 511u);
+        }
+}
+
+std::uint64_t palette_key(const std::uint32_t *w) {
+    PaletteMemo &m = g_palette_memo;
+    const std::uint32_t fields[4] = {w[14], w[16], w[17], w[20] | (w[0] & 32768u)};
+    if (m.slot != g_clut_slot || std::memcmp(m.fields, fields, sizeof fields) != 0) {
+        m.slot = g_clut_slot;
+        std::memcpy(m.fields, fields, sizeof fields);
+        m.key = texpack::palette_key(w);
+    }
+    return m.key;
+}
+
+std::uint32_t make_resident(std::uint64_t key, const texpack::Image &img, std::uint32_t scale_log2) {
+    if (const auto it = g_resident.find(key); it != g_resident.end()) return it->second;
+    const std::uint64_t bytes = (img.texels.size() * 4 + 15) & ~15ull;
+    if (bytes > g_repl_size) return kNoDecode;
+    if (g_repl_used + bytes > g_repl_size) {
+        flush_all();
+        submit();
+        g_resident.clear();
+        g_repl_used = 0;
+        for (RecentLookup &r : g_recent) r.slot = ~0u;
+    }
+    wgpuQueueWriteBuffer(g_queue, g_repl, g_repl_used, img.texels.data(), img.texels.size() * 4);
+    const std::uint32_t code = 0x80000000u | (scale_log2 << 29) | static_cast<std::uint32_t>(g_repl_used / 16);
+    g_repl_used += bytes;
+    return g_resident[key] = code;
+}
+
+std::uint32_t lookup(const std::uint32_t *w, std::uint64_t newest, bool &untagged) {
+    TexelMemo &m = g_texel_memo[w[12] | (static_cast<std::uint64_t>(w[13]) << 14) | (static_cast<std::uint64_t>(w[14]) << 20) | (static_cast<std::uint64_t>(w[15]) << 26)];
+    if (!m.valid || m.stamp < newest) {
+        m.key = texpack::texel_key(w);
+        m.stamp = g_stamp;
+        m.valid = true;
+    }
+    const std::uint64_t key = texpack::combine(m.key, palette_key(w));
+    untagged = !key;
+    if (untagged) return kNoDecode;
+    if (g_seen_keys.insert(key).second && texpack::dumping()) texpack::dump(key, w, g_state.clut);
+    const texpack::Image *img = texpack::find(key);
+    if (!img) return kNoDecode;
+    const std::uint32_t tw = 1u << (w[15] & 0xFFu), th = 1u << (w[15] >> 8);
+    std::uint32_t scale_log2 = 0;
+    while (scale_log2 < 3 && (tw << scale_log2) < img->width) ++scale_log2;
+    if (img->width != tw << scale_log2 || img->height != th << scale_log2) return kNoDecode;
+    const std::uint32_t code = make_resident(key, *img, scale_log2);
+    if (code != kNoDecode) g_replaced_keys.insert(key);
+    return code;
+}
+
+// Setup word 24 for a textured setup: the pack image for its texture, if there is one.
+std::uint32_t replacement(const std::uint32_t *w) {
+    ++g_tex_lookups;
+    if (!texpack::replaceable(w)) {
+        ++g_tex_unsupported;
+        return kNoDecode;
+    }
+    bool drawn = false;
+    std::uint64_t newest = 0;
+    texture_pages(w, [&](std::uint32_t page) {
+        drawn = drawn || g_tex_drawn[page];
+        newest = std::max(newest, g_page_stamp[page]);
+    });
+    if (drawn) {
+        ++g_tex_drawn_skips;
+        return kNoDecode;
+    }
+    const std::uint32_t fields[6] = {w[12], w[13], w[14], w[15], w[16] | (w[17] << 8), w[20] | (w[0] & 32768u)};
+    RecentLookup &r = g_recent[(w[12] ^ (w[12] >> 6) ^ w[15]) & 63u];
+    if (r.slot != g_clut_slot || r.stamp < newest || std::memcmp(r.fields, fields, sizeof fields) != 0) {
+        std::memcpy(r.fields, fields, sizeof fields);
+        r.code = lookup(w, newest, r.untagged);
+        r.slot = g_clut_slot;
+        r.stamp = g_stamp;
+    }
+    if (r.code != kNoDecode) ++g_tex_hits;
+    if (r.untagged) ++g_tex_untagged;
+    return r.code;
+}
+
 }
 
 Mode mode() { return g_mode; }
+
+bool texture_dump() { return g_textures && texpack::dumping(); }
 
 bool init(Mode m) {
     if (m == Mode::off) return false;
@@ -1272,6 +1414,9 @@ bool init(Mode m) {
     g_decoded = make_buffer(static_cast<std::uint64_t>(kDecodedWords) * 4, WGPUBufferUsage_Storage);
     if (const char *decode = std::getenv("PS2_DECODE")) g_decode = std::atoi(decode) != 0;
     g_cache_copy.assign(kCacheWords, 0);
+    g_textures = texpack::init();
+    if (g_textures) g_repl_size = std::min<std::uint64_t>({supported.maxStorageBufferBindingSize, supported.maxBufferSize, 1ull << 30}) & ~15ull;
+    g_repl = make_buffer(g_repl_size, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
     g_readback = make_buffer(static_cast<std::uint64_t>(g_copy_words) * 4, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
     if (g_timestamps) {
         WGPUQuerySetDescriptor qd = WGPU_QUERY_SET_DESCRIPTOR_INIT;
@@ -1282,11 +1427,11 @@ bool init(Mode m) {
         g_query_read = make_buffer(16, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
     }
 
-    WGPUBindGroupLayoutEntry le[8] = {};
-    const WGPUBufferBindingType types[8] = {WGPUBufferBindingType_Storage, WGPUBufferBindingType_ReadOnlyStorage, WGPUBufferBindingType_Uniform,
+    WGPUBindGroupLayoutEntry le[9] = {};
+    const WGPUBufferBindingType types[9] = {WGPUBufferBindingType_Storage, WGPUBufferBindingType_ReadOnlyStorage, WGPUBufferBindingType_Uniform,
                                             WGPUBufferBindingType_ReadOnlyStorage, WGPUBufferBindingType_Storage, WGPUBufferBindingType_Storage,
-                                            WGPUBufferBindingType_ReadOnlyStorage, WGPUBufferBindingType_Storage};
-    for (int i = 0; i < 8; ++i) {
+                                            WGPUBufferBindingType_ReadOnlyStorage, WGPUBufferBindingType_Storage, WGPUBufferBindingType_ReadOnlyStorage};
+    for (int i = 0; i < 9; ++i) {
         le[i] = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
         le[i].binding = static_cast<std::uint32_t>(i);
         le[i].visibility = WGPUShaderStage_Compute;
@@ -1295,7 +1440,7 @@ bool init(Mode m) {
         le[i].buffer.minBindingSize = i == 2 ? kParamStride : 0;
     }
     WGPUBindGroupLayoutDescriptor ld = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
-    ld.entryCount = 8;
+    ld.entryCount = 9;
     ld.entries = le;
     g_layout = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
     WGPUPipelineLayoutDescriptor pld = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
@@ -1346,6 +1491,7 @@ void draw(const State &st, const Vertex *v, int count) {
             const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
             const int tex_w = std::max(1 << tw, static_cast<int>(w[18] >> 16) + 1), tex_h = std::max(1 << th, static_cast<int>(w[19] >> 16) + 1);
             cache.tex = region(w[12], w[13], w[14], 0, 0, tex_w - 1, tex_h - 1);
+            if (g_textures) cache.setup[24] = replacement(cache.setup);
         }
     }
     const std::uint32_t *setup = cache.setup;
@@ -1523,11 +1669,13 @@ void image_begin(const State &s) {
     im.bpp = bits_per_pixel(im.dpsm);
     im.id = ++g_image_ids ? g_image_ids : ++g_image_ids;
     im.active = im.total != 0;
+    g_upload.clear();
 }
 
 void image_data(const std::uint8_t *data, std::size_t bytes) {
     Image &im = g_image;
     if (!im.active) return;
+    if (g_textures) g_upload.insert(g_upload.end(), data, data + bytes);
     if (im.pending.empty() && !im.lead_bits) {
         const std::uint64_t used = queue_upload(data, bytes, 0);
         const std::size_t whole = static_cast<std::size_t>(used / 8);
@@ -1559,6 +1707,7 @@ void local_copy(const State &s) {
 
 void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
     flush_image();
+    if (g_textures) texpack::tag_clut(tex0, texclut);
     if (g_clut_loads + 2 >= kClutSlots) {
         emit_all();
         submit();
@@ -1688,6 +1837,9 @@ void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, co
     const std::size_t words = kMemorySize / 4;
     const std::uint32_t from = scale * scale, to = g_scale * g_scale;
     std::fill(std::begin(g_rendered), std::end(g_rendered), from == to && to > 1);
+    if (g_textures) texpack::clear_tags();
+    std::fill(std::begin(g_tex_drawn), std::end(g_tex_drawn), false);
+    stamp_pages({0, kMemorySize});
     if (from == to && vram.size() == words * to) {
         wgpuQueueWriteBuffer(g_queue, g_vram, 0, vram.data(), vram.size() * 4);
     } else {
@@ -1705,6 +1857,10 @@ void stats() {
     std::fprintf(stderr, "[gpu] %llu submits, dispatches:", static_cast<unsigned long long>(g_submits));
     for (int i = 0; i < kPipelines; ++i) std::fprintf(stderr, " %s %llu", kEntryPoints[i], static_cast<unsigned long long>(g_dispatches[i]));
     std::fprintf(stderr, "\n");
+    if (g_textures)
+        std::fprintf(stderr, "[tex] lookups %llu: replaced %llu, render targets %llu, unsupported %llu, untagged %llu; textures %zu (replaced %zu)\n", static_cast<unsigned long long>(g_tex_lookups),
+                     static_cast<unsigned long long>(g_tex_hits), static_cast<unsigned long long>(g_tex_drawn_skips), static_cast<unsigned long long>(g_tex_unsupported),
+                     static_cast<unsigned long long>(g_tex_untagged), g_seen_keys.size(), g_replaced_keys.size());
 }
 
 void configure_surface() {

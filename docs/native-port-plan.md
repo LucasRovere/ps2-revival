@@ -53,7 +53,7 @@ code or in a pilot game run; the rest is marked.
 | P7: GIF/VIF/VU1 → GPU | Yes: GS on WebGPU compute in GS memory layout, byte-identical to its CPU reference on the pilot game | VU1 programs not recorded run on the interpreter (D21); only the race intro is recorded. |
 | P7: high internal resolution | Yes, `PS2_SCALE` 1–3 (`gpu.cpp`) | *Unverified* on the pilot game (all our runs used 1). Max 3. |
 | P7: widescreen | No | Output is letterboxed to 4:3 (`gpu.cpp` `present`: `vw = min(sw, sh * 4/3)`); the D12 recipe is not applied in the port. |
-| P7/P9: texture replacement | No | No hook in the GPU texture path. |
+| P7/P9: texture replacement | Added (T33, D25) | Packs by our own key from upload hashes; GPU renderer only. |
 | P8: native renderer (option C) | No | Not expected from an emulation runtime. |
 | P9: asset export, mod loader | No | — |
 
@@ -93,9 +93,9 @@ The vendored GS renderer (option B) is accurate and fast; it stays the base
   presentation.
 - Internal resolution: `PS2_SCALE` 2–3 checked on the pilot game; higher if the
   GPU allows and the output holds up.
-- Texture packs: replace GS textures by content hash, fed by `textures/`
-  output (PCSX2 dumps of the pilot game match our own decodes of its disc
-  textures pixel for pixel, so the key can be our own hash of the texels; *unverified* until built).
+- Texture packs, done (T33, D25): replace GS textures by our own key
+  (hashes of the uploaded bytes), fed by `textures/` output through
+  `textures/pack.py` (port dumps matched to PCSX2 dumps by pixels).
 - Frame rate above 60 on high-refresh displays: the pilot game measures its
   own timestep (D11); whether the port can present faster than the emulated
   VBlank is *unverified*.

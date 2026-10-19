@@ -90,6 +90,26 @@ original range, mean opacity drift ≤ 4) and writes side-by-side previews to
 
 `--textures-dir` must be an absolute path: Real-ESRGAN runs in its own folder.
 
+## Packs for the native port (`textures/pack.py`)
+
+The port (Phase 7, [recomp/README.md](../recomp/README.md), "Texture packs")
+names textures by its own key, not PCSX2's hash (D25). To use the
+replacements there:
+
+1. Dump in the port: run it with `PS2_TEX_DUMP=work/<SERIAL>/texdump` and
+   play the scenes you want (it writes `<key>.png` per new texture).
+2. `python textures/pack.py <SERIAL> --dumps work/<SERIAL>/texdump`: each port
+   dump is matched to a PCSX2 dump with the same pixels (same size, RGBA bytes
+   equal), and the PCSX2 replacement of the match is written as `<key>.png`
+   to `local/games/<SERIAL>/textures/` (replacements must be 1/2/4/8× the
+   dump's size).
+3. `"textures": "local/games/<SERIAL>/textures"` in `play.json`.
+
+Only textures PCSX2 also dumped (and `upscale.py` upscaled) are covered;
+coverage grows with both dump sessions. Pilot game, race intro: under a third
+of the port's textures matched a PCSX2 dump; the rest were not in the PCSX2
+dumps (checked: different images).
+
 ## Lessons learned
 
 Each of these was found by checking real output; keep checking.

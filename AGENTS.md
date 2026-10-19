@@ -131,6 +131,9 @@ in the vendored code under `recomp/` (D23); no separate `runtime/` or
   → `PS2_ASPECT`, presentation only; frame dumps unchanged); `PS2_SCALE` 2/3
   sharper with small race-intro fps dips, default 1, clamp 3. Owner check
   of 16:9 in the window pending.
+- Texture packs (Phase 7, T33, D25): `play.json` `textures` (pack folder of
+  `<key>.png`), `PS2_TEX_DUMP` dump mode, `textures/pack.py` builds a pack
+  from the PCSX2 replacements. Phase 7 items done (owner checks open).
 - Repo policy (D24): nothing game-specific in git; recipes, notes and
   game-specific code in `local/games/<serial>/`.
 - Phases 6–9 re-planned (D23): build on the vendored runtime and GS renderer;

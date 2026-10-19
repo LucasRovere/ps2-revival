@@ -41,9 +41,12 @@ std::uint64_t g_primitives = 0;
 #ifdef PS2_GPU
 bool gpu_on() { return gpu::mode() != gpu::Mode::off; }
 bool cpu_raster() { return gpu::mode() != gpu::Mode::primary; }
+// GS memory written on the CPU too: for the CPU rasterizer, or for the texture dump.
+bool cpu_memory() { return cpu_raster() || gpu::texture_dump(); }
 #else
 constexpr bool gpu_on() { return false; }
 constexpr bool cpu_raster() { return true; }
+constexpr bool cpu_memory() { return true; }
 #endif
 
 bool trace_display() {
@@ -250,7 +253,7 @@ void feed_image(const std::uint8_t *data, std::size_t bytes) {
 #ifdef PS2_GPU
     if (gpu_on() && (g_state.trxdir & 3u) == 0) gpu::image_data(data, bytes);
 #endif
-    if (!cpu_raster()) return;
+    if (!cpu_memory()) return;
     if (!g_transfer.active || (g_state.trxdir & 3u) != 0) return;
     const std::uint32_t psm = static_cast<std::uint32_t>(g_state.bitbltbuf >> 56) & 0x3Fu;
     const std::uint32_t bits = bits_per_pixel(psm);
@@ -313,7 +316,7 @@ void load_clut(std::uint64_t tex0) {
 #ifdef PS2_GPU
     if (gpu_on()) gpu::load_clut(tex0, g_state.texclut);
 #endif
-    if (!cpu_raster()) return;
+    if (!cpu_memory()) return;
     const bool eight = psm == PSMT8 || psm == PSMT8H;
     const std::uint32_t entries = eight ? 256u : 16u;
     const std::uint32_t texclut = static_cast<std::uint32_t>(g_state.texclut);

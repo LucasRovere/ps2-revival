@@ -24,6 +24,8 @@ struct SurfaceTarget {
 };
 
 Mode mode();
+// Texture dump on (PS2_TEX_DUMP): gs.cpp keeps GS memory on the CPU to decode dumped textures.
+bool texture_dump();
 bool init(Mode m);
 void draw(const State &s, const Vertex *v, int count);
 void image_begin(const State &s);

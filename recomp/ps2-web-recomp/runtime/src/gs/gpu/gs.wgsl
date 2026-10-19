@@ -10,6 +10,7 @@ struct Params {
 @group(0) @binding(5) var<storage, read_write> scratch: array<u32>;
 @group(0) @binding(6) var<storage, read> cache: array<u32>;
 @group(0) @binding(7) var<storage, read_write> decoded: array<u32>;
+@group(0) @binding(8) var<storage, read> repl: array<u32>;
 
 override SCALE: u32 = 1u;
 
@@ -603,7 +604,44 @@ fn convert(s: Setup, raw: u32) -> u32 {
     }
 }
 
+// Texture-pack image, scale times the texture's size: wraps and clamps at its own resolution.
+fn repl_coord(v: i32, size: i32, m: u32, mn: u32, mx: u32, sl: u32) -> i32 {
+    switch m {
+        case 0u {
+            return v & (size - 1);
+        }
+        case 1u {
+            return clamp(v, 0, size - 1);
+        }
+        default {
+            return clamp(v, i32(mn << sl), i32(((mx + 1u) << sl) - 1u));
+        }
+    }
+}
+
+fn repl_fetch(s: Setup, xi: i32, yi: i32) -> u32 {
+    let sl = (s.dec >> 29u) & 3u;
+    let x = repl_coord(xi, 1 << (s.tw + sl), mode(s, 24u, 2u), s.minu, s.maxu, sl);
+    let y = repl_coord(yi, 1 << (s.th + sl), mode(s, 26u, 2u), s.minv, s.maxv, sl);
+    return repl[(s.dec & 0x1FFFFFFFu) * 4u + (u32(y) << (s.tw + sl)) + u32(x)];
+}
+
+fn sample_repl(s: Setup, uin: f32, vin: f32) -> u32 {
+    let f = f32(1u << ((s.dec >> 29u) & 3u));
+    if (!has(s, F_BILINEAR)) {
+        return repl_fetch(s, i32(floor(uin * f)), i32(floor(vin * f)));
+    }
+    let u = uin * f - 0.5;
+    let v = vin * f - 0.5;
+    let x0 = i32(floor(u));
+    let y0 = i32(floor(v));
+    return blend4(repl_fetch(s, x0, y0), repl_fetch(s, x0 + 1, y0), repl_fetch(s, x0, y0 + 1), repl_fetch(s, x0 + 1, y0 + 1), u - f32(x0), v - f32(y0));
+}
+
 fn sample(s: Setup, uin: f32, vin: f32, k: u32) -> u32 {
+    if (s.dec >= 0x80000000u && s.dec != 0xFFFFFFFFu) {
+        return sample_repl(s, uin, vin);
+    }
     if (!has(s, F_BILINEAR)) {
         return fetch(s, i32(floor(uin)), i32(floor(vin)), k);
     }
