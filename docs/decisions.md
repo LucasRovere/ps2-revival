@@ -617,3 +617,50 @@ record (not done).
 
 **Revisit if:** a game needs new files on the disc, or reads files by
 stored sector numbers.
+
+## D30: The conversion tool works without PCSX2
+
+**Decision (owner, 2026-10-19, T43):**
+1. "We can remove all PCSX2 from this part": the port/convert path
+   (`port.py`, `init`, the port folder) and the skills `/port-game`,
+   `/diagnose-hang`, `/find-widescreen` and `/texture-pack` use no PCSX2:
+   no PCSX2 log comparison, no PCSX2 texture dumps, no PCSX2 runs. Hangs
+   are found from the port's own traces and the analysis export;
+   widescreen is checked in the port's frames (a pnach stays an optional
+   extra, never run by agents).
+2. Textures for the port are generic and automatic: the exploration (T39)
+   runs with `PS2_TEX_DUMP` (`port.py --textures`, opt-in), the dumps are
+   upscaled with the existing `textures/upscale.py` (Real-ESRGAN, PS2
+   alpha kept) into a pack keyed by the port's own keys (D25,
+   `local/games/<serial>/textures/`), and the port uses it. No PCSX2
+   matching.
+3. "Yes": the port folder holds its own copy of the pack (`textures/`);
+   a new `settings.json` points to it (`"textures": "textures"`).
+4. The game gets the PS2 boot path `cdrom0:\<ELF>;1` as `argv[0]` in every
+   mode (ISO or folder, Windows or WSL), as on a real PS2.
+5. The memory card in the folder stays the folder's own (`memcard.ps2`).
+6. Skills stay model-invocable; `/port-game` is the single entry point
+   that calls the others and ends with a playable folder and a report.
+
+**Stays as it is:** the PCSX2 modules for PCSX2 players (Phases 0–4:
+`patches/` .pnach builder, `textures/` on PCSX2 dumps, `pack.py`,
+`docs/pcsx2-tuning.md`) and `recomp/tests/oracle.py` as a test oracle
+(D18).
+
+**Why:** the end goal is ISO → native game with no emulator in the loop
+(D26). A PCSX2 step needs the owner's BIOS, a PCSX2 window and the owner's
+hands (dump sessions), so it does not scale to more games. The port can
+dump its own textures, and its traces already showed the T27 cause
+(the module's own error print).
+
+**Boot path:** on Windows the runtime passed the host ELF path as
+`argv[0]` (its conversion skipped any path with a `:`), so cycle counts
+depended on the ELF's location. Now a host path (no `:`, or a drive letter)
+becomes `cdrom0:\NAME;1`; a device path stays. Pilot menu run: same
+frames, ISO and folder mode now give the same cycle count (baseline
+re-recorded in the local notes).
+
+**Revisit if:** a hang can't be explained from the port's traces and the
+code (then a reference run is worth discussing with the owner), or the
+automatic pack misses textures a game only shows in scenes the
+exploration can't reach.

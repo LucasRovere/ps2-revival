@@ -30,10 +30,15 @@ files with their sector layout, and settings.json (picture settings from
 play.json or the recipe defaults; an existing one is kept). ps2run.exe runs it
 with no arguments, no ISO.
 
-New game (Windows): `port.py init <iso> [--serial S]` reads the serial, boot
-ELF and CRC from the disc, writes local/games/<serial>/game.json and notes.md
-(never overwrites them), then runs the pipeline above with --folder; entry
-points found by exploring go into game.json.
+--textures also dumps every texture the exploring runs draw (PS2_TEX_DUMP, into
+work/<serial>/recomp/texdump/dumps/) and upscales them with textures/upscale.py
+into the game's pack, local/games/<serial>/textures/ (<key>.png). The port
+folder gets a copy of the pack (play.json `textures`, else that folder).
+
+New game (Windows): `port.py init <iso> [--serial S] [--textures]` reads the
+serial, boot ELF and CRC from the disc, writes local/games/<serial>/game.json
+and notes.md (never overwrites them), then runs the pipeline above with
+--folder; entry points found by exploring go into game.json.
 """
 
 import argparse
@@ -232,23 +237,38 @@ def default_aspect(game, patched):
     return game.get("recomp", {}).get("aspect", "4:3") if patched else "4:3"
 
 
-def folder_settings(game, patched, play):
+def folder_settings(game, patched, play, pack):
     """The port folder's settings.json: play.json's picture settings (when there is one), else the defaults.
-    The folder keeps its own card; a repo-relative texture pack or mod folder becomes absolute."""
+    The folder keeps its own card and its own copy of the texture pack; a repo-relative mod folder becomes absolute."""
     settings = {"aspect": default_aspect(game, patched), "scale": 1, "fullscreen": False, "textures": "", "mods": ""}
     settings.update({k: v for k, v in (play or {}).items() if k in settings})
-    for key in ("textures", "mods"):
-        if settings[key]:
-            settings[key] = str(REPO / settings[key])
-    return {**settings, "memcard": "memcard.ps2"}
+    if settings["mods"]:
+        settings["mods"] = str(REPO / settings["mods"])
+    return {**settings, "textures": "textures" if pack else "", "memcard": "memcard.ps2"}
 
 
-def build_folder(window_build, elf, iso, folder, settings):
-    """The standalone port: ps2run.exe finds the ELF, the disc and settings.json next to itself."""
+def pack_source(serial, play):
+    """The game's texture pack: play.json `textures`, else local/games/<serial>/textures; None without images."""
+    pack = REPO / play["textures"] if (play or {}).get("textures") else GAMES_DIR / serial / "textures"
+    return pack if any(pack.glob("*.png")) else None
+
+
+def make_pack(serial, out):
+    """Upscales the port's texture dumps (textures/upscale.py) into the game's pack; only new dumps are done."""
+    pack = GAMES_DIR / serial / "textures"
+    run([sys.executable, REPO / "textures" / "upscale.py", serial, "--textures-dir", out / "texdump", "--out", pack, "--junk-groups"])
+
+
+def build_folder(window_build, elf, iso, folder, settings, pack):
+    """The standalone port: ps2run.exe finds the ELF, the disc, settings.json and textures/ next to itself."""
     folder.mkdir(parents=True, exist_ok=True)
     for name in ("ps2run.exe", "SDL2.dll"):
         shutil.copy2(window_build / name, folder)
     shutil.copy2(elf, folder / elf.name)
+    if pack:
+        shutil.rmtree(folder / "textures", ignore_errors=True)
+        shutil.copytree(pack, folder / "textures")
+        print(f"texture pack copied: {pack} -> {folder / 'textures'}")
     if (folder / "settings.json").exists():
         print(f"settings kept: {folder / 'settings.json'}")
     else:
@@ -297,7 +317,7 @@ def explore_runner(out, generated):
     return build_runner(out, generated)
 
 
-def run_segment(runner, elf, iso, out, seg, start, end, presses, state, card):
+def run_segment(runner, elf, iso, out, seg, start, end, presses, state, card, tex_dump):
     """One exploring segment: frames start..end from a save state (or boot), on a copy of card.
     Returns (misses, code entered, halt reason or None when the run reached its end)."""
     shutil.rmtree(seg, ignore_errors=True)
@@ -311,7 +331,10 @@ def run_segment(runner, elf, iso, out, seg, start, end, presses, state, card):
         args += ["--load-state", state]
     for p in presses:
         args += ["--press", p]
-    run(args, seg / "run.log", {**os.environ, "PS2_VU_RECORD": str(out / "vu1"), "PS2_COVERAGE": str(seg / "code.txt")})
+    env = {**os.environ, "PS2_VU_RECORD": str(out / "vu1"), "PS2_COVERAGE": str(seg / "code.txt")}
+    if tex_dump:
+        env["PS2_TEX_DUMP"] = str(tex_dump)
+    run(args, seg / "run.log", env)
     read = lambda name: (seg / name).read_text().split() if (seg / name).exists() else []
     halt = re.findall(r"\[ee\] halted: (.*)", (seg / "run.log").read_text(errors="replace"))
     return read("misses.txt"), set(read("code.txt")), None if (seg / "state").exists() else (halt or ["no state saved"])[0]
@@ -326,10 +349,11 @@ class Explorer:
     """Plays `frames` frames with generated input (explore.py): segments chained by save states, a
     stalled segment retried with other patterns. A run that stops at a missed entry point gets it
     translated and runs again; new VU1 programs are compiled in as they come. Keeps the new scenes of
-    segments that made progress in explore-frames/."""
+    segments that made progress in explore-frames/. With tex_dump every texture drawn is dumped there."""
 
-    def __init__(self, build, eerecomp, elf, iso, out, entries, overrides, generated):
+    def __init__(self, build, eerecomp, elf, iso, out, entries, overrides, generated, tex_dump=None):
         self.build, self.eerecomp, self.elf, self.iso, self.out = build, eerecomp, elf, iso, out
+        self.tex_dump = tex_dump
         self.entries, self.overrides, self.generated = entries, overrides, generated
         self.work, self.kept, self.vu1 = out / "explore", out / "explore-frames", out / "vu1"
         self.card = self.work / "card.ps2"
@@ -387,7 +411,7 @@ class Explorer:
         seg, new_entries = self.work / f"{end:06d}-{name}", []
         while True:
             misses, code, halt = run_segment(self.runner, self.elf, self.iso, self.out, seg, start, end,
-                                             ex.presses(ex.PATTERNS[p], start, end), state, self.card)
+                                             ex.presses(ex.PATTERNS[p], start, end), state, self.card, self.tex_dump)
             new = sorted(set(misses) - set(self.entries.read_text().split()))
             if not new or self.rounds == EXPLORE_ROUNDS:
                 break
@@ -471,6 +495,7 @@ def init(argv):
     ap = argparse.ArgumentParser(prog="port.py init", description="Onboard a new disc and build its port folder (Windows).")
     ap.add_argument("iso", help="PS2 disc image")
     ap.add_argument("--serial", help="serial when the boot ELF is not named like ABCD_123.45")
+    ap.add_argument("--textures", action="store_true", help="also build an upscaled texture pack from the exploration")
     a = ap.parse_args(argv)
     if os.name != "nt":
         sys.exit("init builds the port folder, which needs the Windows window build")
@@ -484,7 +509,7 @@ def init(argv):
     write_new(GAMES_DIR / serial, {"game.json": json.dumps(new_game(serial, elf_path, crc), indent=2) + "\n",
                                    "notes.md": new_notes(serial, elf_path, crc, cnf, os.path.getsize(a.iso))})
     start = time.time()
-    port(parser().parse_args([serial, "--iso", a.iso, "--folder"]), save_entries=True)
+    port(parser().parse_args([serial, "--iso", a.iso, "--folder"] + (["--textures"] if a.textures else [])), save_entries=True)
     print(f"{serial} onboarded in {(time.time() - start) / 60:.0f} min: double-click {WORK_DIR / serial / 'port' / 'ps2run.exe'}")
 
 
@@ -498,6 +523,7 @@ def parser():
     ap.add_argument("--no-patches", action="store_true", help="translate and run the disc's ELF without the game.json patches")
     ap.add_argument("--saves", action="store_true", help="also play the game.json save and load runs (memory card check)")
     ap.add_argument("--folder", nargs="?", const="", help="also build the standalone port folder (Windows; default work/<SERIAL>/port)")
+    ap.add_argument("--textures", action="store_true", help="dump the textures the exploration draws and upscale them into local/games/<SERIAL>/textures")
     return ap
 
 
@@ -527,7 +553,7 @@ def port(args, save_entries=False):
     runner = build_runner(out, generated)
     if not args.no_explore:
         found = Explorer(lambda: explore_runner(out, generated), eerecomp, elf, iso, out, entries, overrides,
-                         generated)(cfg["explore_frames"])
+                         generated, out / "texdump" / "dumps" if args.textures else None)(cfg["explore_frames"])
         if found and save_entries:
             add_entries(args.serial, found)
         elif found:
@@ -537,14 +563,18 @@ def port(args, save_entries=False):
         play(runner, elf, iso, out, "menu", menu["frames"], menu["presses"], menu["frame_every"])
     if args.saves:
         check_saves(runner, elf, iso, out, cfg)
+    if args.textures:
+        make_pack(args.serial, out)
     compile_vu(eerecomp.with_name("vurecomp"), out / "vu1", generated)
     build_runner(out, generated)
     if args.window or args.folder is not None:
         window_build = build_window_runner(out, generated)
     if args.folder is not None:
         play_json = GAMES_DIR / args.serial / "play.json"
-        settings = folder_settings(game, patched, json.loads(play_json.read_text()) if play_json.exists() else None)
-        build_folder(window_build, elf, iso, Path(args.folder) if args.folder else WORK_DIR / args.serial / "port", settings)
+        play = json.loads(play_json.read_text()) if play_json.exists() else None
+        pack = pack_source(args.serial, play)
+        build_folder(window_build, elf, iso, Path(args.folder) if args.folder else WORK_DIR / args.serial / "port",
+                     folder_settings(game, patched, play, pack), pack)
 
 
 def main():

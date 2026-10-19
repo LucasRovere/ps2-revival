@@ -19,7 +19,7 @@ Needs clang, CMake and Ninja in WSL (SDL2 optional, for the window).
 
 ```powershell
 . work/t22/env.ps1    # LLVM on PATH
-python recomp/port.py init "C:\path\to\game.iso" [--serial ABCD-12345]
+python recomp/port.py init "C:\path\to\game.iso" [--serial ABCD-12345] [--textures]
 ```
 
 Reads `SYSTEM.CNF`, the boot ELF and its CRC from the disc; the serial
@@ -30,7 +30,8 @@ comes from the boot ELF's name (`ABCD_123.45` → `ABCD-12345`), else
 [games.md](../docs/games.md), identity filled in). If either exists it stops
 and changes nothing. Then it runs `port.py <serial> --iso <iso> --folder`:
 link, translate, exploring runs (entry points found are written into
-`game.json`), VU1 compile, window build, port folder. Last line: where the
+`game.json`), VU1 compile, with `--textures` the texture pack (T43,
+[below](#automatic-texture-pack-t43)), window build, port folder. Last line: where the
 folder is (`work/<serial>/port/ps2run.exe`, double-click). No menu run (a new
 game has no `recomp.menu`): the automatic exploration (T39, below) drives the
 game through its intro and menus, and the VU1 programs it meets are compiled;
@@ -219,13 +220,15 @@ work\<SERIAL>\port\ps2run.exe          # or double-click it; no ISO needed
 | `layout.txt` | `sectors <n>`, then `file <lba> <size> <path>` per file and `rest <lba> <count>` per run of other non-zero sectors |
 | `sectors.bin` | Those other sectors in `rest` order (system area, volume descriptors, path tables, directory records; also a file's last sector when its padding is not zero) |
 | `settings.json` | Picture settings for a start in folder mode (T38, below) |
+| `textures/` | Copy of the game's texture pack (T43): `play.json` `textures`, else `local/games/<SERIAL>/textures/`, when it has images |
 
 `settings.json` (flat JSON) is written once from `play.json` (`aspect`,
-`scale`, `fullscreen`, `textures`, `mods`; a repo-relative pack or mod folder becomes absolute)
+`scale`, `fullscreen`, `mods`; a repo-relative mod folder becomes absolute)
 or, without one, the defaults (`aspect` as `play.py` picks it: the recipe's
 `recomp.aspect` when patches are on, else `"4:3"`; scale 1; not
-fullscreen; no pack, no mods), plus `"memcard": "memcard.ps2"` (the folder's own
-card). An existing file is kept (`settings kept: ...`), so edit it by hand.
+fullscreen; no mods), plus `"textures": "textures"` when the folder got a
+pack copy (else `""`) and `"memcard": "memcard.ps2"` (the folder's own
+card, D30). An existing file is kept (`settings kept: ...`), so edit it by hand.
 `ps2run` in folder mode reads it: `aspect` → `PS2_ASPECT`, `scale` →
 `PS2_SCALE`, `textures` → `PS2_TEXTURES`, `mods` → `PS2_MODS` (both
 relative to the folder or absolute), `memcard` (same; `--memcard` still wins); environment variables
@@ -257,17 +260,20 @@ on a machine with the build tools.
 Check (pilot game): the image rebuilt from the folder equals the ISO byte
 for byte (the folder is smaller: zero sectors are not stored);
 menu run from boot on the folder: 107 of 107 frames byte-identical to the
-ISO run and the same cycle count (with the ELF at the same path: the guest's
-`argv[0]` is the host ELF path on Windows, below); window run with the ISO
+ISO run and the same cycle count (since T43; before, the guest's `argv[0]`
+was the host ELF path on Windows, below); window run with the ISO
 link renamed away: intro movies, menus, loading screen and race intro, 60
 fps from a race-intro state like the ISO; a same-size string edit in one
 archive file in a copy of the folder shows in the loading-screen frames.
 Headless race-intro time is the same as the ISO's.
 
-Note: on Windows `boot()` passes the host ELF path as the guest's `argv[0]`
-(its `cdrom0:\NAME;1` conversion skips paths with a `:`, and `C:` has one),
-so the cycle count depends on the length of the ELF's path. Not changed
-(upstream behaviour; changing it changes ISO-run cycle counts).
+Boot path (T43, D30): the game gets `cdrom0:\<ELF NAME>;1` as `argv[0]`
+in every mode, as on a real PS2; the log says `[ee] boot path ...`.
+Upstream skipped the conversion for any path with a `:`, so on Windows
+(`C:`) the guest saw the host path and the cycle count depended on the
+ELF's location. Now only a device path (`cdrom0:`, `host:`: more than one
+character before the `:`) stays as given. Pilot menu run: frames
+unchanged, ISO and folder mode now have the same cycle count.
 
 ### Mods (T42)
 
@@ -377,10 +383,11 @@ first use (own PNG reader, no new library) and kept in a GPU buffer (up to
 1 GiB; when full the buffer is flushed and refilled). Mipmaps: the renderer
 only samples level 0, so packs hold base levels only.
 
-`python textures/pack.py <SERIAL> --dumps <dump folder>` builds a pack from
-the PCSX2 replacements (`docs/textures.md`): each port dump is matched to a
-PCSX2 dump by pixels and the replacement of the match is copied as
-`<key>.png` into `local/games/<SERIAL>/textures/`.
+The conversion tool builds packs itself (below, T43). For PCSX2 players
+who already have PCSX2 replacements, `python textures/pack.py <SERIAL>
+--dumps <dump folder>` converts them (`docs/textures.md`): each port dump is
+matched to a PCSX2 dump by pixels and the replacement of the match is
+copied as `<key>.png` into `local/games/<SERIAL>/textures/`.
 
 The log shows `[tex] pack <folder>: N textures` at start and, at exit,
 `[tex] lookups N: replaced R, render targets D, unsupported U, untagged T;
@@ -402,6 +409,40 @@ state) and keeps the same cycle count; without a pack its 107 frames are
 byte-identical to the previous build. Cost: headless race intro 27.3 →
 28.9-29.3 ms/frame with a pack (CPU: tagging ~6 MB of uploads per frame);
 window 60 fps with and without a pack (3 runs each).
+
+### Automatic texture pack (T43)
+
+```powershell
+python recomp/port.py <SERIAL> --folder --textures    # or: port.py init <iso> --textures
+```
+
+No PCSX2 (D30). The exploring runs (above) run with
+`PS2_TEX_DUMP=work/<SERIAL>/recomp/texdump/dumps`, so every texture the game
+draws there is written as `<key>.png` (dump-mode frames and cycles are the
+same as without). Then `textures/upscale.py <SERIAL> --textures-dir
+work/<SERIAL>/recomp/texdump --out local/games/<SERIAL>/textures
+--junk-groups` upscales them with Real-ESRGAN (classes, PS2 alpha, detail
+check and Lanczos fallback as for PCSX2 dumps, `docs/textures.md`); only
+dumps without an upscale are done, so a re-run adds new scenes. Port keys
+carry no format suffix, so `--junk-groups` treats every image size shared
+by 200 or more dumps as per-frame junk (pilot game: its scripted menu run
+dumps one 1024×256 VRAM capture per frame, ~7,600 of ~8,400 dumps; the
+exploration met none). `--folder` then copies the pack into the port
+folder. `--no-explore --textures` only upscales the dumps already there.
+Review and overrides: `/texture-pack`.
+
+Dump mode keeps a CPU copy of GS memory: the pilot's exploration took
+394 s instead of 313 s.
+
+Check (pilot disc, scratch `init --textures`, 18,000 frames): 774
+textures dumped, 442 upscaled (294 tiny and 38 flat skipped, no junk
+group), 83 of them by the Lanczos fallback; exploring 394 s, upscaling
+~3.5 min, `init` 13 min. The folder's scripted menu run (scale 2) replaced
+429 of 8,407 textures the renderer met (T33's PCSX2-matched pack: 51),
+~60% of texture lookups; frames: sharper signs, banners, logos and car
+details, placement and alpha right, no garbling; the glare-star sprites
+get longer, harder rays (open owner check, as in T33). Same cycle count
+with and without the pack.
 
 ### Patches and overrides (T31)
 
@@ -472,6 +513,7 @@ except:
 | `runtime/src/disc.cpp` (`open`, folder backend), `host/main.cpp` (no-ELF folder mode) | Port folder (T37, D27): `disc::open` on a directory reads `layout.txt`, `disc/` and `sectors.bin` through the existing `Reader` hook; one `[disc] folder/image backend` log line. `ps2run` without an ELF argument takes the ELF named in `disc/SYSTEM.CNF`, the disc and `memcard.ps2` from its own folder, and opens the window when started with no arguments. ISO runs: frames and cycle counts unchanged. |
 | `host/main.cpp` (`apply_folder_settings`) | Folder settings (T38): in folder mode `settings.json` next to `ps2run` sets `PS2_ASPECT`, `PS2_SCALE`, `PS2_TEXTURES` (only when not already set), the card, and fullscreen for a no-argument start. Runs with an ELF argument are unchanged. T42: `mods` → `PS2_MODS`. |
 | `runtime/src/disc.cpp` (`apply_mods`, `index_disc`) | Mods (T42): with `PS2_MODS` set, `disc::open` wraps the reader: replacement files over the original sectors or past the disc end, new LBA/size written into the directory records as read, index rebuilt, `[mods]` log lines. Without `PS2_MODS`: frames and cycle counts unchanged. |
+| `runtime/src/system.cpp` (`boot`) | Boot path (T43, D30): a host ELF path (no `:` or a drive letter) becomes `cdrom0:\NAME;1` as `argv[0]`, also on Windows (upstream converted only paths without a `:`); `[ee] boot path ...` log line. Pilot menu run: frames unchanged, cycles 52,595,993,473 → 52,595,993,647 (ISO), folder mode the same. |
 | `runtime/src/dispatch.cpp` (`g_reached`, `write_coverage`), `runtime/include/ps2/system.hpp`, `runtime/src/system.cpp` (`run()`) | Code coverage (T39): with `PS2_COVERAGE=<file>`, dispatch marks each EE RAM address it enters translated code at (one byte per word), and `run()` writes the marked addresses (hex, one per line) at exit. The exploration's progress signal. Unset: one extra test of an empty vector per dispatch; frames and cycle counts unchanged. |
 
 The headless Windows build (T22) needs no changes to upstream: the headless path

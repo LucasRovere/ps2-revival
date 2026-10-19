@@ -1,24 +1,21 @@
 ---
 name: diagnose-hang
-description: Find why a recompiled PS2 game hangs, stalls on a black or frozen screen, halts, or waits much longer than on PCSX2, using runtime syscall/SIF/IOP traces and a PCSX2 IOP log comparison, then fix it in the vendored runtime. Use when a port run stops making progress.
+description: Find why a recompiled PS2 game hangs, stalls on a black or frozen screen, halts, or waits much longer than it should, using the port's own syscall/SIF/IOP traces and the Ghidra analysis export, then fix it in the vendored runtime. Use when a port run stops making progress.
 ---
 
 # Diagnose a hang
 
 Method that found the pilot game's post-intro stall (T27: a driver module
 failed to load in the port, so the EE retried a SIF command with a timeout
-each time). Background: `recomp/README.md`, D16, D18.
+each time). No PCSX2 (D30): the evidence is the port's traces and the
+game's own code. Background: `recomp/README.md`, D16.
 
 ## Before you start
 
 - A built port (`/port-game`). Python: full path from `local/MACHINE.md`
   (`$py`). `cmd /c "... > log 2>&1"` for every `ps2run` call (PS 5.1 wraps
-  native stderr).
-- PCSX2 + the owner's BIOS (paths in `local/MACHINE.md`). The helper only
-  reads the owner's `PCSX2.ini` and runs PCSX2 with its own data folder in
-  `work/` (D18). Never edit `Documents\PCSX2`; a PCSX2 window opens while
-  it runs. Never screenshot the desktop.
-- Never copy PCSX2 code (GPL-3, AGENTS rule 2). Reading it for behaviour
+  native stderr). Never screenshot the desktop; look at frame dumps.
+- Never copy GPL code (PCSX2, AGENTS rule 2). Reading it for behaviour
   is fine.
 
 Paths below: `$exe` = `work\<SERIAL>\recomp\build-window-win\ps2run.exe`
@@ -63,17 +60,22 @@ Paths below: `$exe` = `work\<SERIAL>\recomp\build-window-win\ps2run.exe`
    yet: `extract/extract.py <SERIAL> --iso <ISO>`, `analysis/analyze.py
    <SERIAL>`, `analysis/syscalls.py <SERIAL>`. Name what it waits for
    (semaphore, SIF command reply, RPC server, IOP module).
-5. **Compare with PCSX2** (log of a real BIOS boot):
-   ```powershell
-   & $py .claude/skills/diagnose-hang/pcsx2_log.py "<ISO>" work\<SERIAL>\pcsx2 60
-   ```
-   `timed.txt` has each log line with seconds since start. Compare in
-   order: `loadmodule: fname ... args` / `loadmodule: id N, ret R` with
-   the port's `[loadfile]` / `[iop] module N started, result R` (0 or 2 =
-   resident, 1 = unloaded), IOP prints with `[iop-tty]`, EE prints. The
-   first difference is the lead. Ask the owner for a longer run or button
-   presses in PCSX2 if the hang is past the boot (they press, you read the
-   log).
+5. **What the game expects** (instead of a reference emulator):
+   - Modules: the IRX paths in the export's `strings.jsonl` (`cdrom0:\...IRX`)
+     and the EE code that loads them, against the port's `[loadfile]` and
+     `[iop] module N started, result R` (0 or 2 = resident, 1 = unloaded).
+     A module the game loads that is missing or unloaded is the lead.
+   - The module's own prints (`[iop-tty]`): error texts such as "cannot
+     add driver" name the failing call; the `[iop-hle]` line just before
+     it is the IOP library call the runtime stubs or gets wrong.
+   - The waiting EE code (step 4): which SIF command id or RPC server it
+     waits for; `[sif]` lines show whether a module registered that
+     handler or server.
+   - The function a library call should behave like: the IOP/EE SDK
+     behaviour as documented (ps2sdk headers, MIT/BSD/AFL) or as the
+     game's code uses its result.
+   The first thing the game expects that the trace does not show is the
+   lead.
 6. **Fix** the smallest generic thing in `recomp/ps2-web-recomp/runtime/`
    (behaviour as the real IOP/kernel does it, in your own code). Add a row
    to the vendored-patch table in `recomp/README.md` (file, why, evidence).
@@ -91,7 +93,7 @@ Paths below: `$exe` = `work\<SERIAL>\recomp\build-window-win\ps2run.exe`
 ## Record
 
 - `local/games/<SERIAL>/notes.md`: symptom, cause (call chain, module,
-  command ids), PCSX2 evidence, fix, before/after frames.
+  command ids), trace evidence, fix, before/after frames.
 - Generic lesson (no game names) in `recomp/README.md`; a new direction in
   `docs/decisions.md`.
 
@@ -100,7 +102,8 @@ Paths below: `$exe` = `work\<SERIAL>\recomp\build-window-win\ps2run.exe`
 - RPC bind to a server no module registers: the runtime held each bind
   for seconds (fixed: SIF bind patch).
 - An IOP library call stubbed to fail (ioman `AddDrv`): the module did not
-  load, the EE timed out on its command (fixed).
+  load (its `[iop-tty]` print said so), the EE timed out on its command
+  (fixed).
 - Unverified, watch for: unimplemented IPU commands (movies), missing IOP
   library exports, a game that waits on a DMA or interrupt the runtime
   never raises (`deadlock` halt).

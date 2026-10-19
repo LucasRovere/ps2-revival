@@ -359,10 +359,15 @@ void boot(std::uint32_t entry, const std::vector<std::string> &args) {
     iop::set_trace(g_options.trace_iop_modules, g_options.trace_iop_hle);
     iop::reset();
     std::vector<std::string> guest_args = args;
-    if (!guest_args.empty() && guest_args[0].find(':') == std::string::npos) {
-        std::string name = guest_args[0].substr(guest_args[0].find_last_of("/\\") + 1);
-        for (char &ch : name) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-        guest_args[0] = "cdrom0:\\" + name + ";1";
+    if (!guest_args.empty()) {
+        // A host path (incl. a Windows drive letter) becomes the PS2 boot path; a device path stays.
+        const std::size_t colon = guest_args[0].find(':');
+        if (colon == std::string::npos || colon == 1) {
+            std::string name = guest_args[0].substr(guest_args[0].find_last_of("/\\") + 1);
+            for (char &ch : name) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+            guest_args[0] = "cdrom0:\\" + name + ";1";
+        }
+        std::fprintf(stderr, "[ee] boot path %s\n", guest_args[0].c_str());
     }
     std::uint32_t argv = 0x00000800u, payload = argv + 4u * static_cast<std::uint32_t>(guest_args.size() + 1);
     for (std::size_t i = 0; i < guest_args.size(); ++i) {

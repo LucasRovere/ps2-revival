@@ -34,19 +34,24 @@ each break into a task.
   before a segment end is lost); dual-layer discs keep layer-1 files in
   `sectors.bin` (untested); the pilot needed two runtime fixes (SIF bind
   wait, ioman `AddDrv`), a second game may need others (method:
-  `--trace-syscalls`, `--trace-iop-hle`, PCSX2 IOP log, see the T27 row
-  and `recomp/README.md`).
+  `/diagnose-hang`: `--trace-syscalls`, `--trace-iop-hle`, the analysis
+  export; see the T27 row and `recomp/README.md`).
 - Windows toolchain: `. work/t22/env.ps1` (local/MACHINE.md).
-- T41: agent skills `/port-game` (onboard, check frames, triage) and
-  `/diagnose-hang` (traces, PCSX2 IOP log via its `pcsx2_log.py`) were
-  written from the pilot game only; this is their first real use.
+- T41/T43: agent skills `/port-game` (single entry point: onboard,
+  textures, widescreen, hangs, report) and `/diagnose-hang` (port traces +
+  analysis export) were written from the pilot game only; this is their
+  first real use. No PCSX2 in the tool or the skills (D30).
+- T43: `port.py init <iso> --textures` also dumps the exploration's
+  textures and upscales them into `local/games/<serial>/textures/`
+  (copied into the port folder); pilot numbers in the local notes ("For
+  T40"). The game gets `cdrom0:\<ELF>;1` as `argv[0]` in every mode.
 
 **Scope:**
 0. **Owner input needed first:** the owner picks one of their games and
    puts its ISO path into `local/MACHINE.md` ("Discs"). Ideally a game
    with a different engine and publisher than the pilot game. No downloads.
 1. Follow `/port-game` (`.claude/skills/port-game/SKILL.md`):
-   `port.py init <iso>` on it (serial from the disc, or `--serial`).
+   `port.py init <iso> --textures` on it (serial from the disc, or `--serial`).
    Record every failure in its `local/games/<serial>/notes.md`: disc
    reading, translation (errors, unresolved targets), build, boot,
    exploration (scenes reached, stalls, halts, missed entries), VU1
@@ -57,7 +62,8 @@ each break into a task.
    `explore.py`, runtime patches listed in `recomp/README.md`); anything
    bigger becomes a backlog task with a concrete failure description.
 4. Pilot game unchanged: its scripted menu run gives the same frames and
-   cycles as before (T39 `work/t39/run.ps1 <tag> 100`, 107 frames).
+   cycles as before (T43 `work/t43/run.ps1 <tag> 100`, 107 frames;
+   cycles in the local notes).
 5. Docs: what worked and broke (game-neutral) in `recomp/README.md` and
    `docs/roadmap.md`, game findings in the game's local notes, new tasks
    in this file.
@@ -77,8 +83,9 @@ each break into a task.
   new game's title and serial before committing).
 
 **Out of scope:** making the second game fully playable when that needs
-large runtime work (becomes tasks), patches or widescreen for it, texture
-packs (`/find-widescreen` and `/texture-pack` stay untried).
+large runtime work (becomes tasks). `/port-game` runs the texture and
+widescreen steps too: record what they gave; fixes beyond small ones
+become tasks.
 
 ## Backlog
 
@@ -101,17 +108,22 @@ Phase 9 / Phase 8 (after the conversion tool):
    override to draw a model natively next to the GS output. Output: local
    notes and a go/no-go for a native draw path with a concrete goal (model
    replacement, LOD, lighting) the GS path can't meet.
+2. **T44: assets: mesh export options (local tools only).** Owner request:
+   the pilot game's glTF export (T14, `local/games/<serial>/tools/`) with
+   options for upgrade kits (body kit, spoiler, wheels: the part variants
+   next to the stock parts in the car archives) and paint colour (the
+   material/palette the game tints). Local tools only (D24); check renders
+   with `tools/gltfview.py` against the port's frames of the same car
+   options.
 
-Texture work (small, owner-driven, open from T33):
+Texture work (small, owner-driven):
 
-- Fuller PCSX2 dump session of tracks and cars (owner plays with dumping
-  on), then re-run the port dump and `textures/pack.py`: more matches.
 - Owner to judge the upscaled glare-star sprites (harder, longer rays);
-  if bad, exclude them from the pack.
+  if bad, a `textures.overrides` `skip` for their keys.
 
 Parked by the owner:
 
-2. **T29: recomp: speed headroom for racing.** After T28 the race intro is
+3. **T29: recomp: speed headroom for racing.** After T28 the race intro is
    60 fps paced but only ~71 fps unpaced, with the VU and render threads both
    near 100% there (at 60 fps: VU ~83%, render ~80%). Record VU1 programs
    during real gameplay (`PS2_VU_RECORD` / `port.py`) and check how many
@@ -123,7 +135,7 @@ Parked by the owner:
    loop, `memcpy` into the rings); `x86-64-v3` builds (AVX2, no FMA, needs
    the owner's OK to drop CPUs without AVX2, D22). Same save-state runs and
    byte-identical frame checks as T25-T28.
-3. **T30: recomp: decouple IOP/SPU2 from the EE clock.** Owner request: audio
+4. **T30: recomp: decouple IOP/SPU2 from the EE clock.** Owner request: audio
    must not depend on the frame rate. Today the EE, IOP and SPU2 share one
    emulated clock, so when the EE falls behind real time the SPU2 makes
    fewer samples and the audio underruns. On a real PS2 the IOP/SPU2 run on
@@ -181,4 +193,5 @@ Results with game-specific numbers: `local/games/<serial>/notes.md`.
 | T39: conversion tool: automatic exploration | 2026-10-19 | `recomp/explore.py` + `port.py` `Explorer`: generated press patterns in 600-frame segments chained by save states; progress = new functions entered (vendored `PS2_COVERAGE` list, D28), new VU1 programs or missed entries; stalled segments retried with other patterns, VU1 programs compiled mid-run; pilot game with no script (scratch `init`, 8 min): intro, menus, card dialogs, loading screen, race intro, every VU1 program the scripted run meets; pilot menu run unchanged | `721b64f` |
 | T42: mods: mod folder over the disc files | 2026-10-19 | `PS2_MODS` (`mods` in `play.json` / folder `settings.json`, D29): replacement files by disc path over the ISO or port folder; bigger files move past the disc end, LBA/size written into their directory records as read (vendored `disc.cpp` patch); files not on the disc skipped; pilot game: a text entry and a texture palette inside its archives (local archive tool), same size and grown, seen in frames in ISO and folder mode; no mods = frames and cycles unchanged; port folder untouched | `78e5bdd` |
 | T41: conversion tool: agent skills | 2026-10-19 | Game-neutral skills in `.claude/skills/`: `/port-game` (init, frame sheets via `sheet.py`, folder check, triage table), `/diagnose-hang` (trace flags, gap greps, retry-loop counting, PCSX2 IOP log via `pcsx2_log.py`, runtime fix rules), `/find-widescreen` (screen-type query from the `GetOsdConfigParam` callers, D12 recipe, pnach, port frame check), `/texture-pack` (upscale/verify loop, port dump, `pack.py`); every cited command and option checked against `--help`/source; on the pilot: trace flags, folder-mode headless run, `sheet.py`, `pcsx2_log.py` (owner ini unchanged), the screen-type search finds exactly the known function; written before T40 (owner AFK), first real use there | `c6af069` |
-| T14: assets: pilot game mesh format | 2026-10-19 | Done before T40 (owner AFK, T40 waits for a game pick). Local tools (D24): mesh decoder + glTF export, glTF checker/software renderer; mesh files are ready-made VIF DMA chains (triangle strips with ADC restarts, 12-bit fixed-point ST, int16 normals, float positions) per material, plus a part hierarchy and name-hashed materials/textures; every mesh in the car archives parses; two stock cars exported (glTF structure and buffer sizes checked), renders match the cars in the port's frames, texture text reads the right way round; unverified: a few header fields, stock part selection, right-wheel turn | this commit |
+| T14: assets: pilot game mesh format | 2026-10-19 | Done before T40 (owner AFK, T40 waits for a game pick). Local tools (D24): mesh decoder + glTF export, glTF checker/software renderer; mesh files are ready-made VIF DMA chains (triangle strips with ADC restarts, 12-bit fixed-point ST, int16 normals, float positions) per material, plus a part hierarchy and name-hashed materials/textures; every mesh in the car archives parses; two stock cars exported (glTF structure and buffer sizes checked), renders match the cars in the port's frames, texture text reads the right way round; unverified: a few header fields, stock part selection, right-wheel turn | `26692a4` |
+| T43: conversion tool without PCSX2 | 2026-10-19 | D30 (owner): no PCSX2 in the tool or its skills. `port.py --textures` (and `init --textures`) dumps the exploration's textures and upscales them (`upscale.py --out --junk-groups`, new pixel-noise check `fine_retention`) into `local/games/<serial>/textures/`, copied into the port folder (`settings.json` `"textures": "textures"`); pilot scratch init: 774 dumps, 442 upscaled, 429 replaced in the menu run (T33: 51), init 13 min, frames sharper with road grain kept, alpha right; boot path `cdrom0:\<ELF>;1` as `argv[0]` in every mode (vendored `system.cpp`): frames unchanged, ISO and folder cycles now equal (52,595,993,647, re-recorded); skills: `/port-game` single entry point (textures, widescreen, hangs, report), `/diagnose-hang` on port traces + analysis export (`pcsx2_log.py` removed), `/find-widescreen` port-only (pnach optional), `/texture-pack` on port dumps; `tools/gltfview.py` + test moved from local; T44 (mesh export options) in backlog | this commit |

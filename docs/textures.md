@@ -58,7 +58,9 @@ detail changes. Record the result in the game notes.
 6. Detail check: the result is box-downscaled to the original size and its
    mid-frequency detail compared with the original (`detail_retention`). Below
    **0.6** the AI erased a real pattern → Lanczos fallback for that texture
-   (listed in `<textures-dir>/lanczos_fallback.txt`).
+   (listed in `<textures-dir>/lanczos_fallback.txt`). Second check
+   (`fine_retention`, T43): the median pixel-scale noise (luma − 1 px blur)
+   of the result against the original; below **0.25** → Lanczos too.
 7. Write to `replacements/` with the same name. Re-runs only process new
    dumps unless `--force` (all) or `--only` (named stems, even if done; a
    replacement whose texture is now `skip` is removed).
@@ -90,11 +92,32 @@ original range, mean opacity drift ≤ 4) and writes side-by-side previews to
 
 `--textures-dir` must be an absolute path: Real-ESRGAN runs in its own folder.
 
-## Packs for the native port (`textures/pack.py`)
+## Packs for the native port (automatic, T43)
 
 The port (Phase 7, [recomp/README.md](../recomp/README.md), "Texture packs")
-names textures by its own key, not PCSX2's hash (D25). To use the
-replacements there:
+names textures by its own key, not PCSX2's hash (D25), and dumps them itself
+(`PS2_TEX_DUMP`). The conversion tool builds the pack with no PCSX2 (D30):
+`port.py <SERIAL> --textures` (or `port.py init <iso> --textures`) dumps
+every texture the automatic exploration draws into
+`work/<SERIAL>/recomp/texdump/dumps/` and runs
+
+```
+python textures/upscale.py <SERIAL> --textures-dir work/<SERIAL>/recomp/texdump --out local/games/<SERIAL>/textures --junk-groups
+```
+
+The pipeline above runs unchanged on the port dumps (the file stem is the
+port key; `textures.overrides` take keys). `--out` writes the upscales
+straight into the pack; `verify.py` takes the same `--textures-dir` and
+`--out`. Port keys have no format suffix, so `junk_suffixes` does not apply;
+`--junk-groups` marks every image size that 200 or more dumps share as junk
+instead (pilot game: one new 1024×256 VRAM capture per frame, ~7,600 of
+~8,400 dumps in its scripted menu run; they look like the PCSX2 junk above;
+the exploration's 774 dumps had no such group). The port
+folder gets a copy of the pack (`textures/`). Review: `/texture-pack`.
+
+## Packs from PCSX2 replacements (`textures/pack.py`, PCSX2 players)
+
+For someone who already has PCSX2 replacements:
 
 1. Dump in the port: run it with `PS2_TEX_DUMP=work/<SERIAL>/texdump` and
    play the scenes you want (it writes `<key>.png` per new texture).
@@ -132,6 +155,14 @@ Each of these was found by checking real output; keep checking.
   textures (e.g. a wheel) differ just as much. Mid-frequency *detail retention*
   separates them: granite 0.53, sharpened wheel 1.24, de-jagged decals
   ~0.67–0.70 (good). Threshold 0.6 → ~2% of textures fall back to Lanczos.
+- **AI also flattens pixel-scale speckle** (T43, port dumps): asphalt and
+  concrete with single-pixel grain came out as flat colour (the road in the
+  race looked painted), and a railing turned into a wall. The mid-band
+  check above misses it (it ignores single-pixel detail on purpose, and a
+  few sharp lane lines keep its std up). The median of |luma − 1 px blur|
+  catches it: the erased surfaces kept 0.00–0.06 of it, sharpened
+  graphics and logos 0.3 and up; threshold 0.25 sends ~19% of the pilot's
+  port textures to Lanczos (13 before).
 - **PS2 alpha must stay 0–128.** Images look washed-out in normal viewers;
   that is correct. Never normalise alpha in outputs.
 - **Known cosmetic limits:** grainy 4-bit art (e.g. headlights) gets a slightly

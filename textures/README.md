@@ -11,6 +11,7 @@ python upscale.py <SERIAL>                # everything not yet replaced
 python verify.py <SERIAL> --worst 20      # checks + previews
 python upscale.py <SERIAL> --only <STEM>  # redo named textures after review
 python pack.py <SERIAL> --dumps <folder>  # pack for the native port (port dumps -> PCSX2 replacements)
+python upscale.py <SERIAL> --textures-dir <port texdump> --out <pack> --junk-groups   # port dumps -> pack (T43)
 ```
 
 Options: `--textures-dir` (default `Documents/PCSX2/textures/<SERIAL>`),

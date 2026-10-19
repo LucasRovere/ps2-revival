@@ -4,7 +4,8 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from port import REPO, folder_settings, new_game, serial_from_elf, write_new  # noqa: E402
+import port  # noqa: E402
+from port import REPO, folder_settings, new_game, pack_source, serial_from_elf, write_new  # noqa: E402
 
 
 class SerialTest(unittest.TestCase):
@@ -50,16 +51,29 @@ class FolderSettingsTest(unittest.TestCase):
     GAME = {"recomp": {"aspect": "16:9"}, "patches": [{}]}
 
     def test_defaults(self):
-        self.assertEqual(folder_settings(self.GAME, True, None),
+        self.assertEqual(folder_settings(self.GAME, True, None, None),
                          {"aspect": "16:9", "scale": 1, "fullscreen": False, "textures": "", "mods": "", "memcard": "memcard.ps2"})
-        self.assertEqual(folder_settings(self.GAME, False, None)["aspect"], "4:3")
+        self.assertEqual(folder_settings(self.GAME, False, None, None)["aspect"], "4:3")
 
     def test_play_json(self):
         play = {"memcard": "local/x.ps2", "scale": 3, "aspect": "4:3", "textures": "local/pack", "mods": "local/mods"}
-        settings = folder_settings(self.GAME, True, play)
+        settings = folder_settings(self.GAME, True, play, Path("local/pack"))
         self.assertEqual((settings["scale"], settings["aspect"], settings["memcard"]), (3, "4:3", "memcard.ps2"))
-        self.assertEqual(settings["textures"], str(REPO / "local/pack"))
+        self.assertEqual(settings["textures"], "textures")  # the folder's own copy
         self.assertEqual(settings["mods"], str(REPO / "local/mods"))
+
+    def test_pack_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            games, own = Path(tmp) / "games", Path(tmp) / "games" / "ABCD-12345" / "textures"
+            own.mkdir(parents=True)
+            old, port.GAMES_DIR = port.GAMES_DIR, games
+            try:
+                self.assertIsNone(pack_source("ABCD-12345", None))  # no images
+                (own / "0123456789abcdef.png").write_bytes(b"")
+                self.assertEqual(pack_source("ABCD-12345", {"textures": ""}), own)
+                self.assertEqual(pack_source("ABCD-12345", {"textures": str(own)}), own)
+            finally:
+                port.GAMES_DIR = old
 
 
 if __name__ == "__main__":

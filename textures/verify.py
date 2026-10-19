@@ -31,6 +31,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("serial")
     ap.add_argument("--textures-dir", type=Path)
+    ap.add_argument("--out", type=Path, help="replacements folder (default: <textures-dir>/replacements)")
     ap.add_argument("--no-previews", action="store_true")
     ap.add_argument("--worst", type=int, default=0)
     args = ap.parse_args()
@@ -42,7 +43,7 @@ def main():
         prev.mkdir(exist_ok=True)
 
     bad, scores = 0, []
-    reps = sorted((game / "replacements").glob("*.png"))
+    reps = sorted(r for r in (args.out or game / "replacements").glob("*.png") if (game / "dumps" / r.name).exists())
     for r in reps:
         o = np.asarray(Image.open(game / "dumps" / r.name).convert("RGBA"))
         n = np.asarray(Image.open(r).convert("RGBA"))

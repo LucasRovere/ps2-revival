@@ -103,8 +103,10 @@ The vendored GS renderer (option B) is accurate and fast; it stays the base
 - Internal resolution: `PS2_SCALE` 2–3 checked on the pilot game; higher if the
   GPU allows and the output holds up.
 - Texture packs, done (T33, D25): replace GS textures by our own key
-  (hashes of the uploaded bytes), fed by `textures/` output through
-  `textures/pack.py` (port dumps matched to PCSX2 dumps by pixels).
+  (hashes of the uploaded bytes). Since T43 (D30) built automatically:
+  the exploration dumps the port's textures and `textures/upscale.py`
+  upscales them into the pack (`port.py --textures`); `textures/pack.py`
+  (PCSX2 replacements) stays for PCSX2 players.
 - Frame rate above 60 on high-refresh displays: the pilot game measures its
   own timestep (D11); whether the port can present faster than the emulated
   VBlank is *unverified*.
@@ -129,10 +131,11 @@ manual on the pilot game into tooling and agent skills. Order (owner):
 - **(d) Second game:** one of the owner's games (owner picks) through the
   tool. Measures how generic it is; whatever breaks becomes tasks.
 - **(e) Agent skills** (`.claude/skills/`, game-neutral): `/port-game`
-  (onboard, build, run, triage), `/diagnose-hang` (syscall/SIF traces,
-  compare with a PCSX2 IOP log: the method that found the pilot game's
-  post-intro stall), `/find-widescreen`, `/texture-pack`. Done (T41);
-  tried on the second game in T40.
+  (onboard, build, run, triage; since T43 the single entry point),
+  `/diagnose-hang` (syscall/SIF/IOP traces and the analysis export: the
+  method that found the pilot game's post-intro stall; no PCSX2 since T43,
+  D30), `/find-widescreen`, `/texture-pack`. Done (T41); tried on the
+  second game in T40.
 
 Each step is about one session; split if bigger.
 

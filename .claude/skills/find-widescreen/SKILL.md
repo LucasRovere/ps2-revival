@@ -1,21 +1,21 @@
 ---
 name: find-widescreen
-description: Find how a PS2 game can render 16:9 (its own widescreen mode via the BIOS screen type, or its projection aspect), write the patch recipe, build the PCSX2 pnach and check it in the native port's frames. Use when asked for widescreen in a game.
+description: Find how a PS2 game can render 16:9 (its own widescreen mode via the BIOS screen type, or its projection aspect), write the patch recipe and check it in the native port's frames. Use when asked for widescreen in a game.
 ---
 
 # Find widescreen
 
 Method of D12: many games have a full 16:9 mode chosen only from the BIOS
 screen type. Make the screen-type query return 16:9 instead of patching
-projection and HUD values one by one. Background: `patches/README.md`,
-`analysis/README.md`, `recomp/README.md` (Patches, Widescreen).
+projection and HUD values one by one. Checked in the port only, no PCSX2
+run (D30). Background: `patches/README.md`, `analysis/README.md`,
+`recomp/README.md` (Patches, Widescreen).
 
 ## Before you start
 
 - Python: full path from `local/MACHINE.md` (`$py`). Ghidra + JDK in
   `tools/bin/` (missing → ask the owner; installs need approval).
-- Copying a pnach into `Documents\PCSX2\patches\` and any PCSX2 setting
-  is the owner's step (AGENTS rule 3). Never screenshot the desktop.
+- Never screenshot the desktop; look at frame dumps.
 
 ## Steps
 
@@ -48,16 +48,12 @@ projection and HUD values one by one. Background: `patches/README.md`,
    & $py -c "import sys; sys.path.insert(0,'recomp/tests'); import asm; print(['%08x' % w for w in asm.assemble(['jr ra', 'addiu v0, zero, 2'])])"
    ```
    Each write has `addr`, `old` (from the `.asm` bytes as a word), `new`,
-   `note`. Add `"gsaspectratio": "16:9"` (PCSX2) and `recomp.aspect:
-   "16:9"` (port window default).
+   `note`. Add `recomp.aspect: "16:9"` (port window default).
 5. **No own 16:9 mode** (Unverified: not done on any game yet): find the
    projection setup that uses the 4/3 constant and change it to 16/9
    (wider view; 2D/HUD stays stretched). Check culling at the screen
    edges in frames.
-6. **PCSX2 pnach:** `& $py patches/build.py <SERIAL>` (checks every `old`
-   word) → `work/<SERIAL>/patches/<SERIAL>_<CRC>.pnach`. Owner copies it
-   and enables it in game Properties → Patches.
-7. **Port check:** `port.py <SERIAL> --no-explore --no-menu --window`
+6. **Port check:** `port.py <SERIAL> --no-explore --no-menu --window`
    applies the patches (mismatch stops the run). Run from boot (a save
    state made before the patch keeps the old flag) to a 3D scene with
    frames, once with patches and once from a `--no-patches` build at the
@@ -67,6 +63,11 @@ projection and HUD values one by one. Background: `patches/README.md`,
    folder: `port.py <SERIAL> --no-explore --no-menu --folder`; its
    `settings.json` is kept once written, so set `"aspect": "16:9"` there
    by hand (or in `play.json` for `play.py`).
+7. **Optional extra, PCSX2 players:** `& $py patches/build.py <SERIAL>`
+   (checks every `old` word) writes `work/<SERIAL>/patches/<SERIAL>_<CRC>.pnach`
+   from the same recipe (`"gsaspectratio": "16:9"` in `game.json` for
+   PCSX2's aspect). Not run in PCSX2 by agents; copying it into PCSX2 is
+   the owner's step (AGENTS rule 3).
 
 ## Record
 

@@ -78,10 +78,11 @@ extract/             ISO reader, boot files, disc inventory (working)
 analysis/            Ghidra headless analysis + plain-file export (working)
 patches/             PCSX2 .pnach builder from game.json recipes (working)
 recomp/              vendored ps2-web-recomp + port.py, play.py (Windows/WSL, working) + tests
+tools/               generic helpers (gltfview.py: glTF check + render)
+tools/bin/           local tool installs (Ghidra, JDK, SDL2, wgpu-native), git-ignored
 local/               git-ignored: MACHINE.md, games/<serial>/ (game.json,
                      notes.md, game-specific tools/)
 work/                scratch space, git-ignored
-tools/bin/           local tool installs (Ghidra, JDK, Real-ESRGAN), git-ignored
 ```
 
 Planned modules (see roadmap): `mods/`. Runtime and graphics work happens
@@ -171,7 +172,12 @@ the same change.
   T38 `port.py init`, T39 automatic exploration, T40 second game, T41 agent
   skills done), then Phases 8–9; final intent fully native. Plan at agent pace:
   Phases 0–7 took about 30 hours; one game fully native ≈ a week.
-- Agent skills (T41, `.claude/skills/`, game-neutral): `/port-game` (new
-  game: onboard, check, triage), `/diagnose-hang` (traces + PCSX2 IOP log),
+- Agent skills (T41, `.claude/skills/`, game-neutral): `/port-game` (the
+  single entry point for a new game: onboard, textures, widescreen, hangs,
+  report), `/diagnose-hang` (port traces + analysis export),
   `/find-widescreen`, `/texture-pack`. Use them for a new game.
+- No PCSX2 in the conversion tool (T43, D30): `port.py --textures` dumps the
+  exploration's textures and upscales them into a pack keyed by the port's
+  keys, copied into the port folder; the game gets `cdrom0:\<ELF>;1` as
+  `argv[0]` in every mode. PCSX2 modules for PCSX2 players stay.
 - Next up: see [docs/tasks.md](docs/tasks.md). The owner runs tasks with `/next-task`.

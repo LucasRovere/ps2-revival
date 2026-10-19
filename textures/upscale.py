@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+import collections
 import json
 import os
 import random
@@ -38,6 +39,7 @@ MODEL_SCALE = 4              # Real-ESRGAN x4plus models only upscale 4x (-s 2 c
 PAD = 8                      # border padding (source pixels) to avoid edge artefacts
 MIN_PIXELS = 32 * 32         # textures this small are left alone
 MIN_RETENTION = 0.6          # below this the AI erased a pattern -> Lanczos instead
+MIN_FINE_RETENTION = 0.25    # same for pixel-scale noise; tuned on a pilot game's port dumps (T43)
 JUNK_GROUP_SIZE = 200        # direct-colour dumps sharing suffix + size this often = junk candidate
 MIP_RE = re.compile(r"-mip\d+$")
 
@@ -116,6 +118,19 @@ def junk_candidates(files):
     return sorted(out, key=lambda c: -c[2])
 
 
+def junk_sizes(files):
+    """Sizes JUNK_GROUP_SIZE or more dumps share. In port dumps (pilot game) these were the same per-frame
+    VRAM captures as in PCSX2's (1024x256, garbage strips): one new key per frame."""
+    sizes = collections.Counter()
+    for f in files:
+        with Image.open(f) as im:
+            sizes[im.size] += 1
+    junk = {size for size, n in sizes.items() if n >= JUNK_GROUP_SIZE}
+    for w, h in sorted(junk):
+        print(f"  junk group {w}x{h}: {sizes[w, h]} dumps")
+    return junk
+
+
 def classify(path, cfg):
     stem = path.stem
     if stem in cfg["overrides"]:
@@ -124,6 +139,8 @@ def classify(path, cfg):
         return "junk"
     img = np.asarray(Image.open(path).convert("RGBA"))
     h, w = img.shape[:2]
+    if (w, h) in cfg.get("junk_sizes", ()):
+        return "junk"
     if w * h <= MIN_PIXELS or min(w, h) < 8:
         return "tiny"
     a = img[..., 3]
@@ -169,16 +186,18 @@ def bleed_colour(rgb, alpha, iterations=16):
     return np.clip(rgb, 0, 255).astype(np.uint8)
 
 
+def _blur(x, r, wrap):
+    k = 2 * r + 1
+    p = np.pad(x, r, mode="wrap" if wrap else "edge")
+    c = np.cumsum(np.cumsum(p, 0), 1)
+    c = np.pad(c, ((1, 0), (1, 0)))
+    return (c[k:, k:] - c[:-k, k:] - c[k:, :-k] + c[:-k, :-k]) / (k * k)
+
+
 def _band(lum, wrap):
     """Mid-frequency detail: blur(1px) - blur(3px). Ignores single-pixel
     dithering, keeps grain/speckle patterns a few pixels across."""
-    def blur(x, r):
-        k = 2 * r + 1
-        p = np.pad(x, r, mode="wrap" if wrap else "edge")
-        c = np.cumsum(np.cumsum(p, 0), 1)
-        c = np.pad(c, ((1, 0), (1, 0)))
-        return (c[k:, k:] - c[:-k, k:] - c[k:, :-k] + c[:-k, :-k]) / (k * k)
-    return blur(lum, 1) - blur(lum, 3)
+    return _blur(lum, 1, wrap) - _blur(lum, 3, wrap)
 
 
 def detail_retention(orig, up, scale):
@@ -198,6 +217,23 @@ def detail_retention(orig, up, scale):
     if so < 1.0:          # original has no real texture to lose
         return 1.0
     return float(bd[vis].std() / so)
+
+
+def fine_retention(orig, up, scale):
+    """Like detail_retention for pixel-scale noise (lum - blur(1px)), by the median so a few sharp
+    lines don't hide it: ~0 = the AI turned a speckled surface (asphalt, concrete) flat."""
+    h, w = orig.shape[:2]
+    down = up[..., :3].astype(np.float32).reshape(h, scale, w, scale, 3).mean((1, 3))
+    wts = np.array([0.299, 0.587, 0.114], np.float32)
+    wrap = tileable(orig[..., :3])
+    lo, ld = orig[..., :3].astype(np.float32) @ wts, down @ wts
+    vis = orig[..., 3] > 0
+    if not vis.any():
+        return 1.0
+    mo = np.median(np.abs(lo - _blur(lo, 1, wrap))[vis])
+    if mo < 1.0:          # no pixel-scale noise to lose
+        return 1.0
+    return float(np.median(np.abs(ld - _blur(ld, 1, wrap))[vis]) / mo)
 
 
 def lanczos(src, scale):
@@ -262,7 +298,8 @@ def merge(src, meta, up_rgb, up_alpha, out_dir, scale):
         a = a8 * meta["amax"] / 255.0
         a = np.clip(np.rint(a), meta["amin"], meta["amax"]).astype(np.uint8)
     out = np.dstack([rgb, a])
-    ai_ok = detail_retention(np.asarray(Image.open(src).convert("RGBA")), out, scale) >= MIN_RETENTION
+    orig = np.asarray(Image.open(src).convert("RGBA"))
+    ai_ok = detail_retention(orig, out, scale) >= MIN_RETENTION and fine_retention(orig, out, scale) >= MIN_FINE_RETENTION
     if not ai_ok:
         out = lanczos(src, scale)
     Image.fromarray(out, "RGBA").save(out_dir / name)
@@ -290,21 +327,26 @@ def main():
     ap.add_argument("serial", help="game serial as used by PCSX2, e.g. ABCD-12345")
     ap.add_argument("--textures-dir", type=Path, help="PCSX2 texture folder for the game "
                     "(default: Documents/PCSX2/textures/<serial>)")
+    ap.add_argument("--out", type=Path, help="replacements folder (default: <textures-dir>/replacements)")
     ap.add_argument("--esrgan", type=Path, help="folder containing realesrgan-ncnn-vulkan")
     ap.add_argument("--report", action="store_true", help="only print classification and junk candidates")
     ap.add_argument("--sample", type=int, default=0, help="process N random textures per class")
     ap.add_argument("--force", action="store_true", help="redo textures already in replacements")
+    ap.add_argument("--junk-groups", action="store_true", help="every size shared by JUNK_GROUP_SIZE or more dumps "
+                    "is junk (port dumps: per-frame captures, no suffix to tell them by)")
     ap.add_argument("--only", nargs="+", metavar="STEM", help="process just these dump file stems "
                     "(even if already replaced); a replacement whose texture is now skipped is removed")
     args = ap.parse_args()
 
     game_dir = args.textures_dir or DEFAULT_TEXTURES / args.serial
-    dumps, out_dir = game_dir / "dumps", game_dir / "replacements"
+    dumps, out_dir = game_dir / "dumps", args.out or game_dir / "replacements"
     if not dumps.is_dir():
         sys.exit(f"No dumps folder at {dumps}. Enable 'Dump Textures' in PCSX2 and play first.")
     cfg = load_game_config(args.serial)
 
     files = sorted(p for p in dumps.glob("*.png") if not MIP_RE.search(p.stem))
+    if args.junk_groups:
+        cfg["junk_sizes"] = junk_sizes(files)
     if args.only:
         files = select_only(files, args.only, out_dir, cfg)
         args.force, args.sample = True, 0
@@ -326,7 +368,7 @@ def main():
         return
 
     esrgan = find_esrgan(args.esrgan)
-    out_dir.mkdir(exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
     todo = {}
     for cls in list(MODELS) + ["lanczos"]:
         items = [f for f in classes.get(cls, []) if args.force or not (out_dir / f.name).exists()]
