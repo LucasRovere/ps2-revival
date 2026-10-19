@@ -1,5 +1,6 @@
 #include "vif.hpp"
 
+#include "chain.hpp"
 #include "dmac.hpp"
 #include "draw_profile.hpp"
 #include "gs/gif.hpp"
@@ -29,6 +30,7 @@ Unit g_units[2];
 Unit g_vu_side;
 std::uint64_t g_commands[2][128];
 std::uint8_t g_dry_run[16384];
+ps2::chain::VuHook g_vu_hook = nullptr;
 
 bool on_vu_thread() { return gs::queue::role() == gs::queue::Role::Vu; }
 bool shadow(int unit) { return unit == 1 && gs::queue::vu_active() && !on_vu_thread(); }
@@ -67,6 +69,13 @@ void run_vu(int unit, std::uint32_t address) {
     } else {
         u.itop = u.itops;
         vu::set_tops(0, u.itop);
+    }
+    if (unit == 1 && g_vu_hook) {
+        const std::uint64_t start = draw_profile::g_on ? draw_profile::now_ns() : 0;
+        if (g_vu_hook(address)) {
+            if (draw_profile::g_on) draw_profile::handler_ran(address, draw_profile::now_ns() - start);
+            return;
+        }
     }
     if (unit == 1 && draw_profile::g_on) {
         const std::uint64_t start = draw_profile::now_ns();
@@ -305,6 +314,21 @@ void process(int unit) {
     u.pending.erase(u.pending.begin(), u.pending.begin() + static_cast<std::ptrdiff_t>(pos));
 }
 
+void feed(int unit, const std::uint8_t *data, std::uint32_t qwc) {
+    Unit &u = state(unit);
+    if (u.pending.empty() && !u.stalled) {
+        const auto *words = reinterpret_cast<const std::uint32_t *>(data);
+        const std::size_t count = static_cast<std::size_t>(qwc) * 4;
+        const std::size_t pos = run(unit, words, count);
+        if (pos < count) u.pending.assign(words + pos, words + count);
+        return;
+    }
+    const std::size_t old = u.pending.size();
+    u.pending.resize(old + static_cast<std::size_t>(qwc) * 4);
+    std::memcpy(u.pending.data() + old, data, static_cast<std::size_t>(qwc) * 16);
+    process(unit);
+}
+
 }
 
 void reset() {
@@ -324,18 +348,19 @@ void stats() {
 
 void transfer(int unit, const std::uint8_t *data, std::uint32_t qwc) {
     if (shadow(unit)) gs::queue::vu().post(gs::queue::kVif1, qwc, 0, data, qwc * 16);
-    Unit &u = state(unit);
-    if (u.pending.empty() && !u.stalled) {
-        const auto *words = reinterpret_cast<const std::uint32_t *>(data);
-        const std::size_t count = static_cast<std::size_t>(qwc) * 4;
-        const std::size_t pos = run(unit, words, count);
-        if (pos < count) u.pending.assign(words + pos, words + count);
-        return;
-    }
-    const std::size_t old = u.pending.size();
-    u.pending.resize(old + static_cast<std::size_t>(qwc) * 4);
-    std::memcpy(u.pending.data() + old, data, static_cast<std::size_t>(qwc) * 16);
-    process(unit);
+    feed(unit, data, qwc);
+}
+
+void transfer_chain(std::uint32_t address, const std::uint8_t *data, std::uint32_t qwc) {
+    if (shadow(1)) gs::queue::vu().post(gs::queue::kVif1Chain, address, qwc, data, qwc * 16);
+    else if (ps2::chain::draw(address, data, qwc)) return;
+    feed(1, data, qwc);
+}
+
+void run_hooked(const std::uint8_t *data, std::uint32_t qwc, ps2::chain::VuHook vu) {
+    g_vu_hook = vu;
+    feed(1, data, qwc);
+    g_vu_hook = nullptr;
 }
 
 bool stalled(int unit) { return state(unit).stalled; }

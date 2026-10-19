@@ -43,6 +43,7 @@ add_library(ps2runtime STATIC
     runtime/src/disc.cpp
     runtime/src/dmac.cpp
     runtime/src/draw_profile.cpp
+    runtime/src/chain.cpp
     runtime/src/vif.cpp
     runtime/src/vu_micro.cpp
     runtime/src/vu_jit.cpp

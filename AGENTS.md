@@ -165,6 +165,9 @@ the same change.
 - Phase 8 (D32): draw-list survey (T36); draw profile (`PS2_DRAW_PROFILE`,
   `recomp/drawlist.py`) and window frame-time log (`PS2_FRAME_LOG`, T45);
   window pacing by timer with audio correction (T45); menu dips: D33.
+- Chain handlers (Phase 8, T46, D35): `recomp.chain_handler` (game C++ in
+  `local/games/<serial>/chains/`) takes over VIF1 chain calls and VU1 program
+  runs; pilot's pre-lit scenery handler byte-identical, little speed (T48's).
 - Repo policy (D24): nothing game-specific in git; recipes, notes and
   game-specific code in `local/games/<serial>/`.
 - Phases 6–9 re-planned (D23): build on the vendored runtime and GS renderer;

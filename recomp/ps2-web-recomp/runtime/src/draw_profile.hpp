@@ -17,6 +17,7 @@ std::uint32_t target();
 void tag_done(std::uint32_t owner, std::uint32_t qwc, std::uint64_t ns);
 void gif_ran(int path, std::uint32_t qwc, std::uint64_t ns);
 void vu_ran(std::uint32_t address, std::uint64_t ns);
+void handler_ran(std::uint32_t address, std::uint64_t ns);
 void channel2_ran(std::uint32_t qwc, std::uint64_t ns);
 
 }

@@ -22,6 +22,7 @@ LOG = """[draw] frames 100-102 root chains 1.00/frame channel 2 0.0100 ms 1.0 qw
 [draw] gif 00001000 path 1 kicks 2.00 ms 0.5000 qw 4.0
 [draw] vu 00001000 entry 0000 runs 2.00 ms 2.0000
 [draw] vu 00002000 entry 0100 runs 1.00 ms 0.5000
+[draw] handler 00002000 entry 0100 runs 3.00 ms 0.2500
 [time] frames 100-102: 8.00 ms per frame
 """
 
@@ -41,6 +42,7 @@ class DrawListTest(unittest.TestCase):
         self.assertEqual(p["targets"][0x1000], (2.0, 3.0, 8.0))
         self.assertEqual(p["gif"][0x1000, 1], 0.5)
         self.assertEqual(p["vu"][0x2000, "0100"], (1.0, 0.5))
+        self.assertEqual(p["handler"][0x2000, "0100"], (3.0, 0.25))
 
     def test_chain_and_fingerprint(self):
         chain, vif = dl.chain_at(ram(), 0x1000)
@@ -51,7 +53,7 @@ class DrawListTest(unittest.TestCase):
     def test_kinds(self):
         kinds, seen = dl.classify(dl.parse_log(LOG), ram())
         k = kinds["V4-32@010 MSCAL0000 MSCNT"]
-        self.assertEqual((k["targets"], k["calls"], k["ms"], k["vu"], k["gs1"]), (2, 3.0, 4.0, 2.5, 0.5))
+        self.assertEqual((k["targets"], k["calls"], k["ms"], k["vu"], k["hdl"], k["gs1"]), (2, 3.0, 4.0, 2.5, 0.25, 0.5))
         self.assertEqual(seen[0][0], "root list (per-frame packets)")
         lines = dl.report(dl.parse_log(LOG), ram())
         self.assertIn("50.0%  V4-32@010 MSCAL0000 MSCNT", lines[2])  # 4 of 8 ms

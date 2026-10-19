@@ -12,7 +12,9 @@ The game.json `patches` words are applied to a copy of the ELF (original
 words checked, as in patches/build.py), which is translated and run;
 --no-patches uses the disc's ELF. `recomp.overrides` maps guest function
 addresses to our C++ functions (recomp/overrides/<name>.cpp or
-local/games/<serial>/overrides/<name>.cpp) that run in their place.
+local/games/<serial>/overrides/<name>.cpp) that run in their place;
+`recomp.chain_handler` names the C++ (local/games/<serial>/chains/<name>.cpp or
+recomp/chains/<name>.cpp) that takes over VIF1 chain calls (T46).
 
 The ISO is linked into work/<serial>/recomp/disc.iso on the first run, so
 --iso is only needed once.
@@ -58,6 +60,7 @@ GAMES_DIR = REPO / "local" / "games"
 WORK_DIR = REPO / "work"
 UPSTREAM = REPO / "recomp" / "ps2-web-recomp"
 OVERRIDES_DIR = REPO / "recomp" / "overrides"
+CHAINS_DIR = REPO / "recomp" / "chains"
 EXPLORE_ROUNDS = 8
 # Five minutes at NTSC: room for intro movies, title and menus (T39).
 DEFAULT_EXPLORE_FRAMES = 18000
@@ -148,6 +151,18 @@ def install_overrides(serial, overrides, generated):
     calls = "".join(f"    ps2::register_override({int(addr, 16):#010x}u, &ovr::{name});\n" for addr, name in sorted(overrides.items()))
     write_if_changed(generated / "overrides.cpp", f'#include "ps2/generated.hpp"\n\nnamespace ovr {{\n{decls}}}\n\n'
                                                   f"void register_overrides() {{\n{calls}}}\n")
+
+
+def install_chain_handler(serial, name, generated):
+    """Copies the chain handler's source (it defines register_chain_handlers()) into generated/chain_handler.cpp."""
+    target = generated / "chain_handler.cpp"
+    if not name:
+        target.unlink(missing_ok=True)
+        return
+    sources = [d / f"{name}.cpp" for d in (GAMES_DIR / serial / "chains", CHAINS_DIR) if (d / f"{name}.cpp").exists()]
+    if not sources:
+        sys.exit(f"No source for chain handler {name}: add {name}.cpp to local/games/{serial}/chains/ or recomp/chains/")
+    write_if_changed(target, sources[0].read_text())
 
 
 def build_tools(out):
@@ -550,6 +565,7 @@ def port(args, save_entries=False):
     eerecomp = build_tools(out)
     translate(eerecomp, elf, entries, overrides, generated)
     install_overrides(args.serial, cfg.get("overrides", {}), generated)
+    install_chain_handler(args.serial, cfg.get("chain_handler"), generated)
     runner = build_runner(out, generated)
     if not args.no_explore:
         found = Explorer(lambda: explore_runner(out, generated), eerecomp, elf, iso, out, entries, overrides,

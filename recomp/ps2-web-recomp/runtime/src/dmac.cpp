@@ -1,5 +1,6 @@
 #include "dmac.hpp"
 
+#include "chain.hpp"
 #include "draw_profile.hpp"
 #include "kernel.hpp"
 
@@ -37,6 +38,23 @@ constexpr std::uint32_t kBase[10] = {0x10008000u, 0x10009000u, 0x1000A000u, 0x10
 std::uint64_t g_starts[10];
 bool g_mfifo_waiting = false;
 
+// A VIF1 `call` a chain handler claimed: the chain's data is gathered until its `ret` and handed over as one.
+struct Collect {
+    bool on = false;
+    std::uint32_t address = 0, asp = 0;
+    std::vector<std::uint8_t> data;
+} g_collect;
+
+void to_vif(int ch, const std::uint8_t *data, std::uint32_t qwc) {
+    if (ch == 1 && g_collect.on) g_collect.data.insert(g_collect.data.end(), data, data + static_cast<std::size_t>(qwc) * 16);
+    else vif::transfer(ch, data, qwc);
+}
+
+void end_collect() {
+    g_collect.on = false;
+    vif::transfer_chain(g_collect.address, g_collect.data.data(), static_cast<std::uint32_t>(g_collect.data.size() / 16));
+}
+
 // MFIFO: with D_CTRL.MFD set to VIF1, fromSPR fills a ring buffer in main memory (D_RBOR,
 // D_RBSR) and VIF1 runs a chain out of it, stalling while its tag address has caught up
 // with fromSPR's write address.
@@ -70,7 +88,7 @@ void deliver(int ch, std::uint32_t address, std::uint32_t qwc) {
     }
     switch (ch) {
     case 0: vif::transfer(0, data, qwc); break;
-    case 1: vif::transfer(1, data, qwc); break;
+    case 1: to_vif(1, data, qwc); break;
     case 2:
         if (draw_profile::g_on) {
             const std::uint64_t start = draw_profile::now_ns();
@@ -235,9 +253,9 @@ void run_chain(int ch) {
             std::uint8_t q[16];
             std::memcpy(q, tagp, 16);
             std::memset(q, 0, 8);
-            vif::transfer(ch, q, 1);
+            to_vif(ch, q, 1);
         }
-        bool end = false;
+        bool end = false, chain_ret = false;
         const std::uint32_t tag_at = c.tadr;
         std::uint32_t data = c.tadr + 16;
         switch (id) {
@@ -251,11 +269,17 @@ void run_chain(int ch) {
             c.chcr = (c.chcr & ~0x30u) | (std::min(asp + 1, 2u) << 4);
             c.tadr = addr_full;
             if (profiled) draw_profile::call(addr_full);
+            if (ch == 1 && !mfifo && !g_collect.on && chain::claims(addr_full)) {
+                g_collect.on = true;
+                g_collect.address = addr_full;
+                g_collect.asp = asp;
+                g_collect.data.clear();
+            }
             break;
         }
         case 6: {
             const std::uint32_t asp = (c.chcr >> 4) & 3u;
-            if (profiled) draw_profile::ret();
+            chain_ret = true;
             if (asp > 0) {
                 c.tadr = c.asr[asp - 1];
                 c.chcr = (c.chcr & ~0x30u) | ((asp - 1) << 4);
@@ -284,6 +308,8 @@ void run_chain(int ch) {
             deliver(ch, data, qwc);
             c.madr = data + qwc * 16;
         }
+        if (g_collect.on && ch == 1 && (end || (tie && irq) || (chain_ret && ((c.chcr >> 4) & 3u) == g_collect.asp))) end_collect();
+        if (profiled && chain_ret) draw_profile::ret();
         if (profiled) draw_profile::tag_done(profile_owner, qwc, draw_profile::now_ns() - profile_start);
         if (vif_stalled(ch)) {
             pause(ch, end || (tie && irq));

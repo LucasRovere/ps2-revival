@@ -17,6 +17,7 @@
 
 void register_generated_code();
 void register_generated_vu();
+void register_chain_handlers();
 
 EM_JS_DEPS(ps2web, "$stringToNewUTF8,$UTF8ToString");
 
@@ -387,6 +388,7 @@ int main(int argc, char **argv) {
     ps2::set_audio_sink(push_audio);
     register_generated_code();
     register_generated_vu();
+    register_chain_handlers();
 
     ps2::init_graphics();
     const bool no_surface = EM_ASM_INT({ return Module.noSurface ? 1 : 0; });

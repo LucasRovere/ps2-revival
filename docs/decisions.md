@@ -746,3 +746,38 @@ on in the owner's order (T46 next). D31 stays; its "revisit if the native
 draw path does not remove the dips" is answered for the menu dips by T53.
 
 **Revisit if:** the owner still sees dips after T45's pacing fix and T53.
+
+## D34: Menu fade screens at scale 3 accepted for now; decoded texture pack kept in RAM
+
+**Owner answers (2026-10-19, after T53):** the GPU-bound fade screens at
+scale 3 (T54's option a): "Accept for now". The decoded texture pack in RAM
+from the start (T53's loader threads, ~1 GB for the pilot's pack): "OK".
+
+**Decision:** T54 leaves the backlog; nothing changes in the runtime. The
+pack stays decoded in RAM.
+
+**Revisit if:** the owner finds the fades bothersome in play (then T54's
+options b or c), or memory becomes a problem on a smaller machine or a
+bigger pack.
+
+## D35: Chain handlers keep the VIF and replace VU1 program runs
+
+**Decision (T46, 2026-10-19):** the D32 seam is built as: the handler
+claims `call` targets on the EE thread (by the chain's bytes in RAM), the
+chain's words go to it as one packet in stream order (VU thread in the
+window), and it runs them through VIF1 with a hook at each VU1 program
+start, where it may do the program's work itself. The VIF unpacks, VIF
+state and the engine's per-object setup program stay as they are. VU1 work
+costs no emulated EE time in this runtime, so a handler charges none.
+
+**Why:** the unpacks, the VIF's double-buffer state and the setup program
+are what later batches and chains depend on; keeping them makes a handler
+exact with only the batch program re-done (pilot: frames byte-identical,
+0 differences in VU1 memory over 15 million batches), and a batch it cannot
+do (e.g. one needing the program's clipper) falls back to VU1 with no
+side effects. The cost: the VIF unpacks stay, so the CPU handler saves only
+part of the VU thread's work (~20% of the batches' VU1 part, T46).
+
+**Revisit if:** the GPU mesh path (T48) needs to skip the VIF work too:
+then the chain's VIF state (double-buffer offsets, row/mode) must advance
+as if it ran, e.g. by a state-only VIF pass over the words.

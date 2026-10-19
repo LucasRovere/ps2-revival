@@ -457,6 +457,7 @@ void run_vu_thread() {
             switch (h.type) {
             case gs::queue::kVif1: vif::transfer(1, payload, h.arg0); break;
             case gs::queue::kVif1Write: vif::write(1, h.arg0, h.arg1); break;
+            case gs::queue::kVif1Chain: vif::transfer_chain(h.arg0, payload, h.arg1); break;
             case gs::queue::kVuReset:
                 vif::reset_vu_side();
                 vu::reset();

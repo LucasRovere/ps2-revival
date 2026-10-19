@@ -26,7 +26,7 @@ std::uint32_t g_target = 0;
 std::vector<std::uint32_t> g_stack;
 std::map<std::uint32_t, Cost> g_targets;
 std::map<std::pair<std::uint32_t, int>, Cost> g_gif;
-std::map<std::pair<std::uint32_t, std::uint32_t>, Cost> g_vu;
+std::map<std::pair<std::uint32_t, std::uint32_t>, Cost> g_vu, g_handler;
 Cost g_roots, g_channel2;
 
 void print() {
@@ -36,6 +36,7 @@ void print() {
     for (const auto &[t, c] : g_targets) std::fprintf(stderr, "[draw] target %08X calls %.2f ms %.4f qw %.1f\n", t, c.count / n, c.ns / n / 1e6, c.qw / n);
     for (const auto &[k, c] : g_gif) std::fprintf(stderr, "[draw] gif %08X path %d kicks %.2f ms %.4f qw %.1f\n", k.first, k.second, c.count / n, c.ns / n / 1e6, c.qw / n);
     for (const auto &[k, c] : g_vu) std::fprintf(stderr, "[draw] vu %08X entry %04X runs %.2f ms %.4f\n", k.first, k.second, c.count / n, c.ns / n / 1e6);
+    for (const auto &[k, c] : g_handler) std::fprintf(stderr, "[draw] handler %08X entry %04X runs %.2f ms %.4f\n", k.first, k.second, c.count / n, c.ns / n / 1e6);
 }
 
 }
@@ -90,6 +91,12 @@ void gif_ran(int path, std::uint32_t qwc, std::uint64_t ns) {
 
 void vu_ran(std::uint32_t address, std::uint64_t ns) {
     Cost &c = g_vu[{g_target, address}];
+    ++c.count;
+    c.ns += ns;
+}
+
+void handler_ran(std::uint32_t address, std::uint64_t ns) {
+    Cost &c = g_handler[{g_target, address}];
     ++c.count;
     c.ns += ns;
 }

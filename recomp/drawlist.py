@@ -5,7 +5,8 @@ and a PS2_DUMP RAM dump of the same run. Each DMA `call` target's chain is
 read from the dump and fingerprinted by its VIF commands (unpack formats and
 VU1 addresses, MSCAL/MSCNT, DIRECT, MPG); targets with the same fingerprint
 form one kind. Per kind: targets, calls, VIF1 ms (incl. the VU1 and GS work
-it starts), VU1 ms, GS front-end ms (path 1, path 2), share of the frame
+it starts), VU1 ms, chain handler ms (VU1 starts a chain handler did itself,
+T46), GS front-end ms (path 1, path 2), share of the frame
 (from a `[time]` line of the same frames, PS2_TIME) or of the VIF1 total.
 --match names the chains found byte for byte in the files of a folder (e.g.
 a game's unpacked mesh files).
@@ -35,11 +36,12 @@ def parse_log(text):
     gif = collections.defaultdict(float)
     for a, path, ms in re.findall(r"\[draw\] gif ([0-9A-F]+) path (\d) kicks [\d.]+ ms ([\d.]+)", text):
         gif[int(a, 16), int(path)] += float(ms)
-    vu = {}
-    for a, entry, runs, ms in re.findall(r"\[draw\] vu ([0-9A-F]+) entry ([0-9A-F]+) runs ([\d.]+) ms ([\d.]+)", text):
-        vu[int(a, 16), entry] = (float(runs), float(ms))
+    vu, handler = {}, {}
+    for what, a, entry, runs, ms in re.findall(r"\[draw\] (vu|handler) ([0-9A-F]+) entry ([0-9A-F]+) runs ([\d.]+) ms ([\d.]+)", text):
+        (vu if what == "vu" else handler)[int(a, 16), entry] = (float(runs), float(ms))
     return {"frames": (first, last), "frame_ms": float(t.group(1)) if t else None, "roots": float(m.group(3)),
-            "channel2_ms": float(m.group(4)), "targets": targets, "gif": gif, "vu": vu}
+            "channel2_ms": float(m.group(4)), "targets": targets, "gif": gif, "vu": vu,
+            "handler": handler}
 
 
 def chain_at(ram, address):
@@ -131,7 +133,7 @@ def match_chains(chains, folder):
 
 def classify(profile, ram):
     """{kind: summary} and {target: (kind, chain bytes or None)}."""
-    kinds = collections.defaultdict(lambda: {"targets": 0, "calls": 0.0, "ms": 0.0, "vu": 0.0, "gs1": 0.0, "gs2": 0.0,
+    kinds = collections.defaultdict(lambda: {"targets": 0, "calls": 0.0, "ms": 0.0, "vu": 0.0, "hdl": 0.0, "gs1": 0.0, "gs2": 0.0,
                                              "entries": collections.Counter()})
     seen = {}
     for target, (calls, ms, _) in profile["targets"].items():
@@ -150,6 +152,8 @@ def classify(profile, ram):
         k = kinds[seen[target][0] if target in seen else "root list (per-frame packets)"]
         k["vu"] += ms
         k["entries"][entry] += ms
+    for (target, _), (_, ms) in profile["handler"].items():
+        kinds[seen[target][0] if target in seen else "root list (per-frame packets)"]["hdl"] += ms
     return kinds, seen
 
 
@@ -158,19 +162,20 @@ def report(profile, ram, match=None, top=20):
     kinds, seen = classify(profile, ram)
     vif_total = sum(ms for _, ms, _ in profile["targets"].values())
     vu_total = sum(ms for _, ms in profile["vu"].values())
+    hdl_total = sum(ms for _, ms in profile["handler"].values())
     gs = {p: sum(ms for (_, path), ms in profile["gif"].items() if path == p) for p in (1, 2)}
     frame_ms = profile["frame_ms"]
     base, base_name = (frame_ms, "frame") if frame_ms else (vif_total, "VIF1")
     first, last = profile["frames"]
     lines.append(f"frames {first}-{last}: " + (f"{frame_ms:.2f} ms/frame; " if frame_ms else "")
-                 + f"VIF1 {vif_total:.2f} ms, VU1 {vu_total:.2f} ms, GS front end path 1 {gs[1]:.2f} ms, path 2 {gs[2]:.2f} ms, "
+                 + f"VIF1 {vif_total:.2f} ms, VU1 {vu_total:.2f} ms, chain handler {hdl_total:.2f} ms, GS front end path 1 {gs[1]:.2f} ms, path 2 {gs[2]:.2f} ms, "
                  + f"channel 2 {profile['channel2_ms']:.2f} ms per frame; {profile['roots']:.2f} root chains per frame")
-    lines.append(f"{'#':>3} {'targets':>7} {'calls':>8} {'VIF1 ms':>8} {'VU1 ms':>7} {'GS p1':>6} {'GS p2':>6} {'% ' + base_name:>8}  kind (VU1 ms by entry)")
+    lines.append(f"{'#':>3} {'targets':>7} {'calls':>8} {'VIF1 ms':>8} {'VU1 ms':>7} {'Hdl ms':>7} {'GS p1':>6} {'GS p2':>6} {'% ' + base_name:>8}  kind (VU1 ms by entry)")
     ranked = sorted(kinds, key=lambda kind: -kinds[kind]["ms"])
     for n, kind in enumerate(ranked[:top], 1):
         k = kinds[kind]
         entries = ", ".join(f"{e} {ms:.2f}" for e, ms in k["entries"].most_common(3))
-        lines.append(f"{n:3d} {k['targets']:7d} {k['calls']:8.1f} {k['ms']:8.3f} {k['vu']:7.3f} {k['gs1']:6.3f} {k['gs2']:6.3f} "
+        lines.append(f"{n:3d} {k['targets']:7d} {k['calls']:8.1f} {k['ms']:8.3f} {k['vu']:7.3f} {k['hdl']:7.3f} {k['gs1']:6.3f} {k['gs2']:6.3f} "
                      f"{100 * k['ms'] / base:7.1f}%  {kind}" + (f" ({entries})" if entries else ""))
     if len(kinds) > top:
         rest = sorted(kinds.values(), key=lambda k: -k["ms"])[top:]

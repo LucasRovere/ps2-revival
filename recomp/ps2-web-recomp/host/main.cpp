@@ -18,6 +18,7 @@
 
 void register_generated_code();
 void register_generated_vu();
+void register_chain_handlers();
 
 namespace {
 
@@ -138,6 +139,7 @@ int main(int argc, char **argv) {
 #endif
     register_generated_code();
     register_generated_vu();
+    register_chain_handlers();
     const auto emulate = [&]() -> int {
         std::uint32_t entry = 0;
         if (!ps2::load_elf(elf, entry)) {

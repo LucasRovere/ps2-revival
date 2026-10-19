@@ -194,6 +194,26 @@ kind), `PS2_FRAME_LOG` (window, per-frame time and thread waits), see
   surface acquire: ~30 fps for 1-2 s; fine at scale 1). These need their
   own fixes (backlog), not the native draw path.
 
+**Chain handlers (T46, pilot game; details in the local notes and
+`recomp/README.md`).** The seam is in the runtime: a game's handler claims
+`call` targets on the EE thread, gets the chain's words where VIF1 would
+run them (the VU thread in the window) and runs them through VIF1 with a
+hook at each VU1 program start. VU1 costs no emulated EE time in this
+runtime, so handlers do not change cycle counts. Findings:
+
+- The pilot's pre-lit kind runs one setup program per object and one of
+  a few batch programs per batch (one main program ~78% of the batches,
+  two variants ~22%: one colour for the mesh, or two ST sets drawn in two
+  passes); all three re-done on the CPU with the VU float ops match the VU
+  path bit for bit (frames byte-identical). Batches whose strip crosses
+  the frustum planes need the program's polygon clipper (~0.5%); they stay
+  on VU1, decided before any side effect.
+- A CPU re-implementation saves little: the compiled VU1 code is already
+  native, and the batch's VU1 part is only part of its cost next to the VIF
+  unpacks and the GS front end of its kicks. Measured: ~20% of the batches'
+  VU1 part; frame times unchanged within noise. The gain needs the GPU
+  path (step 4), which must skip the VIF unpacks too: the chain's VIF state
+  (double-buffer offsets) still has to advance as if it ran.
 **Plan (D32).** The hook is a generic runtime seam: a handler registered
 for static mesh chains is called where VIF1 `call`s the chain (on the VU
 thread in the window, so GS ordering stays right) and may draw the mesh
@@ -203,7 +223,8 @@ itself. Steps, one session each:
    script (T45, done).
 2. Chain handlers in the runtime; first handler: the pilot's pre-lit
    static meshes, VU1 program path re-implemented on the CPU, primitives
-   into the GS renderer, frames compared with the VU path (T46).
+   into the GS renderer, frames compared with the VU path (T46, done:
+   byte-identical, little speed gain).
 3. Lit car meshes the same way (T47).
 4. GPU mesh path: chain vertex data cached on the GPU, a compute pass
    builds the GS primitives (skips the VU1 work and the GS front end);

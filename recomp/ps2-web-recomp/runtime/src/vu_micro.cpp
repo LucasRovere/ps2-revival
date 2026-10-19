@@ -693,12 +693,14 @@ struct Candidate {
     std::vector<std::uint8_t> code;
     ProgramFn function = nullptr;
     ProgramFn jit = nullptr;
+    std::uint64_t key = 0;
 };
 
 struct EntryCache {
     std::uint32_t generation = 0;
     ProgramFn function = nullptr;
     ProgramFn jit = nullptr;
+    std::uint64_t key = 0;
     std::vector<Candidate> candidates;
     std::uint32_t next = 0;
 };
@@ -868,10 +870,12 @@ ProgramFn lookup(std::uint32_t address) {
         if (candidate_matches(c)) {
             e.function = c.function;
             e.jit = c.jit;
+            e.key = c.key;
             return e.function;
         }
     const std::vector<std::uint32_t> pcs = reachable(g_vu1_code, 16383u, address);
     const std::uint64_t key = program_key(g_vu1_code, pcs, address & 16383u);
+    e.key = key;
     const auto it = g_programs.find(key);
     e.function = it == g_programs.end() ? nullptr : it->second;
     e.jit = nullptr;
@@ -881,6 +885,7 @@ ProgramFn lookup(std::uint32_t address) {
     Candidate c = make_candidate(pcs);
     c.function = e.function;
     c.jit = e.jit;
+    c.key = key;
     if (e.candidates.size() < 8) e.candidates.push_back(std::move(c));
     else e.candidates[e.next++ % 8] = std::move(c);
     static const char *record = std::getenv("PS2_VU_RECORD");
@@ -899,6 +904,11 @@ ProgramFn lookup(std::uint32_t address) {
         }
     }
     return e.function;
+}
+
+std::uint64_t program_key(std::uint32_t address) {
+    lookup(address);
+    return g_entries[(address & 16383u) >> 3].key;
 }
 
 void run_fast(int n, std::uint32_t address) {

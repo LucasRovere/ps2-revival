@@ -4,7 +4,8 @@ EE (R5900) → C++ static recompiler (Phase 5). The recompiler and runtime are
 [ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp) (MIT), vendored
 in `ps2-web-recomp/` (D14, D16). Our own code: `port.py` (incl. the port folder), `play.py` (launcher), `drawlist.py` (draw-list report), the function
 override hook (vendored patch, below), generic overrides in `overrides/`
-(none yet; created with the first) and the instruction tests in `tests/`.
+(none yet; created with the first), the chain handler hook (vendored patch) with a test handler in
+`chains/` and the instruction tests in `tests/`.
 
 ## port.py (WSL or Windows)
 
@@ -74,11 +75,12 @@ them (D21, T25). Programs not recorded run on the VU1 interpreter;
 | `explore_frames` | Frames the automatic exploration plays from boot (below) |
 | `menu` | Optional scripted run from boot: `frames`, `frame_every`, `presses` (`frame:button[+button][:hold]`) |
 | `overrides` | Optional `{"0x00123456": "name"}`: guest function entry → our C++ function `name` (below) |
+| `chain_handler` | Optional `name`: the C++ that takes over VIF1 chain calls, `local/games/<SERIAL>/chains/<name>.cpp` or `chains/<name>.cpp` ([Chain handlers](#chain-handlers-t46)) |
 | `save`, `load` | Optional scripted runs for `--saves` (same keys as `menu`, below) |
 
 Output (game-derived, never commit): `work/<SERIAL>/recomp/`: `generated/`
-(C++, incl. `vu1_*.cpp`, `overrides.cpp` and copies of the override
-sources), `patched/` (the patched ELF), `vu1/` (recorded VU1 program
+(C++, incl. `vu1_*.cpp`, `overrides.cpp`, copies of the override
+sources and `chain_handler.cpp`), `patched/` (the patched ELF), `vu1/` (recorded VU1 program
 images), `build-tools/`, `build-native/`, `explore/` (the exploration's
 last segment: state, card, frames, log), `explore-frames/` (its new
 scenes), `menu.log`, `*-frames/` (PPM), memory cards. New entry points found by exploring are
@@ -457,7 +459,8 @@ headless speed is within noise.
 the VIF1 DMA list per `call` target for frames from..from+count and prints
 `[draw]` lines when the run passes from+count: per target the calls, VIF1
 ms (each DMA tag's time, including the VU1 programs and GS front end it
-starts) and qwords; VU1 ms per (target, program entry); GS front-end ms per
+starts) and qwords; VU1 ms per (target, program entry) (chain handler ms per (target, entry) for VU1 starts a
+handler did, T46); GS front-end ms per
 (target, GIF path 1/2); root chains per frame and channel 2 (path 3)
 totals. About 20% slower while on, same cycles. In the window the VU
 thread does that work, so the variable is ignored there (one log line);
@@ -543,6 +546,65 @@ costs no emulated time, so it loops more often per frame than a real GS
 could fill (55 M pixels per frame in the fade-out). Options are in
 `docs/tasks.md`.
 
+### Chain handlers (T46)
+
+Game code can take over a VIF1 chain at its DMA `call` (D32, D35): e.g. an
+engine's static mesh chains, drawn natively instead of by the VU1
+program. One handler per game, `recomp.chain_handler` in `game.json`
+(source in `local/games/<SERIAL>/chains/<name>.cpp`, game-specific, D24;
+or `chains/<name>.cpp`); `port.py` copies it to
+`generated/chain_handler.cpp`. It defines `register_chain_handlers()` and
+calls `ps2::chain::register_handler(claim, draw)` (`ps2/chain.hpp`):
+
+- `claim(address)` runs on the EE thread at each VIF1 `call` tag and says
+  whether the handler wants the chain at that address (it may read
+  `g_ram`; cache per address, the call is frequent). A claimed chain's
+  data (every qword DMA delivers between the `call` and its `ret`, nested
+  calls included) is gathered and handed over as one: headless straight
+  to `draw`, in the window as one `kVif1Chain` packet to the VU thread in
+  stream order (the EE side runs the VIF state copy over the same words as
+  before, so what the EE sees does not change). Unclaimed calls run as
+  before.
+- `draw(address, data, qwc)` runs where the chain's VIF commands would
+  (VU thread in the window, VU1 memory current). Returning false runs the
+  words through VIF1 as usual. Returning true means the handler did the
+  work: it must have passed the words through
+  `ps2::chain::run(data, qwc, hook)`, which runs the VIF commands normally
+  (unpacks into VU1 memory, VIF state, MPG) and calls `hook(entry)` at each
+  VU1 start (MSCAL, MSCALF, MSCNT) with `vu::top()` set; the hook returns
+  true when it did the program's work itself (output through `vu::kick`,
+  registers it leaves for later programs, e.g. `tpc`), false to run the
+  VU1 program. `ps2::chain::vu1_program(entry)` gives the vurecomp key of
+  the program at an entry (as in `vu1_<key>`), `vu1_memory()`,
+  `vu1_regs()` the VU1 state; `ps2/vu_ops.hpp` has the VU float ops the
+  compiled programs use (same ops in the same order give the same bits).
+
+Emulated time: in this runtime VU1 programs cost no EE cycles (a program
+runs to completion at its MSCAL/MSCNT, FLUSH waits for nothing, the EE
+never waits on VU1), so a handler charges none either and cycle counts do
+not change. A handler must produce the same GS packets (and leave VU1
+memory and the registers later programs read as the program would) for
+byte-identical frames.
+
+`chains/identity.cpp` claims every call and runs each chain through
+`chain::run` with the programs unchanged: the check that the seam itself
+changes nothing. With `PS2_DRAW_PROFILE`, VU1 starts a hook did are listed
+as `[draw] handler <target> entry <entry>` (drawlist.py column `Hdl ms`,
+incl. the GS front-end work of their kicks) instead of VU1 time.
+
+Check (pilot game): no handler: menu run 107/107 frames, 52,595,993,647
+cycles; headless race intro 26.7 vs 27.1 ms/frame (3 runs each, noise).
+Identity handler: menu run and racing state byte-identical, same cycles.
+The pilot's handler (local, the engine's pre-lit static meshes: its three
+main batch programs re-done on the CPU with the same float ops, a batch
+that needs the program's polygon clipper left to VU1): a debug mode that
+runs every native batch on VU1 too found 0 differences in VU1 memory over
+15 million batches (racing and race intro); racing and race intro frames
+byte-identical, same cycles; window runs at scale 1 and 3 work. Speed:
+the batches' VU1 work (excl. the GS front end of their kicks) ~20% less
+(VIF unpacks and the GS front end stay); headless and window frame times
+unchanged within noise, fewer VU-limited frames at scale 1 (race intro
+60 → 16 of 2,397). The speed is for the GPU mesh path (T48).
 ### Patches and overrides (T31)
 
 **Patches:** the top-level `game.json` `patches` (the Phase 4 recipe, see
@@ -617,6 +679,7 @@ except:
 | `runtime/src/draw_profile.cpp`, `draw_profile.hpp` (new), `CMakeLists.txt`, `runtime/src/dmac.cpp` (`run_chain`, `start`, channel 2), `runtime/src/vif.cpp` (`run_vu`), `runtime/src/gs/gif.cpp` (`transfer`), `runtime/src/system.cpp` (`vblank`) | Draw profile (T45): `PS2_DRAW_PROFILE=<from>,<count>` times VIF1 tags per DMA `call` target, VU1 runs per entry and GIF paths 1/2 per target, headless only; `[draw]` lines after the last frame. Unset: one test of a false flag per VIF1 tag, VU1 run and GIF packet; frames and cycles unchanged. |
 | `runtime/src/gs/queue.hpp`, `queue.cpp` (`time_waits`, `wait_began`, `wait_ended`, `waited_ms`, `wait` kind), `runtime/src/gs/gs.cpp`, `gs.hpp` (`post_present(frame)`, `presented_frame`), `runtime/src/system.cpp`, `runtime/include/ps2/system.hpp` (wrappers, present timed), `host/window.cpp` (`PS2_FRAME_LOG`, `pace`) | Frame-time log (T45): time each thread waits by kind (only after `time_waits()`, i.e. with `PS2_FRAME_LOG`); the present carries its guest frame in the queue header. Pacing: timer-spaced frames with an audio-queue correction instead of waiting for the audio queue (window only; headless unchanged). |
 | `runtime/src/gs/gpu/texpack.cpp` (`Slot`, `load`, `claim`, `start_loaders`, `find`) | Pack loader threads (T53): with `PS2_TEXTURES` set, `init` starts threads that decode every pack image; `find` decodes or waits for an image not decoded yet, so frames do not depend on timing. Without a pack nothing starts; frames and cycles unchanged. |
+| `runtime/include/ps2/chain.hpp`, `runtime/src/chain.cpp`, `chain.hpp` (new), `CMakeLists.txt`, `runtime/src/dmac.cpp` (`run_chain`, `to_vif`), `runtime/src/vif.cpp`, `vif.hpp` (`transfer_chain`, `run_hooked`, `feed`, hook in `run_vu`), `runtime/src/gs/queue.hpp` (`kVif1Chain`), `runtime/src/system.cpp` (VU thread), `runtime/src/vu_micro.cpp`, `vu_micro.hpp` (`program_key`), `runtime/src/draw_profile.cpp`, `draw_profile.hpp` (`handler_ran`), `host/main.cpp`, `host/web.cpp` (`register_chain_handlers()`) | Chain handlers (T46, D32): a claimed VIF1 `call`'s data goes to the handler as one (`kVif1Chain` in the window), `chain::run` with a hook at each VU1 start; profile `ret` now after the tag's data. No handler: one test of a null pointer per `call` tag and VU1 start; frames and cycles unchanged. |
 
 The headless Windows build (T22) needs no changes to upstream: the headless path
 leaves out `host/window.cpp` (SDL2), `host/profile.cpp` (Linux only) and the
@@ -653,7 +716,7 @@ python recomp/tests/oracle.py [--mode rec interp ...]     # Windows: vectors on 
 | `tests/oracle.py` | One test ELF for all eligible vectors, run on PCSX2 (own data folder in `work/`), end states parsed from the EE console log |
 | `tests/test_port.py` | `port.py`'s pure parts: serial from the boot ELF name, default `game.json`, refusal to overwrite, folder `settings.json` |
 | `tests/test_explore.py` | `explore.py` on synthetic frames: frame signature, black/frozen/repeated frames are not new scenes, stall rule, pattern order (stalls in a row try every pattern), generated presses |
-| `tests/test_drawlist.py` | `drawlist.py` on a synthetic chain: log parsing, chain read and VIF fingerprint, kinds and shares, `--match` at an odd file offset |
+| `tests/test_drawlist.py` | `drawlist.py` on a synthetic chain: log parsing (incl. chain handler lines), chain read and VIF fingerprint, kinds and shares, `--match` at an odd file offset |
 | `tests/harness/` | C++ harness (`main.cpp`: load state, `dispatch`, print state as JSON), `override.cpp` (the override case's C++) and its CMake project (links upstream `ps2runtime`) |
 
 Harness output (fixture C++, build): `work/recomp-tests/`.
