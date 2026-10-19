@@ -1,0 +1,125 @@
+# AGENTS.md: start here
+
+You are working on **ps2-revival**, a public, MIT-licensed toolkit for
+improving PS2 games in PCSX2 and, long term, porting them natively to Windows.
+The owner directs the project and lets agents do the coding. This file is the
+onboarding for a fresh agent with no prior context.
+
+## Read first (in this order)
+
+1. `local/MACHINE.md`: **if it exists**. Machine-specific facts for the
+   owner's PC (tool paths, hardware, where the game discs are). Not in git.
+2. [docs/decisions.md](docs/decisions.md): what has been decided and why.
+   Do not re-open a decision without new evidence; if you have some, say so
+   to the owner rather than silently changing direction.
+3. [docs/roadmap.md](docs/roadmap.md): phases, current status, next tasks.
+4. The doc for the area you are touching (index: [docs/README.md](docs/README.md)).
+5. `local/games/<serial>/notes.md` for the game you are working on (not in
+   git; it is the memory for that game, see [docs/games.md](docs/games.md)).
+
+## Hard rules
+
+1. **No game data and nothing game-specific in the repo, ever.** No ISOs,
+   BIOS, ELFs/IRX modules, decompiled or recompiled game code, dumped or
+   upscaled textures, models, audio, screenshots of copyrighted art. Also no
+   game-specific recipes, notes, overrides, patches or code (incl. engine
+   format decoders and hand-written reimplementations of game functions):
+   they live in `local/games/<serial>/` (git-ignored, D24). Tracked docs and
+   comments stay game-neutral ("the pilot game": no title, serial,
+   addresses or identifying counts). `.gitignore` covers the common cases;
+   check `git status` before committing. Details: [docs/legal.md](docs/legal.md).
+2. **MIT-compatible code only.** Do not copy code from GPL/LGPL/AGPL,
+   "non-commercial" or unknown-license projects. That includes **PCSX2
+   (GPL-3)** and **KytyPS5 (GPL-2-only)**. Reading them to understand
+   hardware behaviour is fine; reimplement in your own words. MIT, BSD,
+   Apache-2.0, zlib, ISC, Unlicense/public domain are fine. Record third-party
+   code in `THIRD_PARTY_NOTICES.md` (create it when first needed).
+3. **Ask the owner before**: downloading or installing software, editing
+   PCSX2's config files (only while PCSX2 is closed), pushing to GitHub,
+   deleting anything outside the repo (e.g. texture dumps), or any action that
+   is hard to undo. Never ask for or handle the owner's passwords/tokens.
+   Pushing uses Git Credential Manager, where the owner signs in themselves.
+4. **Verify, then claim.** Test on real data, inspect outputs (look at images,
+   not only numbers), and report failures plainly. Mark anything unverified
+   as such in docs (`Unverified:` / `Assumption:`). Several "obvious"
+   heuristics in this project turned out wrong when checked (see the texture
+   lessons in [docs/textures.md](docs/textures.md)).
+5. **Keep the docs true.** When you learn something, update the relevant doc
+   in the same change: game findings → `local/games/<serial>/notes.md`
+   (git-ignored), general lessons → the area doc, decisions →
+   `docs/decisions.md`, status → `docs/roadmap.md`. A fresh agent after you
+   must be able to continue from the docs alone.
+
+## Environment essentials (Windows)
+
+Full details: [docs/environment.md](docs/environment.md). The traps that cost time:
+
+- Shell is **Windows PowerShell 5.1**: no `&&`, no `?:`. Passing Python code
+  with double quotes via `python -c` gets mangled; write a script file instead.
+- `python` on PATH may be the **Microsoft Store alias**, not a real Python.
+  Use the full path from `local/MACHINE.md` (or `py`/a venv if available).
+- Python cannot open scripts under very long paths (some agent scratch
+  directories exceed 260 chars). Put throwaway scripts in `work/` inside the
+  repo (git-ignored).
+- Run Python with `-I` when processing untrusted downloaded files.
+
+## Repository map
+
+```
+AGENTS.md            this file (CLAUDE.md points here)
+README.md            human overview
+docs/                all documentation (index: docs/README.md)
+textures/            texture upscale pipeline (working)
+extract/             ISO reader, boot files, disc inventory (working)
+analysis/            Ghidra headless analysis + plain-file export (working)
+patches/             PCSX2 .pnach builder from game.json recipes (working)
+recomp/              vendored ps2-web-recomp + port.py (Windows/WSL, working) + tests
+local/               git-ignored: MACHINE.md, games/<serial>/ (game.json,
+                     notes.md, game-specific tools/)
+work/                scratch space, git-ignored
+tools/bin/           local tool installs (Ghidra, JDK, Real-ESRGAN), git-ignored
+```
+
+Planned modules (see roadmap): `mods/`. Runtime and graphics work happens
+in the vendored code under `recomp/` (D23); no separate `runtime/` or
+`graphics/`.
+
+## Conventions
+
+- Python 3.12+, stdlib + `numpy` + `pillow` unless a module needs more (add
+  a `requirements.txt` per module). Native code later: C++20, CMake.
+- CLI tools take the **game serial** (as PCSX2 shows it) as the main
+  argument and read `local/games/<serial>/game.json`.
+- Comments explain *why* (PS2 quirks, measured thresholds), not *what*.
+- Thresholds that were tuned on real data say so in a comment ("tuned on
+  a pilot game"), without naming the game.
+- Small, reviewable commits with plain messages ("textures: ...").
+
+## Current state (keep updated)
+
+- Working, verified on the pilot game: `textures/` (`--only` review loop,
+  scale 2 or 4), `extract/` (ISO reader, boot files, inventory, CRC),
+  `analysis/` (Ghidra export incl. vtable pass, 0 decompile failures;
+  `syscalls.py`, `census.py`). The pilot game's engine-specific archive and
+  texture decoders are local tools (`local/games/<serial>/tools/`, D24).
+- Patches (Phase 4 done): `patches/build.py`; the pilot game gets a
+  widescreen pnach (D12), no 60 FPS patch (D11), no 480p patch (D13).
+  Owner checks pending, untested in game (see local game notes).
+- Recompiler (Phase 5 done, 2026-10-18): ps2-web-recomp (MIT, D14) vendored
+  in `recomp/ps2-web-recomp/` with listed patches (D16, `recomp/README.md`).
+  `recomp/port.py` builds and runs the pilot game on Windows (clang + VS Build
+  Tools, D17; also WSL); `--window` gives the SDL2 window with the wgpu GPU
+  renderer (D20). VU1 programs compiled (D21), x86-64-v2 builds (D22): race
+  intro at 60 fps in the window. Owner play test: title, menus, racing work.
+  Tests (`recomp/tests/`, D15, D18, D19): assembler for every mnemonic the
+  pilot game uses, reference model with PS2 float rules, 216 vectors (L0, L1
+  216/216 on the recompiler), random cases (L2 500/500), jump tables (L3),
+  PCSX2 oracle (L4: 29 of 34 unverified vectors confirmed, 5 float cases
+  stay on our model).
+- Repo policy (D24): nothing game-specific in git; recipes, notes and
+  game-specific code in `local/games/<serial>/`.
+- Phases 6–9 re-planned (D23): build on the vendored runtime and GS renderer;
+  6 port hooks (override table, recipe patches, saves), 7 look better
+  (widescreen, resolution, texture packs), 8 selective native draw paths,
+  9 mods and assets. Plan: [docs/native-port-plan.md](docs/native-port-plan.md).
+- Next up: see [docs/tasks.md](docs/tasks.md). The owner runs tasks with `/next-task`.

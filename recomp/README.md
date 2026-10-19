@@ -1,0 +1,116 @@
+# recomp
+
+EE (R5900) → C++ static recompiler (Phase 5). The recompiler and runtime are
+[ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp) (MIT), vendored
+in `ps2-web-recomp/` (D14, D16). Our own code: `port.py` and the instruction
+tests in `tests/`.
+
+## port.py (WSL or Windows)
+
+```bash
+python3 recomp/port.py <SERIAL> --iso "/mnt/c/path/to/game.iso"   # first run links the ISO
+python3 recomp/port.py <SERIAL> [--no-explore] [--no-menu]
+```
+
+Needs clang, CMake and Ninja in WSL (SDL2 optional, for the window).
+
+Windows (T22): same command with Windows Python 3.12 and a Windows ISO path.
+Needs LLVM (clang++), CMake, Ninja and the Visual Studio 2022 Build Tools
+(MSVC STL + Windows SDK; clang finds them itself, no developer prompt).
+The LLVM installer does not add itself to PATH, so per shell:
+
+```powershell
+$env:Path = "C:\Program Files\LLVM\bin;$env:Path"
+python recomp/port.py <SERIAL> --iso "C:\path\to\game.iso"
+```
+
+On Windows the ISO is hard-linked (symlinks need admin) and the build dirs
+are `build-tools-win/`, `build-native-win/`; `generated/` and the run
+outputs are shared with WSL. `--window` (T23) also builds
+`build-window-win/ps2run.exe` with the SDL2 window and the wgpu GPU
+renderer, from SDL2 2.32.10 and wgpu-native v29.0.1.1 in `tools/bin/`
+(D20, see [environment.md](../docs/environment.md)), and copies `SDL2.dll`
+next to it. Run it with `--window` for the game window (keys: arrows, Z
+cross, X circle, A square, S triangle, Enter start, F11 fullscreen; pads via
+SDL). Without `--window` it runs headless but still draws on the GPU;
+`PS2_GS=cpu` selects the CPU rasterizer. Never
+runs upstream's `setup.sh`/`port.sh` (they download wgpu-native and emsdk).
+Steps: extract the boot ELF from the ISO, build `eerecomp`, translate,
+build `ps2run` (headless, CPU rasterizer), exploring runs that add missed
+entry points and translate again (upstream `port.sh`'s loop), the
+scripted menu run, then `vurecomp` on the VU1 microprograms the runs
+recorded (`PS2_VU_RECORD`, into `vu1/`) and a rebuild of the runners with
+them (D21, T25). Programs not recorded run on the VU1 interpreter;
+`PS2_VU_INTERPRET=1` forces the interpreter for all (for comparisons). Reads the `recomp` block of `local/games/<SERIAL>/game.json`:
+
+| Key | Meaning |
+|---|---|
+| `entries` | Extra entry points, the runtime's miss format (hex without `0x`; `module:offset` for modules) |
+| `explore_frames` | Frames per exploring run (presses: start at 300, cross every 300) |
+| `menu` | Optional scripted run from boot: `frames`, `frame_every`, `presses` (`frame:button[+button][:hold]`) |
+
+Output (game-derived, never commit): `work/<SERIAL>/recomp/`: `generated/`
+(C++, incl. `vu1_*.cpp`), `vu1/` (recorded VU1 program images),
+`build-tools/`, `build-native/`, `explore.log`/`menu.log`,
+`*-frames/` (PPM), memory cards. New entry points found by exploring are
+printed; add them to `entries`.
+
+## Vendored upstream
+
+`ps2-web-recomp/` is upstream commit `c628ae8` (2026-10-16), tracked files
+byte for byte (`.gitattributes` turns off line-ending conversion there),
+except:
+
+| Change | Why |
+|---|---|
+| `docs/media/demo.mp4`, `demo.webp` left out | Gran Turismo 4 footage: copyrighted game art (AGENTS rule 1). Upstream `README.md` still links them. |
+| `runtime/src/iop/sif.cpp` line 143, `bind()`: `now() + kEeClock * 4` → `now()` | A bind to a server that is not registered was held 4 s of guest time before the 0 reply. The pilot game binds a debug-print server that no module registers on every print, which stalled its boot. Now the 0 reply goes out on the next SIF pump; a server that registers in the same instant still gets the bind. |
+| `CMakeLists.txt` (wgpu block), `runtime/include/ps2/system.hpp` + `runtime/src/gs/gpu/gpu.hpp` (`Windows` surface kind), `runtime/src/gs/gpu/gpu.cpp` (`attach_surface`), `host/window.cpp` | Windows window + GPU build (T23): CMake links `wgpu_native.lib` and its Windows system libs (`d3dcompiler ws2_32 userenv bcrypt ntdll opengl32 propsys runtimeobject`) instead of `libwgpu_native.a dl pthread m`; the WebGPU surface is created from the SDL window's `HWND`; `window.cpp` reads CPU time and RAM with `GetProcessTimes`/`GetProcessMemoryInfo` instead of `getrusage`/`/proc/self/statm` (all under `_WIN32`, Linux code unchanged). |
+| `runtime/src/gs/queue.cpp` (`Ring::post`, `Ring::pop`) | Lost wakeup (T23): a producer waiting for ring space could sleep forever. `pop` cleared `producer_waiting_` with `exchange(0)`, so when that pop's `freed_` increment came before the producer's `seen` load, the producer slept on a value no later pop would notify. The producer now loads `seen` after setting `producer_waiting_` and clears the flag itself; `pop` notifies while the flag is set. The pilot game's threaded window run hung in 6 of 7 tries within ~15 s (the 7th had a debug print in the wait path) (emulation thread in `post` from `vif::transfer`, VU ring empty); 0 of 3 after. Not Windows-specific (same logic with the Linux futex). |
+| `recomp/codegen.cpp` (`Break`), `runtime/src/dispatch.cpp` (`breakpoint()`), `runtime/src/system.cpp` (`run()` exit code) | `break` halts (T24, D19): generated code returns after `breakpoint()`, which logs `[ee] break at <pc> code <code> (ra ...)`, halts with reason `break <code> at <pc>` and unwinds. `ps2run` then shuts down normally and exits with code 3. Upstream logged and continued; PCSX2 never returns from `break` (T21). |
+| `runtime/src/gs/gpu/gpu.cpp`, `runtime/src/gs/gpu/gs.wgsl` (`decode`) | Render thread speed (T26), all output-preserving: (1) a CLUT load identical to the last one (same CBP, CPSM, CSM, CSA, size, TEXCLUT) is skipped while no upload, local copy, state load or drawn frame/Z page has touched its source; (2) the batch-vs-upload/CLUT conflict test checks the 8 KB pages under the batch rectangle instead of one linear range (the pilot game's CLUTs sit in the frame buffer's page span next to the drawn area: hundreds of false conflicts per frame, each flushing the batch); (3) pending uploads and CLUT loads go into alternating upload/CLUT waves by dependency (write-after-write, read-after-write, write-after-read) instead of one dispatch per run of same-kind ops; (4) a batch's texture decodes are one dispatch (the shader looks its record up by prefix sum, like `upload`); (5) `std::min({a, b, c})` → nested `std::min` in `draw` (MSVC's vectorised `min_element` call for 3 floats). Pilot game race intro: GPU commands per frame ~7,000 → ~530, frames byte-identical. |
+| `CMakeLists.txt` (`-march=x86-64-v2`) | VU thread speed (T28, D22): x86-64 builds outside Emscripten use SSE4.1 (`pminsd`, blends) for the VU vector code; no AVX/FMA, so float results do not change. |
+| `recomp/vurecomp.cpp`, `runtime/include/ps2/vu_ops.hpp` | VU thread speed (T28), output-preserving codegen: (1) VF registers and ACC live in a local copy (`Reg128 vf[32]`, written back before `vu::interpret`, `efu` and every exit), so clang keeps them in registers (through `r` it could not: every store to VU memory, a byte pointer, may alias `r`); (2) `flags` computes MAC/status with vector compares from the result value instead of a per-lane loop; (3) partial-lane LQ/SQ/MOVE/MR32/MFIR/MFP/RNEXT/RGET and OPMULA/OPMSUB write the register or qword with one 16-byte blend instead of 4-byte stores; (4) MAX/MIN of a register with itself (a move in the upper pipe) is a plain copy. |
+| `runtime/src/iop/io.cpp` (ioman `AddDrv`, `DelDrv`) | Post-intro stall (T27): `AddDrv` was a stub returning -1, so the game's USB driver module failed to load ("Cannot add driver to IO manager") and never added its SIF command handler. The EE side then sent that command 60 times with a 0.5 s timeout each: ~1,800 frames of black screen (or the skipped movie's last frame) before the title. `AddDrv` now calls the driver's `init` op and returns 0 when it succeeds (as the IOP's ioman does); `DelDrv` returns 0. PCSX2 with the BIOS: the module stays resident (`ret 2`). |
+| `runtime/src/vif.cpp`, `runtime/src/vu_micro.cpp` (`xgkick`) | VU thread speed (T28): VIF NOP (about half of all VIF commands, ~100,000 per pilot game race-intro frame) skips the command dispatch; the general unpack path writes each qword with one 16-byte store and wraps with a mask; XGKICK sends a packet that does not wrap around VU memory straight from VU memory instead of copying it to a stack buffer first. |
+| `runtime/src/gs/queue.hpp`, `runtime/src/gs/queue.cpp` | VU thread speed (T28): `role()` is inline (thread-local read, asked once per VIF command); ring positions wrap with a mask (capacities are powers of two) instead of a 64-bit division; producer and consumer cache the other side's position and only reload it when they run out; each side's atomics sit on their own cache line; `post` does one locked operation instead of two (`consumer_waiting_` is read before it is exchanged). |
+
+The headless Windows build (T22) needs no changes to upstream: the headless path
+leaves out `host/window.cpp` (SDL2), `host/profile.cpp` (Linux only) and the
+wgpu link list. The futex in `gs/queue.cpp` is Linux-only; elsewhere it
+already falls back to `std::atomic` wait/notify and a 1 ms sleep, and
+headless runs one thread anyway (the render/VU threads start only in
+`window.cpp`). `vurecomp` output (T25, T28 codegen) builds with clang 23
+(Windows) and clang 18 (WSL).
+The window build (T23) needs the Windows patch above; its render and VU
+threads hit the ring deadlock fixed by the `queue.cpp` patch.
+
+Licenses: [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) (MIT;
+Play! BSD-2-Clause for the IPU tables).
+
+## tests
+
+Plan and vector format: [../docs/recomp-tests.md](../docs/recomp-tests.md) (D15).
+
+```bash
+python -m unittest discover -s recomp/tests   # assembler + every vector on the model
+python recomp/tests/ref.py                    # vectors on the reference model, with a summary
+python recomp/tests/asm.py <SERIAL>           # local check: re-encode the analysis export
+python3 recomp/tests/harness.py [--random N] [--seed S]   # WSL: vectors + random cases on the recompiler (L1, L2)
+python3 recomp/tests/harness.py --tables <SERIAL>         # WSL, local: jump tables vs the port's entry tables (L3)
+python recomp/tests/oracle.py [--mode rec interp ...]     # Windows: vectors on PCSX2 + the owner's BIOS (L4, D18)
+```
+
+| File | Content |
+|---|---|
+| `tests/asm.py` | Assembler for every mnemonic the pilot game uses (inverse of `analysis/census.py`'s tables) |
+| `tests/ref.py` | Python reference model: integer, control flow, 64/128-bit memory, mult/div, MMI, FPU, VU0 macro ops (PS2 float rules) |
+| `tests/vectors/*.json` | Test vectors, written by hand (`base`, `branch`, `mem`, `mmi`, `system`, `fpu`, `vu0`) |
+| `tests/harness.py` | ELF writer, runs `eerecomp` per case, builds and runs the harness, compares with `ref.py` |
+| `tests/oracle.py` | One test ELF for all eligible vectors, run on PCSX2 (own data folder in `work/`), end states parsed from the EE console log |
+| `tests/harness/` | C++ harness (`main.cpp`: load state, `dispatch`, print state as JSON) and its CMake project (links upstream `ps2runtime`) |
+
+Harness output (fixture C++, build): `work/recomp-tests/`.
+
+Stdlib only. Code runs at 0x00100000; vectors put data elsewhere (we use
+0x00200000).

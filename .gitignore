@@ -1,0 +1,50 @@
+# --- Never commit game or console data -------------------------------------
+# Disc images, BIOS dumps, extracted executables and modules
+*.iso
+*.bin
+*.cue
+*.img
+*.mdf
+*.chd
+*.cso
+*.zso
+*.gz
+*.elf
+*.irx
+SLUS_*
+SLES_*
+SCUS_*
+SCES_*
+SLPM_*
+SLPS_*
+SCPS_*
+bios/
+*.rom0
+*.rom1
+*.nvm
+*.mec
+
+# Texture dumps, upscaled outputs and previews (derived from game art)
+dumps/
+replacements/
+previews/
+_stage/
+work/
+output/
+
+# Local tool installs, machine-specific notes (paths, hardware, ISO locations)
+# and everything game-specific (local/games/<serial>/: recipe, notes, tools; D24)
+tools/bin/
+local/
+
+# --- Python ----------------------------------------------------------------
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# --- Editors / OS ----------------------------------------------------------
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

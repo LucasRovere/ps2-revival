@@ -1,0 +1,8 @@
+[
+  {"name": "break ends the case", "asm": ["addiu v0, zero, 1", "break", "addiu v0, zero, 2"],
+   "expect": {"v0": "0x1", "pc_trace": ["0x00100000", "0x00100004"]}, "source": "spec"},
+  {"name": "sync, cache and pref change no register or memory",
+   "asm": ["sync", "sync 0x10", "cache 0x10, 0(a0)", "pref 0, 0xc0(a0)"],
+   "init": {"a0": "0x200000", "mem": {"0x00200000": "01020304"}},
+   "expect": {"pc_trace": ["0x00100000", "0x00100004", "0x00100008", "0x0010000c"]}, "source": "spec"}
+]

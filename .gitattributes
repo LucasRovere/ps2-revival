@@ -1,0 +1,3 @@
+* text=auto eol=lf
+*.png binary
+recomp/ps2-web-recomp/** -text
