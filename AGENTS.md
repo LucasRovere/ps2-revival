@@ -127,6 +127,10 @@ in the vendored code under `recomp/` (D23); no separate `runtime/` or
   loads); `recomp/play.py <serial>` starts the window port with settings from
   `local/games/<serial>/play.json` (card, scale, fullscreen). Phase 6 left:
   T29/T30 (parked by the owner).
+- Widescreen and resolution (Phase 7, T32): `play.json` `aspect` (`"16:9"`
+  → `PS2_ASPECT`, presentation only; frame dumps unchanged); `PS2_SCALE` 2/3
+  sharper with small race-intro fps dips, default 1, clamp 3. Owner check
+  of 16:9 in the window pending.
 - Repo policy (D24): nothing game-specific in git; recipes, notes and
   game-specific code in `local/games/<serial>/`.
 - Phases 6–9 re-planned (D23): build on the vendored runtime and GS renderer;

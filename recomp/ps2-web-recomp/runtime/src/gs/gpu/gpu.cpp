@@ -54,6 +54,7 @@ WGPUBuffer g_blit_params = nullptr;
 std::uint32_t g_field = 0, g_last_width = 0, g_last_height = 0;
 bool g_have_previous = false;
 std::uint32_t g_scale = 1, g_copy_words = 1u << 20, g_field_words = 1u << 19;
+float g_aspect_w = 4.0f, g_aspect_h = 3.0f;
 
 std::uint32_t field_base(std::uint32_t field) { return g_copy_words + (field & 1u) * g_field_words; }
 
@@ -982,7 +983,7 @@ void submit(WGPUTextureView present_view = nullptr) {
         rd.colorAttachments = &color;
         WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rd);
         const float w = static_cast<float>(g_surface_width), h = static_cast<float>(g_surface_height);
-        const float vw = std::min(w, h * 4.0f / 3.0f), vh = vw * 3.0f / 4.0f;
+        const float vw = std::min(w, h * g_aspect_w / g_aspect_h), vh = vw * g_aspect_h / g_aspect_w;
         wgpuRenderPassEncoderSetViewport(rp, (w - vw) * 0.5f, (h - vh) * 0.5f, vw, vh, 0.0f, 1.0f);
         wgpuRenderPassEncoderSetPipeline(rp, g_blit);
         wgpuRenderPassEncoderSetBindGroup(rp, 0, g_blit_group, 0, nullptr);
@@ -1250,6 +1251,11 @@ bool init(Mode m) {
     }
     if (const char *scale = std::getenv("PS2_SCALE")) g_scale = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::atoi(scale)), 1u, 3u);
     std::fprintf(stderr, "[gpu] scale %u\n", g_scale);
+    if (const char *aspect = std::getenv("PS2_ASPECT"); aspect && std::strcmp(aspect, "16:9") == 0) {
+        g_aspect_w = 16.0f;
+        g_aspect_h = 9.0f;
+    }
+    std::fprintf(stderr, "[gpu] aspect %.0f:%.0f\n", g_aspect_w, g_aspect_h);
     g_copy_words = (1u << 20) * g_scale * g_scale;
     g_tiles_per_row = (2048 * static_cast<int>(g_scale) + 15) / 16;
     g_tile_count.assign(static_cast<std::size_t>(g_tiles_per_row) * g_tiles_per_row, 0);
@@ -1833,7 +1839,7 @@ bool present(const DisplaySource &src) {
     const std::uint32_t param = push_params({src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, src.halved ? 1u : 0u, current});
     g_commands.push_back({kDisplay, (src.width * g_scale + 7) / 8, (src.height * g_scale + 7) / 8, param});
     const float sw = static_cast<float>(g_surface_width), sh = static_cast<float>(g_surface_height);
-    const float vw = std::min(sw, sh * 4.0f / 3.0f), vh = vw * 3.0f / 4.0f;
+    const float vw = std::min(sw, sh * g_aspect_w / g_aspect_h), vh = vw * g_aspect_h / g_aspect_w;
     const std::uint32_t blit[8] = {src.width * g_scale, src.height * g_scale, current, previous, blend ? 1u : 0u, static_cast<std::uint32_t>(vw), static_cast<std::uint32_t>(vh), 0};
     wgpuQueueWriteBuffer(g_queue, g_blit_params, 0, blit, sizeof blit);
     ++g_field;

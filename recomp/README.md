@@ -104,8 +104,41 @@ git-ignored), created with defaults on first use:
 | `memcard` | `local/games/<SERIAL>/memcard.ps2` | Slot 1 card file (relative to the repo or absolute) |
 | `scale` | `1` | GPU internal resolution 1-3 (`PS2_SCALE`) |
 | `fullscreen` | `false` | Start fullscreen (F11 toggles) |
+| `aspect` | `"4:3"` | `"16:9"` presents the image at 16:9 (`PS2_ASPECT`), for a game running its own widescreen mode (e.g. through recipe patches) |
 
-The log shows `settings: ...`, `[gpu] scale N` and `[mc] card in slot 1: <file>`.
+Keys missing from an older `play.json` take the defaults. The log shows
+`settings: ...`, `[gpu] scale N`, `[gpu] aspect W:H` and
+`[mc] card in slot 1: <file>`.
+
+### Widescreen and resolution (T32)
+
+`PS2_ASPECT=16:9` (any other value: 4:3) sets the window's presented
+aspect: the WebGPU blit viewport (and the SDL fallback's logical size) is
+the largest 16:9 rectangle in the window instead of 4:3, and a new window
+opens at 1280×720 instead of 960×720. Only the presentation changes: the
+game still renders its own buffer (e.g. 640×448), so frame dumps
+(`--frames-dir`), cycle counts and emulation are the same with either
+setting. Use 16:9 only when the game draws a 16:9 image (its own
+widescreen mode); its 2D elements stay as the game draws them in that
+mode.
+
+Check (pilot game, patched ELF): presented images read back from the
+window's surface (a local, uncommitted debug build) are 960×720 with the
+4:3 image and 1280×720 with the 16:9 image filling the window; the 3D view
+is unsqueezed at 16:9. Menu run from boot: frames 107 of 107
+byte-identical and the same cycle count with `PS2_ASPECT` unset or 16:9.
+
+`PS2_SCALE` (1-3, `scale` in `play.json`) multiplies the internal
+resolution. Pilot game, race intro: headless 30.2-31.0 ms/frame at scale 1,
+32.6-33.1 at 2, 33.4-33.8 at 3 (render-thread work; GPU load stays under
+~13%). In the window (paced, 3 runs each, noisy) the race intro holds
+~56-60 fps at scale 1 and dips to ~50-55 fps at 2 and 3. Frames at scale
+2 and 3 are sharper (clean polygon edges, sharper text and HUD), with no
+new artefacts seen (bloom/glare, 2D overlays, menus, loading screens
+lined up). Recommendation: scale 2 or 3 for looks, with small fps dips in
+heavy scenes until the render thread gets faster (T29); default stays 1.
+Scale 3 already gives ~1340 lines, about a 1440p display's height, so the
+clamp stays at 3.
 
 ### Patches and overrides (T31)
 
@@ -114,7 +147,8 @@ The log shows `settings: ...`, `[gpu] scale N` and `[mc] card in slot 1: <file>`
 in `patched/`; every `old` word is checked first (`patches/build.py`
 `check_writes`), and a mismatch stops the run. That copy is translated and
 run. `--no-patches` translates and runs the disc's ELF (for comparisons).
-`gsaspectratio` is PCSX2-only; the port's 4:3 output is T32.
+`gsaspectratio` is PCSX2-only; in the port, `aspect` in `play.json` (T32,
+above) presents a 16:9 image.
 
 **Overrides:** `eerecomp --overrides <file>` (one hex address per line, the
 `--entries` format) puts a hook at each listed function entry label in the
@@ -170,6 +204,7 @@ except:
 | `runtime/src/gs/queue.hpp`, `runtime/src/gs/queue.cpp` | VU thread speed (T28): `role()` is inline (thread-local read, asked once per VIF command); ring positions wrap with a mask (capacities are powers of two) instead of a 64-bit division; producer and consumer cache the other side's position and only reload it when they run out; each side's atomics sit on their own cache line; `post` does one locked operation instead of two (`consumer_waiting_` is read before it is exchanged). |
 | `recomp/main.cpp`, `recomp/codegen.hpp`, `recomp/codegen.cpp`, `runtime/include/ps2/generated.hpp`, `runtime/src/dispatch.cpp` | Function overrides (T31, D5): `eerecomp --overrides <file>` (each address must be a function entry, else an error); at each listed entry of the main program the unit emits `if (run_override(c, k)) { c.pc = ra; return; }` (k = place in the sorted list); `table.cpp` gets `kOverrides[]` and `register_generated_code` calls `register_overrides()` (written by `port.py`) and `check_overrides`. Runtime: `register_override(addr, fn)`, `check_overrides` (exits on a listed address without an override or an extra registration), `run_override` (counts calls; counts printed at exit). Without `--overrides` the output is byte-identical (pilot game: all 238 units and `table.cpp`). |
 | `runtime/src/iop/sio2.cpp` (`flush_cards`), `runtime/src/gs/gpu/gpu.cpp` (scale) | Log lines (T34): `[mc] card saved: <file>` after each card file write, `[gpu] scale N` at GPU start, so save runs and the launcher's settings show in the log. |
+| `runtime/src/gs/gpu/gpu.cpp` (blit viewport in `submit`, `present`), `host/window.cpp` (window size, SDL logical size) | 16:9 presentation (T32): `PS2_ASPECT=16:9` replaces the fixed 4:3 of the blit viewport and the SDL fallback with 16:9 and opens a 1280×720 window; `[gpu] aspect W:H` at GPU start. Unset, the arithmetic is the same as upstream's. |
 
 The headless Windows build (T22) needs no changes to upstream: the headless path
 leaves out `host/window.cpp` (SDL2), `host/profile.cpp` (Linux only) and the

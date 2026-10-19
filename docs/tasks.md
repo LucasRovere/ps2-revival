@@ -6,58 +6,81 @@ fits in one session.
 
 ## Next task
 
-### T32: recomp: widescreen and resolution in the window
+### T33: recomp: texture packs in the GPU renderer
 
-**Goal:** Phase 7 start (D23): (1) present the game's 16:9 output at 16:9
-in the window, as a launcher setting; (2) check higher internal resolution
-(`PS2_SCALE` 2 and 3) on the pilot game.
+**Goal:** Phase 7 (D23): the window port shows replacement textures (PNGs,
+e.g. the `textures/` upscales) in place of the game's own, found by our
+own content hash, as a launcher setting.
 
 **Context:**
-- With T31's recipe patches on (default build), the port's frames show the
-  pilot game's 16:9 camera, horizontally squeezed into 4:3 (local notes,
-  "Recipe patches and overrides in the port"). A save state made without the
-  patches keeps the game's 4:3 flag in RAM, so 16:9 checks need a run from
-  boot (or a state made with the patches; T34's menu states in `work/t34/`
-  are patched).
-- 4:3 is fixed in two places of the vendored `runtime/src/gs/gpu/gpu.cpp`:
-  the blit viewport in the present pass (`vw = min(w, h * 4/3)`) and
-  `present` (the `blit` params `vw`, `vh`). Check `host/window.cpp`'s SDL
-  fallback path too. Frame dumps (`dump_frame`, `gs::display`) are the
-  game's own buffer size, not the window's.
-- Launcher (T34): `recomp/play.py <SERIAL>` reads
-  `local/games/<serial>/play.json` (`memcard`, `scale`, `fullscreen`) and
-  passes `PS2_SCALE`; the log shows `[gpu] scale N`. `PS2_SCALE` is clamped
-  to 1-3 in `gpu.cpp`.
-- Speed: race intro ~60 fps paced (~71 unpaced) in the window at scale 1
-  (T28); the VU and render threads are near 100% there.
+- The GPU renderer (vendored `runtime/src/gs/gpu/gpu.cpp`, `gs.wgsl`) has
+  no texture objects: the raster shader samples GS memory (`g_vram`, kept
+  on the GPU in GS layout, scaled by `PS2_SCALE`) through the draw's TEX0
+  fields (`make_setup`: TBP0 `w[12]`, TBW `w[13]`, PSM `w[14]`, TW/TH
+  `w[15]`, CPSM/CSA `w[16]`/`w[17]`). CLUTs go into `g_clut` slots
+  (`load_clut`). Batches with more than `kDecodePrims` prims pre-decode
+  their textures into `g_decoded` (`plan_decodes`, `decode` pass; setup
+  word 24 points at the decoded copy). That decode cache is the natural
+  place to swap in replacement texels: a setup can point at a replacement
+  instead of a decoded copy.
+- The texel data lives on the GPU, so a content hash needs either a CPU
+  copy of what the game uploads (GIF image transfers pass through
+  `gs.cpp` before `gpu::upload`) or a GPU-side hash. *Unverified:* that a
+  texture's hash is stable across uploads (same bytes each time) and that
+  uploads map 1:1 to draws' TEX0 (partial uploads, textures packed into
+  one upload, render-to-texture). The pilot game uploads some paletted
+  textures as PSMCT32 and draws them as PSMT8/PSMT4 (local notes T7), so
+  the key likely belongs at draw/decode time, not per upload.
+- `textures/` (Phase 1) works from PCSX2 dumps named by PCSX2's own hash
+  (`docs/textures.md`); PCSX2's hash is not ours. So the pack needs a map
+  from our hash to PNG: e.g. a dump mode in the port (`PS2_TEX_DUMP=<dir>`:
+  write each new texture as PNG named by our hash), then match those to
+  PCSX2 dumps by pixels (the pilot game's PCSX2 dumps decode
+  pixel-identical to its local decoder, local notes T7).
+- Alpha: PS2 alpha 0-128 (128 = opaque) in dumps and replacements
+  (`docs/textures.md`). Replacements may be 2× or 4× larger (`textures.scale`);
+  sampling must map the draw's texel coordinates to the larger image.
+- T32: `play.py` passes settings as env vars (`PS2_SCALE`, `PS2_ASPECT`);
+  frame dumps (`--frames-dir`) are the internal buffer at the scaled size.
+  Test runs: `work/t32/` scripts (`shots.ps1`: short run from a patched
+  race-intro state; `run.ps1`: menu run from boot), T28
+  window fps runs (`work/t28/threads_window.ps1`). Race intro at scale 1
+  holds ~56-60 fps in the window; the render thread is near its limit
+  (T29), so the replacement path must not add per-draw CPU work.
 
 **Scope:**
-0. Owner approvals: none expected.
-1. Aspect: a runtime option (env var or `ps2run` flag) for 16:9
-   presentation; `play.json` key `aspect` (`"4:3"` default, `"16:9"`),
-   added to the defaults in `play.py`. Vendored patch, README list.
-2. Window check (short runs, no desktop screenshots): the window opens with
-   the setting; whatever the runtime can dump to show the presented image
-   (or a short window run with the frame log) proves the 16:9 viewport.
-3. Scale: race intro fps in the window at `PS2_SCALE` 1, 2, 3
-   (`work/t28/threads_window.ps1` pattern), frames at scale 2/3 looked at
-   (sharper, no new artefacts: e.g. half-pixel offsets, post-effect
-   misalignment); whether more than 3 is worth raising the clamp.
-4. Owner check in the window: menus, HUD and a race in 16:9 (no
-   stretching, HUD not cut, no culling at the screen edges; the D12 owner
-   check, now in the port).
-5. Docs: README (setting, scale results), local notes, roadmap, AGENTS.
+0. Owner approvals: none expected (no downloads; PCSX2 dumps are only read).
+1. Hash: define our texture key (PSM, size, texel bytes, CLUT for paletted
+   formats) and where it is computed; measure stability on real runs
+   (same texture → same hash across frames and runs; count distinct
+   hashes in the race intro).
+2. Dump mode: the port writes each new texture as PNG named by its hash
+   (game-derived output, `work/` only).
+3. Replacement: a pack folder (`local/games/<serial>/textures/` or a
+   `play.json` key `textures`) of `<hash>.png`; matching draws sample the
+   replacement (at its own resolution) instead of GS memory. Vendored
+   patches minimal, README patch list.
+4. Map PCSX2 dumps / `textures/` replacements to our hashes offline (a
+   small tool in `textures/`, generic) so the existing upscales can be
+   used.
+5. Check: a race-intro frame with replaced textures (looked at; e.g. a
+   test pack with solid-colour PNGs first, then real upscales); hit/miss
+   counts in the log; fps cost in the window; with no pack, frames
+   byte-identical and the same cycle count.
+6. Docs: README (pack format, dump mode, results), `docs/textures.md`,
+   local notes, roadmap, AGENTS.
 
 **Success criteria:**
-- `aspect: "16:9"` in `play.json` shows the 16:9 image unsqueezed in the
-  window; `"4:3"` is unchanged (frames byte-identical, menu run reaches the
-  race intro with the same cycle count).
-- Scale 2 and 3 measured (fps) and looked at; recommendation written down.
-- Owner check in the window done or listed as pending.
+- With a pack, replaced textures show in the window and in frame dumps;
+  hit/miss counts logged.
+- Without a pack, frames byte-identical and the menu run reaches the race
+  intro with the same cycle count as the previous build.
+- Hash stability measured and written down (*Unverified* items marked).
+- fps cost measured.
 - No game data and nothing game-specific in git.
 
-**Out of scope:** texture packs (T33), HUD fixes beyond what the game's own
-16:9 mode does, the audio clock (T30), speed work (T29).
+**Out of scope:** making new upscales (Phase 1 does that), model or mesh
+replacement (Phase 8/9), the disc-file mod folder (T35), speed work (T29).
 
 ## Backlog
 
@@ -66,29 +89,22 @@ with the same level of detail as above. Plan:
 [native-port-plan.md](native-port-plan.md) (D23). Game-specific details of
 each item: `local/games/<serial>/notes.md`, section "Task details".
 
-1. **T33: recomp: texture packs in the GPU renderer (Phase 7).** Replace GS
-   textures with PNGs by our own content hash (decoded texels + CLUT), fed
-   by the `textures/` replacements. Find where `gpu.cpp` decodes textures,
-   map dump PNGs to hashes offline, upload replacements at the scaled size.
-   Check: replaced textures in a race-intro frame, hit/miss counts, fps
-   cost. *Unverified:* that the hash is stable across uploads.
-
-2. **T35: mods: disc-file mod folder (Phase 9).** The runtime's disc layer
+1. **T35: mods: disc-file mod folder (Phase 9).** The runtime's disc layer
    (`disc.cpp`/`cdvdfsv.cpp`) serves files from a mods folder before the
    ISO, by disc path. Games that pack files in engine archives need a local
    archive writer (game-specific, in `local/games/<serial>/tools/`). Check
    with a changed text table and one texture, seen in game.
-3. **T14: assets: pilot game mesh format (Phase 9, feeds Phase 8).** Owner:
+2. **T14: assets: pilot game mesh format (Phase 9, feeds Phase 8).** Owner:
    "this can be done later". Decode the pilot game's binary model meshes and
    export one to glTF, checked by a render. Engine-specific: the tool lives
    in `local/games/<serial>/tools/`, not in the repo (D24).
-4. **T36: analysis: pilot game renderer draw lists (Phase 8 start).** From
+3. **T36: analysis: pilot game renderer draw lists (Phase 8 start).** From
    the Ghidra export and the T14 mesh format: how the engine turns meshes,
    materials, matrices and lights into VIF/GS packets; which functions to
    override to draw a model natively next to the GS output. Output: local
    notes and a go/no-go for a native draw path with a concrete goal (model
    replacement, LOD, lighting) the GS path can't meet.
-5. **T29: recomp: speed headroom for racing.** After T28 the race intro is
+4. **T29: recomp: speed headroom for racing.** After T28 the race intro is
    60 fps paced but only ~71 fps unpaced, with the VU and render threads both
    near 100% there (at 60 fps: VU ~83%, render ~80%). Record VU1 programs
    during real gameplay (`PS2_VU_RECORD` / `port.py`) and check how many
@@ -100,7 +116,7 @@ each item: `local/games/<serial>/notes.md`, section "Task details".
    loop, `memcpy` into the rings); `x86-64-v3` builds (AVX2, no FMA, needs
    the owner's OK to drop CPUs without AVX2, D22). Same save-state runs and
    byte-identical frame checks as T25-T28.
-6. **T30: recomp: decouple IOP/SPU2 from the EE clock.** Owner request: audio
+5. **T30: recomp: decouple IOP/SPU2 from the EE clock.** Owner request: audio
    must not depend on the frame rate. Today the EE, IOP and SPU2 share one
    emulated clock, so when the EE falls behind real time the SPU2 makes
    fewer samples and the audio underruns. On a real PS2 the IOP/SPU2 run on
@@ -149,4 +165,5 @@ Results with game-specific numbers: `local/games/<serial>/notes.md`.
 | Plan: re-plan Phases 6-9 | 2026-10-18 | Phase 5 done; D23: build on the vendored runtime and GS renderer; new Phases 6 (hooks, runtime gaps), 7 (look better), 8 (selective native draw paths), 9 (mods, assets); T31-T36 written, T14/T29/T30 reordered | `d5b1db3` |
 | Policy: nothing game-specific in the repo | 2026-10-18 | D24 (owner): per-game recipes, notes and engine-specific tools moved to `local/games/<serial>/`; tools read `local/games/<serial>/game.json`; docs game-neutral | `3eb8a1a` |
 | T31: recomp: function overrides and recipe patches in the port | 2026-10-19 | `port.py` applies the `game.json` patches to the translated ELF (`--no-patches`); `eerecomp --overrides` + runtime `register_override` (vendored patch); pilot game: 16:9 camera in the port, identity override and screen-type override byte-identical, harness override case passes | `1688122` |
-| T34: recomp: saves and launcher | 2026-10-19 | `port.py --saves`: the pilot game formats the card, saves a new profile, a new boot loads it (frames looked at); the card has PCSX2's `.ps2` layout (superblock byte-identical, ECC right) and the port loads a PCSX2-made save; `recomp/play.py` launches the window port with `local/games/<serial>/play.json` (card, scale, fullscreen); two vendored log lines | this commit |
+| T34: recomp: saves and launcher | 2026-10-19 | `port.py --saves`: the pilot game formats the card, saves a new profile, a new boot loads it (frames looked at); the card has PCSX2's `.ps2` layout (superblock byte-identical, ECC right) and the port loads a PCSX2-made save; `recomp/play.py` launches the window port with `local/games/<serial>/play.json` (card, scale, fullscreen); two vendored log lines | `7081f3c` |
+| T32: recomp: widescreen and resolution in the window | 2026-10-19 | `play.json` `aspect: "16:9"` (`PS2_ASPECT`, vendored patch: blit viewport, SDL fallback, 1280×720 window) presents the game's own 16:9 image unsqueezed (presented surface read back and looked at); 4:3 default frames byte-identical, same cycle count; `PS2_SCALE` 2/3 sharper, no new artefacts, +2-3 ms/frame headless, small race-intro fps dips in the window; default 1, clamp 3; owner check pending | this commit |
