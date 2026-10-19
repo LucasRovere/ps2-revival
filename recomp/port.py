@@ -7,12 +7,18 @@ then plays the scripted menu run. The runs record the VU1 microprograms they
 meet; `vurecomp` turns them into C++ and the runner is rebuilt with them.
 Everything goes to work/<serial>/recomp/.
 
+The game.json `patches` words are applied to a copy of the ELF (original
+words checked, as in patches/build.py), which is translated and run;
+--no-patches uses the disc's ELF. `recomp.overrides` maps guest function
+addresses to our C++ functions (recomp/overrides/<name>.cpp or
+local/games/<serial>/overrides/<name>.cpp) that run in their place.
+
 The ISO is linked into work/<serial>/recomp/disc.iso on the first run, so
 --iso is only needed once.
 
 Usage (WSL; on Windows the same with Windows Python and a Windows ISO path):
   python3 recomp/port.py <SERIAL> --iso "/mnt/c/.../game.iso"
-  python3 recomp/port.py <SERIAL> [--no-explore] [--no-menu]
+  python3 recomp/port.py <SERIAL> [--no-explore] [--no-menu] [--no-patches]
 """
 
 import argparse
@@ -28,6 +34,7 @@ REPO = Path(__file__).resolve().parent.parent
 GAMES_DIR = REPO / "local" / "games"
 WORK_DIR = REPO / "work"
 UPSTREAM = REPO / "recomp" / "ps2-web-recomp"
+OVERRIDES_DIR = REPO / "recomp" / "overrides"
 EXPLORE_ROUNDS = 8
 # Separate build dirs so the WSL and Windows builds don't clobber each other.
 BUILD_SUFFIX = "-win" if os.name == "nt" else ""
@@ -36,6 +43,8 @@ SDL2_DIR = REPO / "tools" / "bin" / "SDL2-2.32.10"
 WGPU_DIR = REPO / "tools" / "bin" / "wgpu-native-v29.0.1.1"
 
 sys.path.insert(0, str(REPO / "extract"))
+sys.path.insert(0, str(REPO / "patches"))
+from build import apply_writes, check_writes  # noqa: E402
 from extract import boot_path, parse_system_cnf  # noqa: E402
 from iso9660 import Iso  # noqa: E402
 
@@ -75,6 +84,46 @@ def extract_elf(iso, out, expected):
     return elf
 
 
+def patch_elf(game, elf, out):
+    """A copy of the ELF with every game.json patch write applied; refuses if an original word differs."""
+    data = elf.read_bytes()
+    bad = check_writes(game, data)
+    for name, addr, old, found in bad:
+        print(f"MISMATCH [{name}] 0x{addr:08x}: expected {old:08x}, ELF has {found:08x}")
+    if bad:
+        sys.exit("Original words do not match: wrong game version or wrong recipe.")
+    patched = out / "patched" / elf.name
+    patched.parent.mkdir(exist_ok=True)
+    patched.write_bytes(apply_writes(game, data))
+    print(f"{sum(len(p['writes']) for p in game['patches'])} patch writes checked and applied -> {patched}")
+    return patched
+
+
+def write_if_changed(path, text):
+    if not path.exists() or path.read_text() != text:
+        path.write_text(text)
+
+
+def install_overrides(serial, overrides, generated):
+    """Copies each override's source into generated/ and writes overrides.cpp, which registers them."""
+    names = sorted(set(overrides.values()))
+    for stale in generated.glob("override_*.cpp"):
+        if stale.stem[len("override_"):] not in names:
+            stale.unlink()
+    if not overrides:
+        (generated / "overrides.cpp").unlink(missing_ok=True)
+        return
+    for name in names:
+        sources = [d / f"{name}.cpp" for d in (GAMES_DIR / serial / "overrides", OVERRIDES_DIR) if (d / f"{name}.cpp").exists()]
+        if not sources:
+            sys.exit(f"No source for override {name}: add {name}.cpp to local/games/{serial}/overrides/ or recomp/overrides/")
+        write_if_changed(generated / f"override_{name}.cpp", sources[0].read_text())
+    decls = "".join(f"bool {name}(ps2::Cpu &c);\n" for name in names)
+    calls = "".join(f"    ps2::register_override({int(addr, 16):#010x}u, &ovr::{name});\n" for addr, name in sorted(overrides.items()))
+    write_if_changed(generated / "overrides.cpp", f'#include "ps2/generated.hpp"\n\nnamespace ovr {{\n{decls}}}\n\n'
+                                                  f"void register_overrides() {{\n{calls}}}\n")
+
+
 def build_tools(out):
     build = out / f"build-tools{BUILD_SUFFIX}"
     if not (build / "build.ninja").exists():
@@ -89,9 +138,9 @@ def compile_vu(vurecomp, vu1, generated):
         run([vurecomp, vu1, generated])
 
 
-def translate(eerecomp, elf, entries, generated):
+def translate(eerecomp, elf, entries, overrides, generated):
     generated.mkdir(exist_ok=True)
-    run([eerecomp, elf, "--entries", entries, "--out", generated])
+    run([eerecomp, elf, "--entries", entries, "--out", generated] + (["--overrides", overrides] if overrides else []))
 
 
 def build_runner(out, generated):
@@ -131,7 +180,7 @@ def play(runner, elf, iso, out, name, frames, presses, frame_every):
     return misses.read_text().split() if misses.exists() else []
 
 
-def explore(runner, eerecomp, elf, iso, out, entries, generated, frames):
+def explore(runner, eerecomp, elf, iso, out, entries, overrides, generated, frames):
     """Runs the game until a run finds no new entry points (port.sh's loop)."""
     presses = ["300:start"] + [f"{f}:cross" for f in range(600, frames, 300)]
     found = []
@@ -144,7 +193,7 @@ def explore(runner, eerecomp, elf, iso, out, entries, generated, frames):
         found += new
         with open(entries, "a") as f:
             f.write("".join(m + "\n" for m in new))
-        translate(eerecomp, elf, entries, generated)
+        translate(eerecomp, elf, entries, overrides, generated)
         runner = build_runner(out, generated)
     return found
 
@@ -156,6 +205,7 @@ def main():
     ap.add_argument("--no-explore", action="store_true", help="skip the exploring runs")
     ap.add_argument("--no-menu", action="store_true", help="skip the scripted menu run")
     ap.add_argument("--window", action="store_true", help="also build ps2run with the window and GPU renderer (Windows)")
+    ap.add_argument("--no-patches", action="store_true", help="translate and run the disc's ELF without the game.json patches")
     args = ap.parse_args()
 
     game = json.loads((GAMES_DIR / args.serial / "game.json").read_text(encoding="utf-8"))
@@ -164,14 +214,21 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     iso = link_iso(out, args.iso)
     elf = extract_elf(iso, out, game["disc"]["elf"])
+    if game.get("patches") and not args.no_patches:
+        elf = patch_elf(game, elf, out)
     entries, generated = out / "entries.txt", out / "generated"
     entries.write_text("".join(e + "\n" for e in cfg["entries"]))
+    overrides = None
+    if cfg.get("overrides"):
+        overrides = out / "overrides.txt"
+        overrides.write_text("".join(f"{int(a, 16):x}\n" for a in sorted(cfg["overrides"])))
 
     eerecomp = build_tools(out)
-    translate(eerecomp, elf, entries, generated)
+    translate(eerecomp, elf, entries, overrides, generated)
+    install_overrides(args.serial, cfg.get("overrides", {}), generated)
     runner = build_runner(out, generated)
     if not args.no_explore:
-        found = explore(runner, eerecomp, elf, iso, out, entries, generated, cfg["explore_frames"])
+        found = explore(runner, eerecomp, elf, iso, out, entries, overrides, generated, cfg["explore_frames"])
         if found:
             print("Add these to recomp.entries in game.json:", json.dumps(found))
     if not args.no_menu and "menu" in cfg:

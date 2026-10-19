@@ -16,6 +16,7 @@ struct CodegenOptions {
     std::string output;
     std::uint32_t unit_bits = 14;
     std::set<std::uint32_t> probes;
+    std::set<std::uint32_t> overrides;
 };
 
 struct Translation {

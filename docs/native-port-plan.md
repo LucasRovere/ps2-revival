@@ -66,12 +66,13 @@ their limit (T28). Real racing load *unverified* (T29). Menus drop a little
 Own the pieces needed to change the game, and close the runtime gaps that
 affect play.
 
-- **Function overrides (D5):** `eerecomp --overrides`: listed guest
+- **Function overrides (D5), done (T31):** `eerecomp --overrides`: listed guest
   addresses call a registered C++ function instead of the recompiled one;
   `port.py` reads the list from `game.json`. Overrides are our own code
   (SDK behaviour, engine structures documented in the notes), never pasted
-  decompiler output (AGENTS rule 1, D23).
-- **Recipe patches in the port:** `port.py` applies the `game.json`
+  decompiler output (AGENTS rule 1, D23). They must charge the guest's
+  cycles to keep emulated time ([recomp/README.md](../recomp/README.md)).
+- **Recipe patches in the port, done (T31):** `port.py` applies the `game.json`
   `patches` words to the ELF before translation (same check as
   `patches/build.py`), so Phase 4 recipes work in the port too.
 - **Saves:** memory card save and load checked in the port.

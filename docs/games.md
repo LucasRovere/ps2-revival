@@ -8,7 +8,8 @@ per game, named by serial exactly as PCSX2 uses it:
 local/games/<serial>/      git-ignored (local/ is in .gitignore)
   game.json   machine-readable recipe, read by the tools (schema: architecture.md)
   notes.md    findings for humans and agents: the memory for this game
-  tools/      optional: game- or engine-specific code (format decoders, overrides)
+  tools/      optional: game- or engine-specific code (format decoders)
+  overrides/  optional: game-specific function overrides for the port (<name>.cpp, recomp/README.md)
 ```
 
 ## Adding a game

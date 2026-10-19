@@ -116,10 +116,16 @@ in the vendored code under `recomp/` (D23); no separate `runtime/` or
   216/216 on the recompiler), random cases (L2 500/500), jump tables (L3),
   PCSX2 oracle (L4: 29 of 34 unverified vectors confirmed, 5 float cases
   stay on our model).
+- Port hooks (Phase 6, T31): `port.py` applies the `game.json` `patches` to
+  the ELF it translates (`--no-patches` for the disc's ELF); function
+  overrides (`recomp.overrides` → `eerecomp --overrides`, our C++ in
+  `recomp/overrides/` or `local/games/<serial>/overrides/`). Overrides must
+  charge the guest's cycles (`recomp/README.md`). Pilot game: 16:9 camera in
+  the port's frames; identity override byte-identical.
 - Repo policy (D24): nothing game-specific in git; recipes, notes and
   game-specific code in `local/games/<serial>/`.
 - Phases 6–9 re-planned (D23): build on the vendored runtime and GS renderer;
-  6 port hooks (override table, recipe patches, saves), 7 look better
+  6 port hooks (override table and recipe patches done, saves), 7 look better
   (widescreen, resolution, texture packs), 8 selective native draw paths,
   9 mods and assets. Plan: [docs/native-port-plan.md](docs/native-port-plan.md).
 - Next up: see [docs/tasks.md](docs/tasks.md). The owner runs tasks with `/next-task`.

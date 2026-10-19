@@ -3,7 +3,9 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -164,6 +166,51 @@ void stop(Cpu &c, std::uint32_t pc, const char *what) {
 void probe(Cpu &c, std::uint32_t pc) {
     std::fprintf(stderr, "[probe] 0x%08X a0 %08X a1 %08X a2 %08X a3 %08X ra %08X v0 %08X\n", pc, c.r[4].w[0], c.r[5].w[0], c.r[6].w[0],
                  c.r[7].w[0], c.r[31].w[0], c.r[2].w[0]);
+}
+
+namespace {
+
+std::map<std::uint32_t, OverrideFn> g_registered;
+
+struct Override {
+    std::uint32_t address;
+    OverrideFn fn;
+    std::uint64_t calls;
+};
+
+struct Overrides {
+    std::vector<Override> list;
+    ~Overrides() {
+        for (const Override &o : list) std::fprintf(stderr, "[override] 0x%08X: %llu calls\n", o.address, static_cast<unsigned long long>(o.calls));
+    }
+} g_overrides;
+
+}
+
+void register_override(std::uint32_t address, OverrideFn fn) { g_registered[address] = fn; }
+
+// The generated code numbers its overrides by their place in `addresses`. A listed address without a registered
+// override, or the other way round, would silently run the wrong code, so both stop the program at startup.
+void check_overrides(const std::uint32_t *addresses, std::uint32_t count) {
+    g_overrides.list.clear();
+    for (std::uint32_t k = 0; k < count; ++k) {
+        const auto it = g_registered.find(addresses[k]);
+        if (it == g_registered.end()) {
+            std::fprintf(stderr, "[override] no override registered for 0x%08X\n", addresses[k]);
+            std::exit(1);
+        }
+        g_overrides.list.push_back({addresses[k], it->second, 0});
+    }
+    if (g_registered.size() != count) {
+        std::fprintf(stderr, "[override] %zu overrides registered, %u listed in the generated code\n", g_registered.size(), count);
+        std::exit(1);
+    }
+}
+
+bool run_override(Cpu &c, std::uint32_t index) {
+    Override &o = g_overrides.list[index];
+    ++o.calls;
+    return o.fn(c);
 }
 
 void breakpoint(Cpu &c, std::uint32_t pc) {

@@ -22,10 +22,11 @@ Recipe format:
     "name": "Widescreen 16:9",
     "description": "shown in PCSX2",
     "gsaspectratio": "16:9",
-    "writes": [{"addr": "0x00414bb0", "old": "0x27bdffe0", "new": "0x03e00008", "note": "comment"}]
+    "writes": [{"addr": "0x00123456", "old": "0x27bdffe0", "new": "0x03e00008", "note": "comment"}]
   }
 ]
 ```
 
 `gsaspectratio` is optional. Writes are 32-bit EE words, applied
-continuously (`patch=1`).
+continuously (`patch=1`). `recomp/port.py` applies the same writes (same check)
+to the ELF it translates for the native port (T31).

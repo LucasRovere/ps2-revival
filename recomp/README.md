@@ -2,14 +2,15 @@
 
 EE (R5900) → C++ static recompiler (Phase 5). The recompiler and runtime are
 [ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp) (MIT), vendored
-in `ps2-web-recomp/` (D14, D16). Our own code: `port.py` and the instruction
-tests in `tests/`.
+in `ps2-web-recomp/` (D14, D16). Our own code: `port.py`, the function
+override hook (vendored patch, below), generic overrides in `overrides/`
+(none yet; created with the first) and the instruction tests in `tests/`.
 
 ## port.py (WSL or Windows)
 
 ```bash
 python3 recomp/port.py <SERIAL> --iso "/mnt/c/path/to/game.iso"   # first run links the ISO
-python3 recomp/port.py <SERIAL> [--no-explore] [--no-menu]
+python3 recomp/port.py <SERIAL> [--no-explore] [--no-menu] [--no-patches]
 ```
 
 Needs clang, CMake and Ninja in WSL (SDL2 optional, for the window).
@@ -35,7 +36,8 @@ cross, X circle, A square, S triangle, Enter start, F11 fullscreen; pads via
 SDL). Without `--window` it runs headless but still draws on the GPU;
 `PS2_GS=cpu` selects the CPU rasterizer. Never
 runs upstream's `setup.sh`/`port.sh` (they download wgpu-native and emsdk).
-Steps: extract the boot ELF from the ISO, build `eerecomp`, translate,
+Steps: extract the boot ELF from the ISO, apply the `game.json` `patches`
+(below), build `eerecomp`, translate,
 build `ps2run` (headless, CPU rasterizer), exploring runs that add missed
 entry points and translate again (upstream `port.sh`'s loop), the
 scripted menu run, then `vurecomp` on the VU1 microprograms the runs
@@ -48,12 +50,56 @@ them (D21, T25). Programs not recorded run on the VU1 interpreter;
 | `entries` | Extra entry points, the runtime's miss format (hex without `0x`; `module:offset` for modules) |
 | `explore_frames` | Frames per exploring run (presses: start at 300, cross every 300) |
 | `menu` | Optional scripted run from boot: `frames`, `frame_every`, `presses` (`frame:button[+button][:hold]`) |
+| `overrides` | Optional `{"0x00123456": "name"}`: guest function entry → our C++ function `name` (below) |
 
 Output (game-derived, never commit): `work/<SERIAL>/recomp/`: `generated/`
-(C++, incl. `vu1_*.cpp`), `vu1/` (recorded VU1 program images),
-`build-tools/`, `build-native/`, `explore.log`/`menu.log`,
+(C++, incl. `vu1_*.cpp`, `overrides.cpp` and copies of the override
+sources), `patched/` (the patched ELF), `vu1/` (recorded VU1 program
+images), `build-tools/`, `build-native/`, `explore.log`/`menu.log`,
 `*-frames/` (PPM), memory cards. New entry points found by exploring are
 printed; add them to `entries`.
+
+### Patches and overrides (T31)
+
+**Patches:** the top-level `game.json` `patches` (the Phase 4 recipe, see
+[patches/README.md](../patches/README.md)) are applied to a copy of the ELF
+in `patched/`; every `old` word is checked first (`patches/build.py`
+`check_writes`), and a mismatch stops the run. That copy is translated and
+run. `--no-patches` translates and runs the disc's ELF (for comparisons).
+`gsaspectratio` is PCSX2-only; the port's 4:3 output is T32.
+
+**Overrides:** `eerecomp --overrides <file>` (one hex address per line, the
+`--entries` format) puts a hook at each listed function entry label in the
+generated unit, so direct `jal` calls, tail jumps and dispatcher entries
+(`jalr`, vtables) all reach it:
+
+```cpp
+L_00123456:
+    if (run_override(c, 0u)) { c.pc = c.r[31].w[0]; return; }
+```
+
+An override is `bool name(ps2::Cpu &c)` in `namespace ovr`, in
+`overrides/<name>.cpp` (generic: SDK, libc) or
+`local/games/<serial>/overrides/<name>.cpp` (game-specific, never in git,
+D24). It reads arguments from `a0`-`a3`, writes the result to `v0`/`v1` and
+returns true; the hook then returns to `ra` like `jr ra`. Returning false
+runs the recompiled code instead. `port.py` writes the address list, copies
+the sources into `generated/` and writes `generated/overrides.cpp`
+(`register_overrides()`, called from the generated `register_generated_code`).
+At startup the runtime stops with an error if a listed address has no
+registered override or the other way round. At exit it prints
+`[override] 0x...: N calls` per override. Without overrides the generated
+C++ is byte-identical to before.
+
+Overrides must keep emulated time: the recompiled code charges each
+instruction to `c.budget` (a branch and its delay slot count 2, also when a
+branch-likely skips the slot), and that budget is the EE clock. An override
+that does not charge the same cycles runs the game at a different speed
+relative to vblank, so frames change. For byte-identical frames an override
+also has to respect the preemption checks at taken backward branches
+(`c.budget < 0` there runs due events): a side-effect-free override can
+compute the guest's path first and return false when the guest would hit
+such a check with the budget used up (T31's identity override does this).
 
 ## Vendored upstream
 
@@ -74,6 +120,7 @@ except:
 | `runtime/src/iop/io.cpp` (ioman `AddDrv`, `DelDrv`) | Post-intro stall (T27): `AddDrv` was a stub returning -1, so the game's USB driver module failed to load ("Cannot add driver to IO manager") and never added its SIF command handler. The EE side then sent that command 60 times with a 0.5 s timeout each: ~1,800 frames of black screen (or the skipped movie's last frame) before the title. `AddDrv` now calls the driver's `init` op and returns 0 when it succeeds (as the IOP's ioman does); `DelDrv` returns 0. PCSX2 with the BIOS: the module stays resident (`ret 2`). |
 | `runtime/src/vif.cpp`, `runtime/src/vu_micro.cpp` (`xgkick`) | VU thread speed (T28): VIF NOP (about half of all VIF commands, ~100,000 per pilot game race-intro frame) skips the command dispatch; the general unpack path writes each qword with one 16-byte store and wraps with a mask; XGKICK sends a packet that does not wrap around VU memory straight from VU memory instead of copying it to a stack buffer first. |
 | `runtime/src/gs/queue.hpp`, `runtime/src/gs/queue.cpp` | VU thread speed (T28): `role()` is inline (thread-local read, asked once per VIF command); ring positions wrap with a mask (capacities are powers of two) instead of a 64-bit division; producer and consumer cache the other side's position and only reload it when they run out; each side's atomics sit on their own cache line; `post` does one locked operation instead of two (`consumer_waiting_` is read before it is exchanged). |
+| `recomp/main.cpp`, `recomp/codegen.hpp`, `recomp/codegen.cpp`, `runtime/include/ps2/generated.hpp`, `runtime/src/dispatch.cpp` | Function overrides (T31, D5): `eerecomp --overrides <file>` (each address must be a function entry, else an error); at each listed entry of the main program the unit emits `if (run_override(c, k)) { c.pc = ra; return; }` (k = place in the sorted list); `table.cpp` gets `kOverrides[]` and `register_generated_code` calls `register_overrides()` (written by `port.py`) and `check_overrides`. Runtime: `register_override(addr, fn)`, `check_overrides` (exits on a listed address without an override or an extra registration), `run_override` (counts calls; counts printed at exit). Without `--overrides` the output is byte-identical (pilot game: all 238 units and `table.cpp`). |
 
 The headless Windows build (T22) needs no changes to upstream: the headless path
 leaves out `host/window.cpp` (SDL2), `host/profile.cpp` (Linux only) and the
@@ -96,7 +143,7 @@ Plan and vector format: [../docs/recomp-tests.md](../docs/recomp-tests.md) (D15)
 python -m unittest discover -s recomp/tests   # assembler + every vector on the model
 python recomp/tests/ref.py                    # vectors on the reference model, with a summary
 python recomp/tests/asm.py <SERIAL>           # local check: re-encode the analysis export
-python3 recomp/tests/harness.py [--random N] [--seed S]   # WSL: vectors + random cases on the recompiler (L1, L2)
+python3 recomp/tests/harness.py [--random N] [--seed S]   # WSL: vectors + random cases on the recompiler (L1, L2) + override case
 python3 recomp/tests/harness.py --tables <SERIAL>         # WSL, local: jump tables vs the port's entry tables (L3)
 python recomp/tests/oracle.py [--mode rec interp ...]     # Windows: vectors on PCSX2 + the owner's BIOS (L4, D18)
 ```
@@ -106,9 +153,9 @@ python recomp/tests/oracle.py [--mode rec interp ...]     # Windows: vectors on 
 | `tests/asm.py` | Assembler for every mnemonic the pilot game uses (inverse of `analysis/census.py`'s tables) |
 | `tests/ref.py` | Python reference model: integer, control flow, 64/128-bit memory, mult/div, MMI, FPU, VU0 macro ops (PS2 float rules) |
 | `tests/vectors/*.json` | Test vectors, written by hand (`base`, `branch`, `mem`, `mmi`, `system`, `fpu`, `vu0`) |
-| `tests/harness.py` | ELF writer, runs `eerecomp` per case, builds and runs the harness, compares with `ref.py` |
+| `tests/harness.py` | ELF writer, runs `eerecomp` per case, builds and runs the harness, compares with `ref.py`; `OVERRIDE_CASE`: a function reached through `jal` and `jalr` runs its override (`harness/override.cpp`) both times and returns to the caller |
 | `tests/oracle.py` | One test ELF for all eligible vectors, run on PCSX2 (own data folder in `work/`), end states parsed from the EE console log |
-| `tests/harness/` | C++ harness (`main.cpp`: load state, `dispatch`, print state as JSON) and its CMake project (links upstream `ps2runtime`) |
+| `tests/harness/` | C++ harness (`main.cpp`: load state, `dispatch`, print state as JSON), `override.cpp` (the override case's C++) and its CMake project (links upstream `ps2runtime`) |
 
 Harness output (fixture C++, build): `work/recomp-tests/`.
 

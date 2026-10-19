@@ -213,6 +213,8 @@ private:
                 out_ << label(a) << ":\n";
             }
             if (options_.probes.count(a)) line(std::format("probe(c, {});", pc(a)));
+            if (const auto o = options_.overrides.find(a); !relocatable_ && o != options_.overrides.end())
+                line(std::format("if (run_override(c, {}u)) {{ c.pc = c.r[31].w[0]; return; }}", std::distance(options_.overrides.begin(), o)));
             const Insn i = at(a);
             const Flow fl = flow(i.op);
             if (fl == Flow::None) {
@@ -816,8 +818,16 @@ void generate(const std::vector<Translation> &translations, const CodegenOptions
     }
     header << "}\n";
     if (module_count) table << "const ps2::ModuleInfo kModules[] = {\n" << modules.str() << "};\n\n";
-    table << "}\n\nvoid register_generated_code() { ps2::register_units(gen::kUnits, " << main_units << "u);";
+    if (!options.overrides.empty()) {
+        table << "const std::uint32_t kOverrides[] = {";
+        for (std::uint32_t a : options.overrides) table << hex(a) << ", ";
+        table << "};\n\n";
+    }
+    table << "}\n\n";
+    if (!options.overrides.empty()) table << "void register_overrides();\n\n";
+    table << "void register_generated_code() { ps2::register_units(gen::kUnits, " << main_units << "u);";
     if (module_count) table << " ps2::register_modules(gen::kModules, " << module_count << "u);";
+    if (!options.overrides.empty()) table << " register_overrides(); ps2::check_overrides(gen::kOverrides, " << options.overrides.size() << "u);";
     table << " }\n";
     write_if_changed(fs::path(options.output) / "units.hpp", header.str());
     write_if_changed(fs::path(options.output) / "table.cpp", table.str());

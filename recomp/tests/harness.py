@@ -51,14 +51,27 @@ FCR31_C = 1 << 23
 
 WRAPPER = """#define gen case_{i}
 #define register_generated_code register_case_{i}
+#define register_overrides register_overrides_{i}
 {includes}
 #undef gen
 #undef register_generated_code
-
+#undef register_overrides
+{overrides}
 void init_case_{i}(ps2::Cpu &c) {{
 {init}
 }}
 """
+
+# Override case (T31): F's recompiled code returns 1; the override (harness/override.cpp) returns a0 + 0x100.
+# It must be reached through jal and through jalr, and return to the caller both times.
+OVERRIDE_CASE = {
+    "file": "override", "name": "override reached through jal and jalr",
+    "asm": ["jal F", "nop", "addu s0, v0, zero", "jalr t9", "nop", "addu s1, v0, zero", "j END", "nop",
+            "F:", "addiu v0, zero, 1", "jr ra", "nop", "END:"],
+    "init": {"a0": "0x5", "t9": "0x100020"},
+    "overrides": {"0x00100020": "harness_add"},
+    "expect": {"v0": "0x105", "s0": "0x105", "s1": "0x105", "ra": "0x100014"},
+}
 
 
 def elf(words, mem):
@@ -133,9 +146,17 @@ def translate(cases, eerecomp):
         if "pc_trace" in case.get("expect", {}):
             (work / "probes.txt").write_text("".join(f"{CODE_BASE + 4 * k:x}\n" for k in range(len(case["words"]))))
             args += ["--probes", work / "probes.txt"]
+        overrides = ""
+        if "overrides" in case:
+            (work / "overrides.txt").write_text("".join(f"{a}\n" for a in case["overrides"]))
+            args += ["--overrides", work / "overrides.txt"]
+            names = sorted(set(case["overrides"].values()))
+            overrides = ("namespace ovr {\n" + "".join(f"bool {n}(ps2::Cpu &c);\n" for n in names) + "}\n\n"
+                         f"void register_overrides_{i}() {{\n"
+                         + "".join(f"    ps2::register_override({a}u, &ovr::{n});\n" for a, n in case["overrides"].items()) + "}\n")
         subprocess.run(args, check=True, capture_output=True)
         includes = "\n".join(f'#include "{p}"' for p in sorted((work / "cpp").glob("*.cpp")))
-        write_if_changed(cases_dir / f"case_{i}.cpp", WRAPPER.format(i=i, includes=includes, init=init_cpp(init)))
+        write_if_changed(cases_dir / f"case_{i}.cpp", WRAPPER.format(i=i, includes=includes, overrides=overrides, init=init_cpp(init)))
     for stale in cases_dir.glob("case_*.cpp"):
         if int(stale.stem[5:]) >= len(cases):
             stale.unlink()
@@ -394,7 +415,7 @@ def main():
         case = random_case(rng, len(randoms))
         if case:
             randoms.append(case)
-    cases = vectors + randoms
+    cases = vectors + randoms + [OVERRIDE_CASE]
     for case in cases:
         case["words"] = assemble(case["asm"], CODE_BASE)
 
@@ -404,10 +425,12 @@ def main():
     cmake(build, "harness")
     results, logs = run_harness(build / "harness", len(cases))
     failed_vectors = report(vectors, results, logs)
-    failed_random = report(randoms, results[len(vectors):], logs[len(vectors):])
+    failed_random = report(randoms, results[len(vectors):-1], logs[len(vectors):-1])
+    failed_override = report([OVERRIDE_CASE], results[-1:], logs[-1:])
     print(f"L1: {len(vectors) - failed_vectors}/{len(vectors)} vectors pass on the recompiler")
     print(f"L2: {len(randoms) - failed_random}/{len(randoms)} random cases match the reference model (seed {args.seed})")
-    sys.exit(1 if failed_vectors or failed_random else 0)
+    print(f"override case: {'FAIL' if failed_override else 'pass'}")
+    sys.exit(1 if failed_vectors or failed_random or failed_override else 0)
 
 
 if __name__ == "__main__":

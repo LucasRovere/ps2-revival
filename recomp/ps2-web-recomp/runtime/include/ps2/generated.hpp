@@ -44,6 +44,13 @@ void trap(Cpu &c, std::uint32_t pc);
 void stop(Cpu &c, std::uint32_t pc, const char *what);
 void probe(Cpu &c, std::uint32_t pc);
 
+// Our C++ in place of a guest function. Returns true when it did the function's work (the caller then returns to ra),
+// false to run the recompiled code.
+using OverrideFn = bool (*)(Cpu &);
+void register_override(std::uint32_t address, OverrideFn fn);
+void check_overrides(const std::uint32_t *addresses, std::uint32_t count);
+bool run_override(Cpu &c, std::uint32_t index);
+
 std::uint32_t mfc0(Cpu &c, std::uint32_t reg, std::uint32_t sel);
 void mtc0(Cpu &c, std::uint32_t reg, std::uint32_t value);
 void set_interrupts(Cpu &c, bool enabled);

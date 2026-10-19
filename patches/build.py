@@ -24,12 +24,26 @@ sys.path.insert(0, str(REPO / "extract"))
 from extract import parse_elf  # noqa: E402
 
 
-def read_word(elf, segments, addr):
+def file_offset(segments, addr):
     for s in segments:
         vaddr = int(s["vaddr"], 16)
         if vaddr <= addr < vaddr + s["filesz"]:
-            return struct.unpack_from("<I", elf, s["offset"] + addr - vaddr)[0]
+            return s["offset"] + addr - vaddr
     raise ValueError(f"0x{addr:08x} is not in the ELF's file data")
+
+
+def read_word(elf, segments, addr):
+    return struct.unpack_from("<I", elf, file_offset(segments, addr))[0]
+
+
+def apply_writes(cfg, elf):
+    """The ELF with every patch write applied (check_writes first)."""
+    segments = parse_elf(elf)["program_headers"]
+    out = bytearray(elf)
+    for p in cfg["patches"]:
+        for w in p["writes"]:
+            struct.pack_into("<I", out, file_offset(segments, int(w["addr"], 16)), int(w["new"], 16))
+    return bytes(out)
 
 
 def check_writes(cfg, elf):

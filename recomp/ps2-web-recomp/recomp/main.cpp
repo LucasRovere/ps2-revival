@@ -9,10 +9,12 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <iterator>
 #include <map>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -91,7 +93,7 @@ std::vector<Snr2Module> read_modules(const std::string &dir) {
 }
 
 int usage() {
-    std::fprintf(stderr, "usage: eerecomp <elf> [--entries file] [--modules dir] [--probes file] [--out dir] [--stats]\n");
+    std::fprintf(stderr, "usage: eerecomp <elf> [--entries file] [--modules dir] [--probes file] [--overrides file] [--out dir] [--stats]\n");
     return 2;
 }
 
@@ -99,7 +101,7 @@ int usage() {
 
 int main(int argc, char **argv) {
     if (argc < 2) return usage();
-    std::string elf_path = argv[1], entries_path, out, probes_path, modules_dir;
+    std::string elf_path = argv[1], entries_path, out, probes_path, overrides_path, modules_dir;
     bool stats = false;
     for (int i = 2; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -107,6 +109,7 @@ int main(int argc, char **argv) {
         else if (arg == "--stats") stats = true;
         else if (arg == "--out" && i + 1 < argc) out = argv[++i];
         else if (arg == "--probes" && i + 1 < argc) probes_path = argv[++i];
+        else if (arg == "--overrides" && i + 1 < argc) overrides_path = argv[++i];
         else if (arg == "--modules" && i + 1 < argc) modules_dir = argv[++i];
         else return usage();
     }
@@ -147,6 +150,11 @@ int main(int argc, char **argv) {
             options.output = out;
             if (!probes_path.empty())
                 for (std::uint32_t a : read_entries(probes_path).main) options.probes.insert(a);
+            if (!overrides_path.empty())
+                for (std::uint32_t a : read_entries(overrides_path).main) {
+                    if (!program.entries.count(a)) throw std::runtime_error(std::format("override 0x{:08X} is not a function entry", a));
+                    options.overrides.insert(a);
+                }
             generate(translations, options);
         }
     } catch (const std::exception &error) {

@@ -10,7 +10,7 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../ps2-web-recomp upstream)
 
 if(HARNESS_CASES)
     file(GLOB CASE_SOURCES CONFIGURE_DEPENDS "${HARNESS_CASES}/*.cpp")
-    add_executable(harness main.cpp ${CASE_SOURCES})
+    add_executable(harness main.cpp override.cpp ${CASE_SOURCES})
     target_link_libraries(harness PRIVATE ps2runtime)
     target_compile_options(harness PRIVATE -Wno-unused-label -Wno-unused-variable)
 endif()

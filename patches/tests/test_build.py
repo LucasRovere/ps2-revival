@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from build import check_writes, pnach  # noqa: E402
+from build import apply_writes, check_writes, pnach  # noqa: E402
 
 VADDR, OFFSET = 0x100000, 0x1000
 
@@ -40,6 +40,10 @@ class BuildTest(unittest.TestCase):
         cfg["patches"][0]["writes"][0]["addr"] = "0x00200000"
         with self.assertRaises(ValueError):
             check_writes(cfg, tiny_elf([0]))
+
+    def test_apply_writes(self):
+        elf = tiny_elf([0xaaaaaaaa, 0xbbbbbbbb])
+        self.assertEqual(apply_writes(config("0xbbbbbbbb"), elf), tiny_elf([0xaaaaaaaa, 0x24020002]))
 
     def test_pnach_text(self):
         self.assertEqual(pnach(config("0x0")).splitlines(), [
