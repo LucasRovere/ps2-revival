@@ -14,8 +14,14 @@ local/games/<serial>/      git-ignored (local/ is in .gitignore)
 
 ## Adding a game
 
-1. Create the folder with a minimal `game.json` (`serial`, `title`).
-2. Create `notes.md` from the template below.
+1. `python recomp/port.py init <iso> [--serial S]` (Windows,
+   [recomp/README.md](../recomp/README.md)) creates the folder with
+   `game.json` (identity, default `recomp` block) and `notes.md` from the
+   template below, and builds the port folder `work/<serial>/port/`. It
+   never overwrites an existing `game.json` or `notes.md`. (By hand:
+   create the folder with a minimal `game.json` (`serial`, `title`) and
+   `notes.md` from the template.)
+2. Set `title` in `game.json` and the heading of `notes.md`.
 3. Work through the phases that apply (textures, extract, analysis…) and
    record findings as you go.
 

@@ -25,12 +25,21 @@ card) and the `recomp.load` run (a new boot loads that save).
 
 --folder [<dir>] (Windows) also builds the standalone port folder (default
 work/<serial>/port/): the window ps2run.exe, SDL2.dll, the ELF and the disc's
-files with their sector layout. ps2run.exe runs it with no arguments, no ISO.
+files with their sector layout, and settings.json (picture settings from
+play.json or the recipe defaults; an existing one is kept). ps2run.exe runs it
+with no arguments, no ISO.
+
+New game (Windows): `port.py init <iso> [--serial S]` reads the serial, boot
+ELF and CRC from the disc, writes local/games/<serial>/game.json and notes.md
+(never overwrites them), then runs the pipeline above with --folder; entry
+points found by exploring go into game.json.
 """
 
 import argparse
+import datetime
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -43,6 +52,8 @@ WORK_DIR = REPO / "work"
 UPSTREAM = REPO / "recomp" / "ps2-web-recomp"
 OVERRIDES_DIR = REPO / "recomp" / "overrides"
 EXPLORE_ROUNDS = 8
+# One minute at NTSC, the pilot game's value (it ends inside the intro movies there; T39).
+DEFAULT_EXPLORE_FRAMES = 3600
 # Separate build dirs so the WSL and Windows builds don't clobber each other.
 BUILD_SUFFIX = "-win" if os.name == "nt" else ""
 # Windows window build (T23): official prebuilt releases, git-ignored under tools/bin.
@@ -52,7 +63,7 @@ WGPU_DIR = REPO / "tools" / "bin" / "wgpu-native-v29.0.1.1"
 sys.path.insert(0, str(REPO / "extract"))
 sys.path.insert(0, str(REPO / "patches"))
 from build import apply_writes, check_writes  # noqa: E402
-from extract import boot_path, parse_system_cnf  # noqa: E402
+from extract import boot_path, parse_system_cnf, pcsx2_crc  # noqa: E402
 from iso9660 import SECTOR, Iso  # noqa: E402
 
 
@@ -213,12 +224,32 @@ def unpack_disc(iso, folder):
     print(f"unpacked {len(disc.files())} files, {sum(c for _, c in runs)} other sectors -> {folder}")
 
 
-def build_folder(window_build, elf, iso, folder):
-    """The standalone port: ps2run.exe finds the ELF and the disc next to itself."""
+def default_aspect(game, patched):
+    # A widescreen patch makes the game draw 16:9; a 4:3 window would squeeze it.
+    return game.get("recomp", {}).get("aspect", "4:3") if patched else "4:3"
+
+
+def folder_settings(game, patched, play):
+    """The port folder's settings.json: play.json's picture settings (when there is one), else the defaults.
+    The folder keeps its own card; a repo-relative texture pack becomes absolute."""
+    settings = {"aspect": default_aspect(game, patched), "scale": 1, "fullscreen": False, "textures": ""}
+    settings.update({k: v for k, v in (play or {}).items() if k in settings})
+    if settings["textures"]:
+        settings["textures"] = str(REPO / settings["textures"])
+    return {**settings, "memcard": "memcard.ps2"}
+
+
+def build_folder(window_build, elf, iso, folder, settings):
+    """The standalone port: ps2run.exe finds the ELF, the disc and settings.json next to itself."""
     folder.mkdir(parents=True, exist_ok=True)
     for name in ("ps2run.exe", "SDL2.dll"):
         shutil.copy2(window_build / name, folder)
     shutil.copy2(elf, folder / elf.name)
+    if (folder / "settings.json").exists():
+        print(f"settings kept: {folder / 'settings.json'}")
+    else:
+        (folder / "settings.json").write_text(json.dumps(settings, indent=2) + "\n")
+        print(f"settings written: {folder / 'settings.json'} {settings}")
     if (folder / "layout.txt").exists():
         print(f"disc files kept in {folder} (delete layout.txt to unpack again)")
     else:
@@ -272,9 +303,72 @@ def explore(runner, eerecomp, elf, iso, out, entries, overrides, generated, fram
     return found
 
 
-def main():
+def add_entries(serial, found):
+    path = GAMES_DIR / serial / "game.json"
+    game = json.loads(path.read_text(encoding="utf-8"))
+    game["recomp"]["entries"] += found
+    path.write_text(json.dumps(game, indent=2) + "\n", encoding="utf-8")
+    print(f"{len(found)} entry points added to {path}")
+
+
+def serial_from_elf(elf_path):
+    """'DIR/ABCD_123.45' -> 'ABCD-12345' (the serial as PCSX2 shows it); None for other names."""
+    m = re.fullmatch(r"([A-Z]{4})_(\d{3})\.(\d{2})", elf_path.rsplit("/", 1)[-1].upper())
+    return f"{m[1]}-{m[2]}{m[3]}" if m else None
+
+
+def new_game(serial, elf_path, crc):
+    return {"serial": serial, "title": serial, "disc": {"elf": elf_path, "crc": crc},
+            "recomp": {"entries": [], "explore_frames": DEFAULT_EXPLORE_FRAMES}}
+
+
+def new_notes(serial, elf_path, crc, cnf, disc_bytes):
+    """notes.md from the docs/games.md template with the identity filled in."""
+    return (f"# {serial} (title and region to fill in)\n\n"
+            f"## Identity\n"
+            f"Serial {serial}, CRC {crc}, disc {disc_bytes:,} bytes, main ELF {elf_path}"
+            f" (VER {cnf.get('VER')}, VMODE {cnf.get('VMODE')}). Onboarded with `port.py init` on {datetime.date.today()}.\n\n"
+            "## PCSX2\nSettings that work, issues, patches available.\n\n"
+            "## Textures\nDump coverage, junk suffixes and why, classification counts, problem textures.\n\n"
+            "## Executable / engine\nELF facts, engine, libraries, notable functions (with addresses).\n\n"
+            "## Open questions\nThings believed but not verified.\n")
+
+
+def write_new(folder, files):
+    """Writes {name: text} into folder; refuses (writing nothing) if any of them exists."""
+    existing = [name for name in files if (folder / name).exists()]
+    if existing:
+        sys.exit(f"{folder} already has {', '.join(existing)}: not overwritten, nothing changed")
+    folder.mkdir(parents=True, exist_ok=True)
+    for name, text in files.items():
+        (folder / name).write_text(text, encoding="utf-8")
+        print(f"wrote {folder / name}")
+
+
+def init(argv):
+    ap = argparse.ArgumentParser(prog="port.py init", description="Onboard a new disc and build its port folder (Windows).")
+    ap.add_argument("iso", help="PS2 disc image")
+    ap.add_argument("--serial", help="serial when the boot ELF is not named like ABCD_123.45")
+    a = ap.parse_args(argv)
+    if os.name != "nt":
+        sys.exit("init builds the port folder, which needs the Windows window build")
+    with Iso(a.iso) as disc:
+        cnf = parse_system_cnf(disc.read("SYSTEM.CNF").decode("ascii", "replace"))
+        elf_path = boot_path(cnf["BOOT2"])
+        crc = pcsx2_crc(disc.read(elf_path))
+    serial = a.serial or serial_from_elf(elf_path)
+    if not serial:
+        sys.exit(f"Boot ELF {elf_path} does not give a serial: pass --serial")
+    write_new(GAMES_DIR / serial, {"game.json": json.dumps(new_game(serial, elf_path, crc), indent=2) + "\n",
+                                   "notes.md": new_notes(serial, elf_path, crc, cnf, os.path.getsize(a.iso))})
+    start = time.time()
+    port(parser().parse_args([serial, "--iso", a.iso, "--folder"]), save_entries=True)
+    print(f"{serial} onboarded in {(time.time() - start) / 60:.0f} min: double-click {WORK_DIR / serial / 'port' / 'ps2run.exe'}")
+
+
+def parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("serial", help="game serial, e.g. ABCD-12345")
+    ap.add_argument("serial", help="game serial, e.g. ABCD-12345 (or: init <iso> [--serial S])")
     ap.add_argument("--iso", help="PS2 disc image; linked on the first run")
     ap.add_argument("--no-explore", action="store_true", help="skip the exploring runs")
     ap.add_argument("--no-menu", action="store_true", help="skip the scripted menu run")
@@ -282,7 +376,10 @@ def main():
     ap.add_argument("--no-patches", action="store_true", help="translate and run the disc's ELF without the game.json patches")
     ap.add_argument("--saves", action="store_true", help="also play the game.json save and load runs (memory card check)")
     ap.add_argument("--folder", nargs="?", const="", help="also build the standalone port folder (Windows; default work/<SERIAL>/port)")
-    args = ap.parse_args()
+    return ap
+
+
+def port(args, save_entries=False):
     if args.folder is not None and os.name != "nt":
         sys.exit("--folder needs the Windows window build")
 
@@ -292,7 +389,8 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     iso = link_iso(out, args.iso)
     elf = extract_elf(iso, out, game["disc"]["elf"])
-    if game.get("patches") and not args.no_patches:
+    patched = bool(game.get("patches")) and not args.no_patches
+    if patched:
         elf = patch_elf(game, elf, out)
     entries, generated = out / "entries.txt", out / "generated"
     entries.write_text("".join(e + "\n" for e in cfg["entries"]))
@@ -307,7 +405,9 @@ def main():
     runner = build_runner(out, generated)
     if not args.no_explore:
         found = explore(runner, eerecomp, elf, iso, out, entries, overrides, generated, cfg["explore_frames"])
-        if found:
+        if found and save_entries:
+            add_entries(args.serial, found)
+        elif found:
             print("Add these to recomp.entries in game.json:", json.dumps(found))
     if not args.no_menu and "menu" in cfg:
         menu = cfg["menu"]
@@ -319,7 +419,16 @@ def main():
     if args.window or args.folder is not None:
         window_build = build_window_runner(out, generated)
     if args.folder is not None:
-        build_folder(window_build, elf, iso, Path(args.folder) if args.folder else WORK_DIR / args.serial / "port")
+        play_json = GAMES_DIR / args.serial / "play.json"
+        settings = folder_settings(game, patched, json.loads(play_json.read_text()) if play_json.exists() else None)
+        build_folder(window_build, elf, iso, Path(args.folder) if args.folder else WORK_DIR / args.serial / "port", settings)
+
+
+def main():
+    if sys.argv[1:2] == ["init"]:
+        init(sys.argv[2:])
+    else:
+        port(parser().parse_args())
 
 
 if __name__ == "__main__":

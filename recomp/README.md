@@ -15,6 +15,26 @@ python3 recomp/port.py <SERIAL> [--no-explore] [--no-menu] [--no-patches] [--sav
 
 Needs clang, CMake and Ninja in WSL (SDL2 optional, for the window).
 
+### New game: port.py init (T38, Windows)
+
+```powershell
+. work/t22/env.ps1    # LLVM on PATH
+python recomp/port.py init "C:\path\to\game.iso" [--serial ABCD-12345]
+```
+
+Reads `SYSTEM.CNF`, the boot ELF and its CRC from the disc; the serial
+comes from the boot ELF's name (`ABCD_123.45` → `ABCD-12345`), else
+`--serial` is needed. Writes `local/games/<serial>/game.json` (`serial`,
+`title` = serial, `disc.elf`, `disc.crc`, `recomp.entries: []`,
+`recomp.explore_frames: 3600`) and `notes.md` (template of
+[games.md](../docs/games.md), identity filled in). If either exists it stops
+and changes nothing. Then it runs `port.py <serial> --iso <iso> --folder`:
+link, translate, exploring runs (entry points found are written into
+`game.json`), VU1 compile, window build, port folder. Last line: where the
+folder is (`work/<serial>/port/ps2run.exe`, double-click). No menu run (a new
+game has no `recomp.menu`), so only the VU1 programs the exploring runs met
+are compiled; the rest run on the interpreter until a later run records them.
+
 Windows (T22): same command with Windows Python 3.12 and a Windows ISO path.
 Needs LLVM (clang++), CMake, Ninja and the Visual Studio 2022 Build Tools
 (MSVC STL + Windows SDK; clang finds them itself, no developer prompt).
@@ -59,7 +79,7 @@ Output (game-derived, never commit): `work/<SERIAL>/recomp/`: `generated/`
 sources), `patched/` (the patched ELF), `vu1/` (recorded VU1 program
 images), `build-tools/`, `build-native/`, `explore.log`/`menu.log`,
 `*-frames/` (PPM), memory cards. New entry points found by exploring are
-printed; add them to `entries`.
+printed; add them to `entries` (`init` writes them itself).
 
 ### Saves (T34)
 
@@ -113,7 +133,8 @@ Keys missing from an older `play.json` take the defaults. The log shows
 `[mc] card in slot 1: <file>`.
 
 When the port folder `work/<SERIAL>/port/` exists (below), `play.py` starts
-its `ps2run.exe` instead, with the same settings, and prints `port folder: ...`.
+its `ps2run.exe` instead, with the same settings, and prints `port folder: ...`
+(`play.json` wins over the folder's `settings.json`).
 
 ### Port folder (T37, D27, Windows)
 
@@ -132,6 +153,20 @@ work\<SERIAL>\port\ps2run.exe          # or double-click it; no ISO needed
 | `disc/` | Every disc file at its disc path |
 | `layout.txt` | `sectors <n>`, then `file <lba> <size> <path>` per file and `rest <lba> <count>` per run of other non-zero sectors |
 | `sectors.bin` | Those other sectors in `rest` order (system area, volume descriptors, path tables, directory records; also a file's last sector when its padding is not zero) |
+| `settings.json` | Picture settings for a start in folder mode (T38, below) |
+
+`settings.json` (flat JSON) is written once from `play.json` (`aspect`,
+`scale`, `fullscreen`, `textures`; a repo-relative pack becomes absolute)
+or, without one, the defaults (`aspect` as `play.py` picks it: the recipe's
+`recomp.aspect` when patches are on, else `"4:3"`; scale 1; not
+fullscreen; no pack), plus `"memcard": "memcard.ps2"` (the folder's own
+card). An existing file is kept (`settings kept: ...`), so edit it by hand.
+`ps2run` in folder mode reads it: `aspect` → `PS2_ASPECT`, `scale` →
+`PS2_SCALE`, `textures` → `PS2_TEXTURES` (relative to the folder or
+absolute), `memcard` (same; `--memcard` still wins); environment variables
+already set win over the file (that is how `play.py` keeps `play.json`).
+`fullscreen: true` only applies to a start with no arguments
+(double-click). Without the file the defaults are as before (4:3, scale 1).
 
 The disc is unpacked once; a later `--folder` only refreshes the exe, DLL
 and ELF (delete `layout.txt` to unpack again). The runtime's folder backend
@@ -142,14 +177,14 @@ back as on the ISO and the directory index is built from the same records.
 `disc/SYSTEM.CNF`, disc = that folder, card `memcard.ps2` there (other
 options still apply, e.g. `--memcard`, `--window`). With no arguments at all
 it opens the window. The log says `[disc] folder backend: <dir>` or
-`[disc] image backend: <file>`.
+`[disc] image backend: <file>`. `settings.json` next to it sets the picture
+(above).
 
 Editing a file in `disc/` in place changes what the game reads, as long as
 the file keeps its size (the disc's directory records keep the old size).
 Limits: files that grow, new files and a mod overlay are T42; layer-1 files
 of a dual-layer disc are not unpacked (they stay in `sectors.bin`; no
-dual-layer disc tested); started without arguments the folder uses the
-defaults (4:3, scale 1), not `play.json`. The exe needs the Microsoft Visual
+dual-layer disc tested). The exe needs the Microsoft Visual
 C++ 2015-2022 runtime (`MSVCP140.dll`, `VCRUNTIME140.dll`), already present
 on a machine with the build tools.
 
@@ -323,6 +358,7 @@ except:
 | `runtime/src/gs/gpu/gpu.cpp` (blit viewport in `submit`, `present`), `host/window.cpp` (window size, SDL logical size) | 16:9 presentation (T32): `PS2_ASPECT=16:9` replaces the fixed 4:3 of the blit viewport and the SDL fallback with 16:9 and opens a 1280×720 window; `[gpu] aspect W:H` at GPU start. Unset, the arithmetic is the same as upstream's. |
 | `runtime/src/gs/gpu/texpack.cpp`, `texpack.hpp` (new), `gpu.cpp` (upload tags, `replacement` in the setup cache, `g_repl` binding 8, plan_decodes skips replaced setups, `[tex]` stats), `gpu.hpp` (`texture_dump`), `gs.wgsl` (`sample_repl`), `gs.cpp` (`cpu_memory`: CPU copy of GS memory for the dump), `CMakeLists.txt` (texpack.cpp) | Texture packs (T33, D25): setup word 24 = `0x80000000 | log2(scale) << 29 | offset/16` points the raster shader at a pack image instead of GS memory. Without `PS2_TEXTURES`/`PS2_TEX_DUMP` the new code does not run and frames and cycle counts are unchanged. |
 | `runtime/src/disc.cpp` (`open`, folder backend), `host/main.cpp` (no-ELF folder mode) | Port folder (T37, D27): `disc::open` on a directory reads `layout.txt`, `disc/` and `sectors.bin` through the existing `Reader` hook; one `[disc] folder/image backend` log line. `ps2run` without an ELF argument takes the ELF named in `disc/SYSTEM.CNF`, the disc and `memcard.ps2` from its own folder, and opens the window when started with no arguments. ISO runs: frames and cycle counts unchanged. |
+| `host/main.cpp` (`apply_folder_settings`) | Folder settings (T38): in folder mode `settings.json` next to `ps2run` sets `PS2_ASPECT`, `PS2_SCALE`, `PS2_TEXTURES` (only when not already set), the card, and fullscreen for a no-argument start. Runs with an ELF argument are unchanged. |
 
 The headless Windows build (T22) needs no changes to upstream: the headless path
 leaves out `host/window.cpp` (SDL2), `host/profile.cpp` (Linux only) and the
@@ -357,6 +393,7 @@ python recomp/tests/oracle.py [--mode rec interp ...]     # Windows: vectors on 
 | `tests/vectors/*.json` | Test vectors, written by hand (`base`, `branch`, `mem`, `mmi`, `system`, `fpu`, `vu0`) |
 | `tests/harness.py` | ELF writer, runs `eerecomp` per case, builds and runs the harness, compares with `ref.py`; `OVERRIDE_CASE`: a function reached through `jal` and `jalr` runs its override (`harness/override.cpp`) both times and returns to the caller |
 | `tests/oracle.py` | One test ELF for all eligible vectors, run on PCSX2 (own data folder in `work/`), end states parsed from the EE console log |
+| `tests/test_port.py` | `port.py`'s pure parts: serial from the boot ELF name, default `game.json`, refusal to overwrite, folder `settings.json` |
 | `tests/harness/` | C++ harness (`main.cpp`: load state, `dispatch`, print state as JSON), `override.cpp` (the override case's C++) and its CMake project (links upstream `ps2runtime`) |
 
 Harness output (fixture C++, build): `work/recomp-tests/`.

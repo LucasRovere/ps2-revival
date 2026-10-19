@@ -141,6 +141,11 @@ in the vendored code under `recomp/` (D23); no separate `runtime/` or
   (window exe, ELF, `disc/` + `layout.txt` + `sectors.bin`, D27); `ps2run.exe`
   there runs with no arguments and no ISO; `play.py` uses it when present.
   Pilot game: frames and cycles as the ISO run; an in-place file edit shows.
+- T38: `port.py init <iso> [--serial S]` onboards a new disc in one command
+  (serial, ELF, CRC from the disc; writes `game.json` + `notes.md`, never
+  overwrites; runs the pipeline to the port folder, found entries saved).
+  The folder's `settings.json` (from `play.json` or recipe defaults, kept
+  once written) sets aspect/scale/pack/card for a double-click start.
 - Repo policy (D24): nothing game-specific in git; recipes, notes and
   game-specific code in `local/games/<serial>/`.
 - Phases 6–9 re-planned (D23): build on the vendored runtime and GS renderer;

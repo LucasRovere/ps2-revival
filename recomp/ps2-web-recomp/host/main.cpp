@@ -12,6 +12,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -42,12 +43,44 @@ std::string folder_elf(const std::filesystem::path &dir) {
     return {};
 }
 
+// One value of the folder's flat settings.json: "key": "text" or "key": 3 / true.
+std::string setting(const std::string &json, const std::string &key) {
+    auto at = json.find("\"" + key + "\"");
+    if (at == std::string::npos || (at = json.find(':', at)) == std::string::npos) return {};
+    at = json.find_first_not_of(" \t\r\n", at + 1);
+    if (at == std::string::npos) return {};
+    if (json[at] == '"') return json.substr(at + 1, json.find('"', at + 1) - at - 1);
+    return json.substr(at, json.find_first_of(",} \t\r\n", at) - at);
+}
+
+// Environment variables already set (e.g. by play.py) win over the file.
+void default_env(const char *name, const std::string &value) {
+    if (value.empty() || std::getenv(name)) return;
+#ifdef _WIN32
+    _putenv_s(name, value.c_str());
+#else
+    setenv(name, value.c_str(), 0);
+#endif
+}
+
+// settings.json next to ps2run (written by port.py --folder): aspect, scale, textures, memcard, fullscreen.
+bool apply_folder_settings(const std::filesystem::path &dir) {
+    std::ifstream in(dir / "settings.json");
+    const std::string json((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    default_env("PS2_ASPECT", setting(json, "aspect"));
+    default_env("PS2_SCALE", setting(json, "scale"));
+    if (const auto textures = setting(json, "textures"); !textures.empty()) default_env("PS2_TEXTURES", (dir / textures).string());
+    if (const auto card = setting(json, "memcard"); !card.empty()) ps2::g_options.memcard_path = (dir / card).string();
+    return setting(json, "fullscreen") == "true";
+}
+
 }
 
 int main(int argc, char **argv) {
     // No ELF argument: run the port folder ps2run sits in (T37); no arguments at all opens the window.
     const bool folder = argc < 2 || argv[1][0] == '-';
     std::string elf = folder ? std::string() : argv[1];
+    bool fullscreen_setting = false;
     if (folder) {
         std::filesystem::path dir = std::filesystem::path(argv[0]).parent_path();
         if (dir.empty()) dir = ".";
@@ -55,9 +88,11 @@ int main(int argc, char **argv) {
         if (elf.empty()) return usage();
         ps2::g_options.disc_path = dir.string();
         ps2::g_options.memcard_path = (dir / "memcard.ps2").string();
+        fullscreen_setting = apply_folder_settings(dir);
     }
     std::vector<std::string> args{elf};
-    [[maybe_unused]] bool window = argc < 2, fullscreen = false;
+    // The settings' fullscreen only applies to a start with no arguments (double-click).
+    [[maybe_unused]] bool window = argc < 2, fullscreen = window && fullscreen_setting;
     std::string load_path;
     for (int i = folder ? 1 : 2; i < argc; ++i) {
         const std::string a = argv[i];

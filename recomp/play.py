@@ -23,7 +23,7 @@ import os
 import subprocess
 import sys
 
-from port import BUILD_SUFFIX, GAMES_DIR, REPO, WORK_DIR
+from port import BUILD_SUFFIX, GAMES_DIR, REPO, WORK_DIR, default_aspect
 
 
 def load_settings(serial, aspect):
@@ -41,8 +41,7 @@ def main():
     args = ap.parse_args()
 
     game = json.loads((GAMES_DIR / args.serial / "game.json").read_text(encoding="utf-8"))
-    # A widescreen patch makes the game draw 16:9; a 4:3 window would squeeze it.
-    settings = load_settings(args.serial, game.get("recomp", {}).get("aspect", "4:3") if game.get("patches") else "4:3")
+    settings = load_settings(args.serial, default_aspect(game, bool(game.get("patches"))))
     out = WORK_DIR / args.serial / "recomp"
     folder = WORK_DIR / args.serial / "port" / "ps2run.exe"
     if folder.exists():
