@@ -977,4 +977,38 @@ textures as 32-bit); it holds no rendered pixels.
 **Revisit if:** colour clamping matters (float targets keep results over
 255 between blends; COLCLAMP clamps only on display and texture reads), the
 CPU decode and upload copy stay too slow for the D38 render target (move
-them to the GPU), or a target is read in another format (T58).
+them to the GPU), or a target is read in another format (done in T58: D41).
+
+## D41: Native renderer: targets read in another format, read-backs, scaled nearest sampling (T58)
+
+**Decision (T58, 2026-10-20):** the GS-draw translator (D40) handles GS
+memory shared between targets like this:
+- A 16-bit frame or texture (CT16/CT16S) whose base lies in a 32-bit
+  target (CT32/CT24, same width, at a page row) is a **view**: its own
+  `rgba16float` texture, converted from the parent before use when the
+  parent changed, and back into the parent before the parent's next use
+  (draw, texture read, display, read-back) when it was drawn. Conversion
+  passes are per GS pixel through lookup tables built from the GS swizzle
+  tables (which 16-bit pixel is which half of which 32-bit pixel in a page).
+- FBMSK bits inside a channel (after the GS's 16-bit packing of the mask):
+  the draw reads a copy of its target in the shader, blends there with the
+  GS formula and merges bits; the copy is refreshed when a primitive
+  overlaps what was drawn since the last copy.
+- Downloads and uploads into a target's memory: the targets under the
+  memory are read back into the CPU copy of GS memory, oldest content
+  first (the newest wins where they overlap), then gs.cpp reads it
+  (downloads) or the upload is written and the touched rows are filled back
+  into the targets.
+- Nearest sampling of a target at scale > 1 picks the texel at the GS pixel
+  the sub-pixel belongs to and keeps the sub-pixel's place in it, so 1:1
+  copies through a reinterpreted target stay exact (otherwise sub-pixels on
+  texel edges pick neighbouring 16-bit pixels: grid stripes at scale 3).
+
+**Why:** generic by GS rules; the views keep everything else drawn by
+fixed-function blending (no per-draw destination reads), and read-backs
+are rare (loading screens) so a GPU wait there costs nothing in play.
+
+**Revisit if:** a game draws into a 32-bit target as 16-bit at another
+width or an unaligned base (then views by memory range), read-backs show
+up during play (then a GPU-side memory copy, D40's revisit), or local
+copies (TRXDIR 2) appear.

@@ -18,8 +18,8 @@ struct Draw {
     mxl: f32,
     ta0: f32,
     ta1: f32,
-    pad0: f32,
-    pad1: f32,
+    fbmsk: u32,
+    blend: u32,
 }
 
 const F_TME: u32 = 1u;
@@ -34,11 +34,79 @@ const F_SOURCE16: u32 = 65536u;
 const F_SRC_ONE: u32 = 131072u;
 const F_AEM: u32 = 262144u;
 const F_SOURCE_TARGET: u32 = 524288u;
+const F_MASKED: u32 = 1048576u;
+const F_TARGET16: u32 = 2097152u;
 
 @group(0) @binding(0) var<storage, read> draws: array<Draw>;
 @group(1) @binding(0) var tex: texture_2d<f32>;
 @group(1) @binding(1) var near: sampler;
 @group(1) @binding(2) var lin: sampler;
+// Masked draws: a copy of the target being drawn.
+@group(2) @binding(0) var dest: texture_2d<f32>;
+
+// A target texel as the GS pixel (RGBA8, alpha up to 255) and back; 16-bit pixels from and to it.
+fn pack32(c: vec4<f32>) -> u32 {
+    let rgb = vec3<u32>(clamp(round(c.rgb * 255.0), vec3<f32>(0.0), vec3<f32>(255.0)));
+    let a = u32(clamp(round(c.a * 128.0), 0.0, 255.0));
+    return rgb.r | (rgb.g << 8u) | (rgb.b << 16u) | (a << 24u);
+}
+
+fn unpack32(v: u32) -> vec4<f32> {
+    return vec4<f32>(vec3<f32>(f32(v & 0xFFu), f32((v >> 8u) & 0xFFu), f32((v >> 16u) & 0xFFu)) / 255.0, f32(v >> 24u) / 128.0);
+}
+
+fn to16(v: u32) -> u32 {
+    return ((v >> 3u) & 0x1Fu) | (((v >> 11u) & 0x1Fu) << 5u) | (((v >> 19u) & 0x1Fu) << 10u) | ((v >> 16u) & 0x8000u);
+}
+
+fn from16(h: u32) -> u32 {
+    return ((h & 0x1Fu) << 3u) | (((h >> 5u) & 0x1Fu) << 11u) | (((h >> 10u) & 0x1Fu) << 19u) | ((h & 0x8000u) << 16u);
+}
+
+fn blend_input(sel: u32, cs: vec3<i32>, cd: vec3<i32>) -> vec3<i32> {
+    if (sel == 0u) {
+        return cs;
+    }
+    if (sel == 1u) {
+        return cd;
+    }
+    return vec3<i32>(0);
+}
+
+// FBMSK bits inside a channel: the GS blend and the bit merge done here against the destination copy.
+fn masked(d: Draw, c: vec4<f32>, pos: vec2<f32>) -> vec4<f32> {
+    let target16 = has(d, F_TARGET16);
+    let dv = pack32(textureLoad(dest, vec2<i32>(pos), 0));
+    var dst = dv;
+    if (target16) {
+        dst = from16(to16(dv));
+    }
+    var rgb = vec3<i32>(c.rgb);
+    if ((d.blend & 0x10000u) != 0u) {
+        let cd = vec3<i32>(i32(dst & 0xFFu), i32((dst >> 8u) & 0xFFu), i32((dst >> 16u) & 0xFFu));
+        let csel = (d.blend >> 4u) & 3u;
+        var cc = i32((d.blend >> 8u) & 0xFFu);
+        if (csel == 0u) {
+            cc = i32(c.a);
+        } else if (csel == 1u) {
+            cc = i32(dst >> 24u);
+        }
+        let a = blend_input(d.blend & 3u, rgb, cd);
+        let b = blend_input((d.blend >> 2u) & 3u, rgb, cd);
+        let e = blend_input((d.blend >> 6u) & 3u, rgb, cd);
+        rgb = clamp((((a - b) * cc) >> vec3<u32>(7u)) + e, vec3<i32>(0), vec3<i32>(255));
+    }
+    var alpha = u32(c.a);
+    if (has(d, F_FBA)) {
+        alpha = alpha | 0x80u;
+    }
+    let src = u32(rgb.r) | (u32(rgb.g) << 8u) | (u32(rgb.b) << 16u) | (alpha << 24u);
+    if (target16) {
+        let m = to16(d.fbmsk);
+        return unpack32(from16((to16(src) & ~m) | (to16(dv) & m)));
+    }
+    return unpack32((src & ~d.fbmsk) | (dv & d.fbmsk));
+}
 
 struct VertexIn {
     @location(0) pos: vec3<f32>,
@@ -75,7 +143,7 @@ fn field(d: Draw, shift: u32, bits: u32) -> u32 {
     return (d.flags >> shift) & ((1u << bits) - 1u);
 }
 
-fn texel(d: Draw, stq: vec3<f32>) -> vec4<f32> {
+fn texel(d: Draw, stq: vec3<f32>, pos: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>) -> vec4<f32> {
     let st = stq.xy / stq.z;
     var t = st * d.tex_size;
     if (has(d, F_REPEAT_U)) {
@@ -84,7 +152,7 @@ fn texel(d: Draw, stq: vec3<f32>) -> vec4<f32> {
     if (has(d, F_REPEAT_V)) {
         t.y = t.y - floor(t.y / d.tex_size.y) * d.tex_size.y;
     }
-    let uv = t / d.store_size;
+    var uv = t / d.store_size;
     var lod = d.lod_k;
     if (!has(d, F_LCM)) {
         lod = log2(1.0 / abs(stq.z)) * d.lod_l + d.lod_k;
@@ -100,6 +168,20 @@ fn texel(d: Draw, stq: vec3<f32>) -> vec4<f32> {
                 level = floor(level + 0.5);
             }
         }
+    }
+    if (has(d, F_SOURCE_TARGET) && !linear) {
+        // Nearest from a scaled target, as the GS does it: the texel is picked at the GS pixel this sub-pixel
+        // belongs to and the sub-pixel keeps its place in it (1:1 copies through a reinterpreted target stay exact).
+        let p = pos - 0.5;
+        let sub = p - floor(p / SCALE) * SCALE;
+        var g = (stq.xy / stq.z - dx * sub.x - dy * sub.y) * d.tex_size;
+        if (has(d, F_REPEAT_U)) {
+            g.x = g.x - floor(g.x / d.tex_size.x) * d.tex_size.x;
+        }
+        if (has(d, F_REPEAT_V)) {
+            g.y = g.y - floor(g.y / d.tex_size.y) * d.tex_size.y;
+        }
+        uv = (floor(g) * SCALE + sub + 0.5) / (d.store_size * SCALE);
     }
     var c: vec4<f32>;
     if (linear) {
@@ -133,9 +215,12 @@ struct FragmentOut {
 @fragment
 fn fs(in: VertexOut) -> FragmentOut {
     let d = draws[in.draw];
+    let st = in.stq.xy / in.stq.z;
+    let st_dx = dpdx(st);
+    let st_dy = dpdy(st);
     var c = floor(in.color);
     if (has(d, F_TME)) {
-        let t = floor(texel(d, in.stq));
+        let t = floor(texel(d, in.stq, in.position.xy, st_dx, st_dy));
         let tcc = has(d, F_TCC);
         switch field(d, 2u, 2u) {
             case 0u {
@@ -168,11 +253,16 @@ fn fs(in: VertexOut) -> FragmentOut {
             discard;
         }
     }
+    var o: FragmentOut;
+    if (has(d, F_MASKED)) {
+        o.color = masked(d, c, in.position.xy);
+        o.blend = vec4<f32>(0.0);
+        return o;
+    }
     var written = c.a;
     if (has(d, F_FBA) && written < 128.0) {
         written = written + 128.0;
     }
-    var o: FragmentOut;
     o.color = vec4<f32>(select(c.rgb / 255.0, vec3<f32>(1.0), has(d, F_SRC_ONE)), written / 128.0);
     o.blend = vec4<f32>(0.0, 0.0, 0.0, c.a / 128.0);
     return o;
@@ -226,6 +316,64 @@ fn fs_display(in: FullOut) -> @location(0) vec4<f32> {
         rgb = floor(rgb / 8.0) * 8.0;
     }
     return vec4<f32>(rgb / 255.0, 1.0);
+}
+
+// Format conversions between a 32-bit target and its 16-bit view, per GS pixel (sub-pixels at scale kept).
+// draws[i].flags = 0 CT16 / 1 CT16S, tex_size.y = the view's first page row in the 32-bit target.
+struct ConvertOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) @interpolate(flat) draw: u32,
+}
+
+@vertex
+fn vs_convert(@builtin(vertex_index) i: u32, @builtin(instance_index) n: u32) -> ConvertOut {
+    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    var o: ConvertOut;
+    o.position = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+    o.draw = n;
+    return o;
+}
+
+@group(1) @binding(0) var convert_src: texture_2d<f32>;
+@group(1) @binding(1) var<storage, read> lut: array<u32>;
+
+@fragment
+fn fs_to16(in: ConvertOut) -> @location(0) vec4<f32> {
+    let d = draws[in.draw];
+    let s = u32(SCALE);
+    let p = vec2<u32>(in.position.xy);
+    let g = p / s;
+    let e = lut[d.flags * 4096u + (g.y & 63u) * 64u + (g.x & 63u)];
+    let at = vec2<u32>((g.x & ~63u) + (e & 0xFFu), (u32(d.tex_size.y) + g.y / 64u) * 32u + ((e >> 8u) & 0xFFu));
+    let v = pack32(textureLoad(convert_src, at * s + p % s, 0));
+    return unpack32(from16(select(v & 0xFFFFu, v >> 16u, (e >> 16u) != 0u)));
+}
+
+@fragment
+fn fs_to32(in: ConvertOut) -> @location(0) vec4<f32> {
+    let d = draws[in.draw];
+    let s = u32(SCALE);
+    let p = vec2<u32>(in.position.xy);
+    let g = p / s;
+    let e = lut[8192u + d.flags * 2048u + (g.y & 31u) * 64u + (g.x & 63u)];
+    let base = vec2<u32>(g.x & ~63u, (g.y / 32u - u32(d.tex_size.y)) * 64u);
+    let lo = base + vec2<u32>(e & 63u, (e >> 6u) & 63u);
+    let hi = base + vec2<u32>((e >> 16u) & 63u, (e >> 22u) & 63u);
+    let sub = p % s;
+    return unpack32(to16(pack32(textureLoad(convert_src, lo * s + sub, 0))) | (to16(pack32(textureLoad(convert_src, hi * s + sub, 0))) << 16u));
+}
+
+// A target as GS pixels (1x) for read-backs into GS memory.
+@group(0) @binding(0) var packed_src: texture_2d<f32>;
+
+@fragment
+fn fs_pack32(in: FullOut) -> @location(0) u32 {
+    return pack32(textureLoad(packed_src, vec2<u32>(in.position.xy) * u32(SCALE), 0));
+}
+
+@fragment
+fn fs_pack16(in: FullOut) -> @location(0) u32 {
+    return to16(pack32(textureLoad(packed_src, vec2<u32>(in.position.xy) * u32(SCALE), 0)));
 }
 
 @group(0) @binding(0) var picture: texture_2d<f32>;

@@ -16,7 +16,7 @@ void reset();
 void draw(const gs::State &s, const gs::Vertex *v, int count);
 void image_begin(const gs::State &s);
 void image_data(const std::uint8_t *data, std::size_t bytes);
-// Local copies and downloads (TRXDIR 2 and 1): not done yet, counted.
+// Downloads (TRXDIR 1): targets under the source go into GS memory for gs.cpp to read. Local copies (2): counted.
 void transfer(std::uint32_t dir);
 void load_clut(std::uint64_t tex0, std::uint64_t texclut);
 void flush();

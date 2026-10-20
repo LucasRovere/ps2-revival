@@ -53,12 +53,17 @@ bool g_packs = false;
 WGPUShaderModule g_module = nullptr;
 WGPUBindGroupLayout g_params_layout = nullptr, g_texture_layout = nullptr;
 WGPUPipelineLayout g_draw_layout = nullptr;
+WGPUBindGroupLayout g_dest_layout = nullptr, g_convert_layout = nullptr;
+WGPUPipelineLayout g_convert_pipeline_layout = nullptr;
 WGPURenderPipeline g_init_pipeline = nullptr, g_display_pipeline = nullptr, g_blit_pipeline = nullptr;
+WGPURenderPipeline g_to16_pipeline = nullptr, g_to32_pipeline = nullptr, g_pack16_pipeline = nullptr, g_pack32_pipeline = nullptr;
+WGPUBuffer g_lut = nullptr;
 WGPUSampler g_near[4] = {}, g_lin[4] = {}, g_smooth = nullptr;
 std::map<std::uint32_t, WGPURenderPipeline> g_pipelines;
 
 // Counters for the exit line.
 std::uint64_t g_prims = 0, g_triangles = 0, g_sprites = 0, g_skipped[8] = {}, g_decoded = 0, g_replaced = 0, g_flushes = 0;
+std::uint64_t g_conversions = 0, g_read_backs = 0, g_masked = 0;
 std::map<std::string, std::uint64_t> g_missing;
 
 void missing(const std::string &what) {
@@ -70,10 +75,18 @@ struct Target {
     WGPUTexture tex = nullptr;
     WGPUTextureView view = nullptr;
     std::uint32_t version = 0;
+    std::uint64_t stamp = 0;  // when its content last changed (g_stamp): overlapping targets read back oldest first
     WGPUTexture copy = nullptr;
     WGPUTextureView copy_view = nullptr;
     std::uint32_t copy_version = ~0u;
-    WGPUBindGroup group = nullptr, copy_group = nullptr;
+    WGPUBindGroup group = nullptr, copy_group = nullptr, dest_group = nullptr;
+    // GS pixels drawn since the copy was made (x0, y0, x1, y1).
+    std::int32_t dirty[4] = {0, 0, 0, 0};
+    // A 16-bit view of a 32-bit target's memory (same width, from page row prow): drawn and read as its own
+    // texture, converted from the parent before use and back into it before the parent's next use.
+    Target *parent = nullptr;
+    std::uint32_t prow = 0, synced = ~0u;
+    bool ahead = false;
     bool sixteen() const { return (psm & 0xFu) == 2u || (psm & 0xFu) == 0xAu; }
     std::uint32_t bytes() const { return (fbw * 64u) * ((height + 63u) & ~63u) * (sixteen() ? 2u : 4u); }
 };
@@ -92,10 +105,11 @@ struct Texture {
 };
 
 std::unordered_map<std::uint32_t, Target> g_targets;
+std::uint64_t g_stamp = 0;
 std::unordered_map<std::uint64_t, Depth> g_depths;
 std::unordered_map<std::uint64_t, Texture> g_textures;
 std::uint64_t g_texture_clock = 0;
-WGPUBindGroup g_blank_group = nullptr;
+WGPUBindGroup g_blank_group = nullptr, g_blank_dest_group = nullptr;
 
 // Kept alive until the commands that use them are submitted.
 std::vector<WGPUTexture> g_dead_textures;
@@ -112,23 +126,26 @@ struct NVertex {
 struct Params {
     float target[2], scale;
     std::uint32_t flags;
-    float tex_size[2], store_size[2], aref, lod_l, lod_k, mxl, ta0, ta1, pad[2];
+    float tex_size[2], store_size[2], aref, lod_l, lod_k, mxl, ta0, ta1;
+    // Masked draws: FBMSK (plus channels the draw does not write) and ALPHA | FIX << 8 | blend on << 16.
+    std::uint32_t fbmsk, blend;
     bool operator==(const Params &) const = default;
 };
 
 enum : std::uint32_t {
     F_TME = 1u, F_TCC = 2u, F_ATE = 16u, F_FBA = 256u, F_MAG_LINEAR = 512u, F_LCM = 8192u, F_REPEAT_U = 16384u,
     F_REPEAT_V = 32768u, F_SOURCE16 = 65536u, F_SRC_ONE = 131072u, F_AEM = 262144u, F_SOURCE_TARGET = 524288u,
+    F_MASKED = 1048576u, F_TARGET16 = 2097152u,
 };
 
-enum class OpKind { pass, draw, copy, init };
+enum class OpKind { pass, draw, copy, init, convert };
 
 struct Op {
     OpKind kind;
     WGPUTextureView color = nullptr, depth = nullptr;
     bool clear_depth = false;
     WGPURenderPipeline pipeline = nullptr;
-    WGPUBindGroup group = nullptr;
+    WGPUBindGroup group = nullptr, dest = nullptr;
     std::uint32_t first = 0, count = 0, param = 0;
     std::uint32_t scissor[4] = {};
     float fix = 0.0f;
@@ -155,6 +172,8 @@ struct Upload {
     std::uint32_t bp = 0, bw = 0, psm = 0, x = 0, y = 0, w = 0, h = 0;
     std::size_t expected = 0;
     std::vector<std::uint8_t> bytes;
+    std::uint32_t lo = 0, hi = 0;
+    std::vector<Target *> targets;  // targets whose memory it writes: read back first, refilled after
 } g_upload;
 
 // Draw state rebuilt when a GS register other than a vertex register changes (gs::g_setup_generation).
@@ -177,7 +196,8 @@ struct Current {
     Target *target = nullptr;
     Depth *depth = nullptr;
     WGPURenderPipeline pipeline = nullptr;
-    WGPUBindGroup group = nullptr;
+    WGPUBindGroup group = nullptr, dest = nullptr;
+    bool masked = false;
     Params params{};
     std::uint32_t param = ~0u;
     std::uint32_t scissor[4] = {};
@@ -332,6 +352,26 @@ void load_tables() {
     off4 = t;
 }
 
+// Where 16-bit pixels sit in 32-bit ones within a page (CT16, then CT16S): 4096 entries per format
+// for a 64x64 16-bit page (32-bit pixel x | y << 8 | upper half << 16), then 2048 per format for a 64x32
+// 32-bit page (the 16-bit pixels in its lower and upper half, x | y << 6 each, upper << 16).
+WGPUBuffer make_lut() {
+    using namespace swz;
+    std::vector<std::uint32_t> lut(2 * 4096 + 2 * 2048, 0), at32(2048);
+    for (std::uint32_t i = 0; i < 2048; ++i) at32[off32[i] / 4] = i;
+    for (std::uint32_t f = 0; f < 2; ++f) {
+        const std::uint32_t *o16 = f ? off16s : off16;
+        for (std::uint32_t i = 0; i < 4096; ++i) {
+            const std::uint32_t p = at32[o16[i] / 4], upper = (o16[i] >> 1) & 1u;
+            lut[f * 4096 + i] = (p & 63u) | ((p >> 6) << 8) | (upper << 16);
+            lut[8192 + f * 2048 + p] |= i << (upper * 16);
+        }
+    }
+    WGPUBuffer b = make_buffer(lut.size() * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+    wgpuQueueWriteBuffer(g_queue, b, 0, lut.data(), lut.size() * 4);
+    return b;
+}
+
 // One row of an image transfer into GS memory (page widths and heights are powers of two).
 template <std::uint32_t Bits>
 void write_row(std::uint8_t *mem, const std::uint8_t *d, std::size_t bit, const std::uint32_t *trow, std::uint32_t base, std::uint32_t x0, std::uint32_t w, std::uint32_t pws) {
@@ -435,6 +475,10 @@ void read_clut(std::uint64_t tex0, std::uint64_t texclut) {
 
 // ---- Render targets ----
 
+void submit_ops();
+void submit_commands(WGPUCommandEncoder enc);
+void read_pixels(WGPUTexture tex, std::uint32_t width, std::uint32_t height, std::vector<std::uint32_t> &out);
+
 std::uint32_t target_key(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm) { return fbp | (fbw << 9) | (psm << 15); }
 
 Target *find_target(std::uint32_t fbp, std::uint32_t psm) {
@@ -453,6 +497,15 @@ const Target *target_under(std::uint32_t lo, std::uint32_t hi) {
     return nullptr;
 }
 
+// Targets over [lo, hi) of GS memory, oldest content first: read back in this order, the newest wins.
+std::vector<Target *> targets_under(std::uint32_t lo, std::uint32_t hi) {
+    std::vector<Target *> out;
+    for (auto &[key, t] : g_targets)
+        if (t.tex && lo < t.fbp * 8192u + t.bytes() && t.fbp * 8192u < hi) out.push_back(&t);
+    std::sort(out.begin(), out.end(), [](const Target *a, const Target *b) { return a->stamp < b->stamp; });
+    return out;
+}
+
 void drop_texture(WGPUTexture &t, WGPUTextureView &v) {
     if (t) g_dead_textures.push_back(t);
     if (v) g_dead_views.push_back(v);
@@ -467,11 +520,11 @@ void drop_group(WGPUBindGroup &g) {
 
 void end_pass() { g_pass_target = nullptr, g_pass_depth = nullptr; }
 
-// New target texture: GS memory's content there is drawn into it first (state loads, partial redraws).
-void fill_target(Target &t, std::uint32_t from_row) {
+// GS memory's content drawn into rows [from_row, to_row) of a target (new targets, state loads, uploads).
+void fill_target(Target &t, std::uint32_t from_row, std::uint32_t to_row) {
     const std::uint32_t w = t.width, h = t.height;
     std::vector<std::uint32_t> rgba(static_cast<std::size_t>(w) * h);
-    for (std::uint32_t y = 0; y < h; ++y)
+    for (std::uint32_t y = from_row; y < to_row; ++y)
         for (std::uint32_t x = 0; x < w; ++x) {
             std::uint32_t c = gs::read_pixel(t.psm, t.fbp * 32u, t.fbw, x, y);
             if (t.sixteen()) c = expand16(c, 0, 0x80, false);
@@ -494,6 +547,7 @@ void fill_target(Target &t, std::uint32_t from_row) {
     wgpuBindGroupLayoutRelease(layout);
     op.color = t.view;
     op.scissor[1] = from_row * g_scale;
+    op.scissor[3] = to_row * g_scale;
     op.width = w * g_scale;
     op.height = t.height * g_scale;
     g_ops.push_back(op);
@@ -503,9 +557,82 @@ void fill_target(Target &t, std::uint32_t from_row) {
     end_pass();
 }
 
+// ---- Format reinterpretation: 16-bit views of 32-bit targets ----
+
+// One conversion pass over the page rows a view shares with its parent (lookup tables from the GS swizzles).
+void push_convert(Target &v, bool into_view) {
+    Target &p = *v.parent;
+    const std::uint32_t rows = std::min(p.height / 32u > v.prow ? p.height / 32u - v.prow : 0u, v.height / 64u);
+    if (!rows) return;
+    Params q{};
+    q.flags = v.psm == gs::PSMCT16S ? 1u : 0u;
+    q.tex_size[1] = static_cast<float>(v.prow);
+    g_params.push_back(q);
+    WGPUBindGroupEntry e[2] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+    e[0].binding = 0;
+    e[0].textureView = into_view ? p.view : v.view;
+    e[1].binding = 1;
+    e[1].buffer = g_lut;
+    e[1].size = WGPU_WHOLE_SIZE;
+    WGPUBindGroupDescriptor d = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+    d.layout = g_convert_layout;
+    d.entryCount = 2;
+    d.entries = e;
+    Op op{OpKind::convert};
+    op.pipeline = into_view ? g_to16_pipeline : g_to32_pipeline;
+    op.group = wgpuDeviceCreateBindGroup(g_device, &d);
+    g_dead_groups.push_back(op.group);
+    op.color = into_view ? v.view : p.view;
+    op.param = static_cast<std::uint32_t>(g_params.size() - 1);
+    op.scissor[1] = into_view ? 0u : v.prow * 32u * g_scale;
+    op.scissor[2] = v.width * g_scale;
+    op.scissor[3] = rows * (into_view ? 64u : 32u) * g_scale;
+    g_ops.push_back(op);
+    end_pass();
+    (into_view ? v : p).stamp = ++g_stamp;
+    ++g_conversions;
+}
+
+void write_back(Target &p, const Target *except) {
+    for (auto &[key, v] : g_targets)
+        if (v.parent == &p && v.ahead && &v != except) {
+            push_convert(v, false);
+            v.ahead = false;
+            v.synced = ++p.version;
+        }
+}
+
+// Before a target is drawn, read, shown or read back: views drawn since go into their parent first,
+// and a view gets the parent's content when the parent changed.
+void resolve(Target &t) {
+    if (!t.parent) {
+        write_back(t, nullptr);
+        return;
+    }
+    write_back(*t.parent, &t);
+    if (!t.ahead && t.synced != t.parent->version) {
+        push_convert(t, true);
+        t.synced = t.parent->version;
+        ++t.version;
+    }
+}
+
+// The 32-bit target (CT32/CT24, same width) whose memory a 16-bit frame or texture at fbp lies in, from a page row.
+Target *parent_of(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm) {
+    if ((psm != gs::PSMCT16 && psm != gs::PSMCT16S) || !fbw) return nullptr;
+    for (auto &[key, p] : g_targets)
+        if (p.tex && (p.psm & ~1u) == 0 && p.fbw == fbw && fbp >= p.fbp && (fbp - p.fbp) % fbw == 0 && (fbp - p.fbp) / fbw < p.height / 32u) return &p;
+    return nullptr;
+}
+
 void make_target_texture(Target &t, std::uint32_t height) {
     const WGPUTexture old = t.tex;
     const std::uint32_t old_height = t.height;
+    if (t.parent && t.ahead) {
+        push_convert(t, false);
+        t.ahead = false;
+        ++t.parent->version;
+    }
     WGPUTexture tex = make_texture(t.width * g_scale, height * g_scale, kColor,
                                    WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopySrc | WGPUTextureUsage_CopyDst);
     if (old) {
@@ -521,11 +648,13 @@ void make_target_texture(Target &t, std::uint32_t height) {
     drop_texture(t.copy, t.copy_view);
     drop_group(t.group);
     drop_group(t.copy_group);
+    drop_group(t.dest_group);
     t.copy_version = ~0u;
     t.tex = tex;
     t.view = make_view(tex);
     t.height = height;
-    fill_target(t, old ? old_height : 0);
+    if (t.parent) t.synced = ~0u;
+    else fill_target(t, old ? old_height : 0, height);
     ++t.version;
 }
 
@@ -536,15 +665,91 @@ Target &target_for(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm) {
         t.fbw = fbw;
         t.psm = psm;
         t.width = fbw * 64u;
+        if ((t.parent = parent_of(fbp, fbw, psm))) t.prow = (fbp - t.parent->fbp) / fbw;
     }
     return t;
 }
 
 void ensure_height(Target &t, std::uint32_t rows) {
-    rows = std::min<std::uint32_t>((rows + 31u) & ~31u, 2048u);
+    const std::uint32_t align = t.parent ? 63u : 31u;  // views convert whole 16-bit page rows
+    rows = std::min<std::uint32_t>((rows + align) & ~align, 2048u);
     if (t.tex && rows <= t.height) return;
     make_target_texture(t, std::max(rows, t.height));
     g_cur.valid = false;
+}
+
+// t.copy = t as drawn so far (textures read from the target being drawn, masked draws' destination).
+void copy_target(Target &t) {
+    if (!t.copy) {
+        t.copy = make_texture(t.width * g_scale, t.height * g_scale, kColor, WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst);
+        t.copy_view = make_view(t.copy);
+    }
+    Op op{OpKind::copy};
+    op.src = t.tex;
+    op.dst = t.copy;
+    op.width = t.width * g_scale;
+    op.height = t.height * g_scale;
+    g_ops.push_back(op);
+    end_pass();
+    t.copy_version = t.version;
+    std::memset(t.dirty, 0, sizeof t.dirty);
+}
+
+WGPUBindGroup dest_group(Target &t) {
+    if (!t.dest_group) {
+        WGPUBindGroupEntry e = WGPU_BIND_GROUP_ENTRY_INIT;
+        e.binding = 0;
+        e.textureView = t.copy_view;
+        WGPUBindGroupDescriptor d = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+        d.layout = g_dest_layout;
+        d.entryCount = 1;
+        d.entries = &e;
+        t.dest_group = wgpuDeviceCreateBindGroup(g_device, &d);
+    }
+    return t.dest_group;
+}
+
+// Writes a target's pixels into the CPU copy of GS memory (downloads, uploads into its memory).
+void read_back(Target &t) {
+    resolve(t);
+    submit_ops();
+    WGPUTexture packed = make_texture(t.width, t.height, WGPUTextureFormat_R32Uint, WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc);
+    WGPUTextureView packed_view = make_view(packed);
+    const WGPURenderPipeline pipe = t.sixteen() ? g_pack16_pipeline : g_pack32_pipeline;
+    WGPUBindGroupEntry e = WGPU_BIND_GROUP_ENTRY_INIT;
+    e.binding = 0;
+    e.textureView = t.view;
+    WGPUBindGroupLayout layout = wgpuRenderPipelineGetBindGroupLayout(pipe, 0);
+    WGPUBindGroupDescriptor d = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+    d.layout = layout;
+    d.entryCount = 1;
+    d.entries = &e;
+    WGPUBindGroup group = wgpuDeviceCreateBindGroup(g_device, &d);
+    wgpuBindGroupLayoutRelease(layout);
+    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
+    WGPURenderPassColorAttachment ca = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+    ca.view = packed_view;
+    ca.loadOp = WGPULoadOp_Clear;
+    ca.storeOp = WGPUStoreOp_Store;
+    WGPURenderPassDescriptor pd = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+    pd.colorAttachmentCount = 1;
+    pd.colorAttachments = &ca;
+    WGPURenderPassEncoder p = wgpuCommandEncoderBeginRenderPass(enc, &pd);
+    wgpuRenderPassEncoderSetPipeline(p, pipe);
+    wgpuRenderPassEncoderSetBindGroup(p, 0, group, 0, nullptr);
+    wgpuRenderPassEncoderDraw(p, 3, 1, 0, 0);
+    wgpuRenderPassEncoderEnd(p);
+    wgpuRenderPassEncoderRelease(p);
+    submit_commands(enc);
+    std::vector<std::uint32_t> pixels;
+    read_pixels(packed, t.width, t.height, pixels);
+    for (std::uint32_t y = 0; y < t.height; ++y)
+        for (std::uint32_t x = 0; x < t.width; ++x) gs::write_pixel(t.psm, t.fbp * 32u, t.fbw, x, y, pixels[static_cast<std::size_t>(y) * t.width + x]);
+    for_pages(t.fbp * 32u, t.fbw, t.psm, 0, 0, t.width, t.height, [](std::uint32_t pg) { ++g_page_gen[pg]; });
+    wgpuBindGroupRelease(group);
+    wgpuTextureViewRelease(packed_view);
+    wgpuTextureRelease(packed);
+    ++g_read_backs;
 }
 
 Depth &depth_for(std::uint32_t zbp, const Target &t) {
@@ -633,21 +838,9 @@ std::uint32_t level_bp(const gs::Context &c, std::uint32_t l, std::uint32_t &bw)
 
 // Texture from a render target drawn earlier: same base pointer and format class.
 bool target_source(Target &t, const Target *drawing, Source &out) {
+    resolve(t);
     if (&t == drawing) {
-        if (t.copy_version != t.version) {
-            if (!t.copy) {
-                t.copy = make_texture(t.width * g_scale, t.height * g_scale, kColor, WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst);
-                t.copy_view = make_view(t.copy);
-            }
-            Op op{OpKind::copy};
-            op.src = t.tex;
-            op.dst = t.copy;
-            op.width = t.width * g_scale;
-            op.height = t.height * g_scale;
-            g_ops.push_back(op);
-            end_pass();
-            t.copy_version = t.version;
-        }
+        if (t.copy_version != t.version) copy_target(t);
         if (!t.copy_group) t.copy_group = texture_group(t.copy_view, 3);
         out.group = t.copy_group;
     } else {
@@ -665,8 +858,15 @@ bool texture_source(const State &st, const gs::Context &c, const Target *drawing
     const std::uint32_t psm = static_cast<std::uint32_t>(c.tex0 >> 20) & 0x3Fu;
     const std::uint32_t tw = std::min<std::uint32_t>(static_cast<std::uint32_t>(c.tex0 >> 26) & 0xFu, 10u);
     const std::uint32_t th = std::min<std::uint32_t>(static_cast<std::uint32_t>(c.tex0 >> 30) & 0xFu, 10u);
-    if (tbp % 32u == 0)
+    if (tbp % 32u == 0) {
         if (Target *t = find_target(tbp / 32u, psm)) return target_source(*t, drawing, out);
+        const std::uint32_t tbw = static_cast<std::uint32_t>(c.tex0 >> 14) & 0x3Fu;
+        if (Target *p = parent_of(tbp / 32u, tbw, psm)) {
+            Target &v = target_for(tbp / 32u, tbw, psm);
+            ensure_height(v, (p->height / 32u - v.prow) * 64u);
+            return target_source(v, drawing, out);
+        }
+    }
     const std::uint32_t lo = tbp * 256u;
     if (const Target *t = target_under(lo, lo + 1)) {
         missing(std::string("texture inside a render target in another format (fbp ") + std::to_string(t->fbp) + ")");
@@ -886,19 +1086,42 @@ WGPURenderPipeline full_pipeline(const char *entry, WGPUTextureFormat format) {
     return wgpuDeviceCreateRenderPipeline(g_device, &d);
 }
 
+WGPURenderPipeline convert_pipeline(const char *entry) {
+    WGPUColorTargetState color = WGPU_COLOR_TARGET_STATE_INIT;
+    color.format = kColor;
+    WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
+    fragment.module = g_module;
+    fragment.entryPoint = view(entry);
+    fragment.targetCount = 1;
+    fragment.targets = &color;
+    WGPUConstantEntry constant = WGPU_CONSTANT_ENTRY_INIT;
+    constant.key = view("SCALE");
+    constant.value = static_cast<double>(g_scale);
+    fragment.constantCount = 1;
+    fragment.constants = &constant;
+    WGPURenderPipelineDescriptor d = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+    d.layout = g_convert_pipeline_layout;
+    d.vertex.module = g_module;
+    d.vertex.entryPoint = view("vs_convert");
+    d.fragment = &fragment;
+    return wgpuDeviceCreateRenderPipeline(g_device, &d);
+}
+
 // ---- Draw state ----
 
 std::uint64_t prim_attr(const State &st) { return (st.prmodecont & 1u) ? st.prim : (st.prim & 7u) | (st.prmode & ~7ull); }
 
-std::uint32_t write_mask(const gs::Context &c, const Target &t) {
+// Channels FBMSK leaves writable; partial when it masks bits inside a channel (then the shader merges bits).
+std::uint32_t write_mask(const gs::Context &c, const Target &t, bool &partial) {
     const std::uint32_t fbmsk = static_cast<std::uint32_t>(c.frame >> 32);
     const std::uint32_t channel[4] = {0xFFu, 0xFF00u, 0xFF0000u, 0xFF000000u};
     const std::uint32_t channel16[4] = {0xF8u, 0xF800u, 0xF80000u, 0x80000000u};
     std::uint32_t mask = 0;
+    partial = false;
     for (int i = 0; i < 4; ++i) {
         const std::uint32_t bits = t.sixteen() ? channel16[i] : channel[i];
         if ((fbmsk & bits) == bits) continue;
-        if (fbmsk & bits) missing("FBMSK bit mask inside a channel");
+        if (fbmsk & bits) partial = true;
         mask |= 1u << i;
     }
     return mask;
@@ -926,6 +1149,7 @@ void rebuild(const State &st, std::uint64_t attr) {
     const std::int32_t scay0 = static_cast<std::int32_t>((c.scissor >> 32) & 0x7FFu), scay1 = static_cast<std::int32_t>((c.scissor >> 48) & 0x7FFu);
     cur.scissor_y1 = scay1;
     if (!t.tex) ensure_height(t, std::min<std::uint32_t>(static_cast<std::uint32_t>(scay1) + 1, 512u));
+    resolve(t);
     cur.target = &t;
     cur.ofx = static_cast<float>(c.xyoffset & 0xFFFFu);
     cur.ofy = static_cast<float>((c.xyoffset >> 32) & 0xFFFFu);
@@ -942,7 +1166,8 @@ void rebuild(const State &st, std::uint64_t attr) {
     const bool ate = test & 1u, zte = (test >> 16) & 1u;
     const std::uint32_t atst = static_cast<std::uint32_t>(test >> 1) & 7u, afail = static_cast<std::uint32_t>(test >> 12) & 3u;
     const std::uint32_t ztst = static_cast<std::uint32_t>(test >> 17) & 3u;
-    std::uint32_t mask = write_mask(c, t);
+    bool partial = false;
+    std::uint32_t mask = write_mask(c, t, partial);
     bool zwrite = zte && !((c.zbuf >> 32) & 1u) && ztst != 0;
     std::uint32_t flags = 0;
     if (ate && atst == 0) {
@@ -963,19 +1188,33 @@ void rebuild(const State &st, std::uint64_t attr) {
     if (!(st.colclamp & 1u)) missing("COLCLAMP off");
 
     const bool abe = (attr & 0x40u) != 0;
-    const std::uint32_t alpha = static_cast<std::uint32_t>(c.alpha) & 0xFFu;
+    const std::uint32_t alpha = static_cast<std::uint32_t>(c.alpha) & 0xFFu, fix = static_cast<std::uint32_t>(c.alpha >> 32) & 0xFFu;
     bool src_one = false;
-    if (abe) {
+    if (abe && !partial) {
         WGPUBlendComponent unused;
         if (!blend_state(alpha, unused, src_one)) missing("blend equation " + std::to_string(alpha));
     }
     if (src_one) flags |= F_SRC_ONE;
     const std::uint32_t depth_mode = zte ? ztst + 1 : 0;
-    cur.pipeline = pipeline((abe ? (alpha | 0x100u) : 0u) | (mask << 9) | (depth_mode << 13) | (zwrite ? 1u << 16 : 0u));
-    cur.fix = static_cast<float>(static_cast<std::uint32_t>(c.alpha >> 32) & 0xFFu) / 128.0f;
-
     Params &p = cur.params;
     p = Params{};
+    cur.masked = partial && mask != 0;
+    cur.dest = g_blank_dest_group;
+    if (cur.masked) {
+        // Bits masked inside a channel: the shader reads the destination (a copy), blends and merges bits.
+        p.fbmsk = static_cast<std::uint32_t>(c.frame >> 32);
+        for (std::uint32_t i = 0; i < 4; ++i)
+            if (!(mask & (1u << i))) p.fbmsk |= 0xFFu << (8 * i);
+        p.blend = abe ? alpha | (fix << 8) | 0x10000u : 0u;
+        flags |= F_MASKED | (t.sixteen() ? F_TARGET16 : 0u);
+        if (t.copy_version != t.version) copy_target(t);
+        cur.dest = dest_group(t);
+        cur.pipeline = pipeline((0xFu << 9) | (depth_mode << 13) | (zwrite ? 1u << 16 : 0u));
+    } else {
+        cur.pipeline = pipeline((abe ? (alpha | 0x100u) : 0u) | (mask << 9) | (depth_mode << 13) | (zwrite ? 1u << 16 : 0u));
+    }
+    cur.fix = static_cast<float>(fix) / 128.0f;
+
     p.target[0] = static_cast<float>(t.width * g_scale);
     p.target[1] = static_cast<float>(t.height * g_scale);
     p.scale = static_cast<float>(g_scale);
@@ -1052,9 +1291,13 @@ NVertex make_vertex(const Vertex &v, const Vertex &color) {
     return o;
 }
 
-void add_vertices(const NVertex *v, std::uint32_t n) {
+void add_vertices(const NVertex *v, std::uint32_t n, const std::int32_t *box) {
     Current &cur = g_cur;
     Target &t = *cur.target;
+    if (t.dirty[2] <= t.dirty[0]) std::memcpy(t.dirty, box, sizeof t.dirty);
+    else t.dirty[0] = std::min(t.dirty[0], box[0]), t.dirty[1] = std::min(t.dirty[1], box[1]), t.dirty[2] = std::max(t.dirty[2], box[2]), t.dirty[3] = std::max(t.dirty[3], box[3]);
+    if (t.parent) t.ahead = true;
+    t.stamp = ++g_stamp;
     if (g_pass_target != &t || g_pass_depth != cur.depth) {
         Op op{OpKind::pass};
         op.color = t.view;
@@ -1068,7 +1311,7 @@ void add_vertices(const NVertex *v, std::uint32_t n) {
     const std::uint32_t first = static_cast<std::uint32_t>(g_vertices.size());
     g_vertices.insert(g_vertices.end(), v, v + n);
     Op &last = g_ops.back();
-    if (last.kind == OpKind::draw && last.pipeline == cur.pipeline && last.group == cur.group && last.fix == cur.fix &&
+    if (last.kind == OpKind::draw && last.pipeline == cur.pipeline && last.group == cur.group && last.dest == cur.dest && last.fix == cur.fix &&
         std::memcmp(last.scissor, cur.scissor, sizeof cur.scissor) == 0 && last.first + last.count == first) {
         last.count += n;
         return;
@@ -1076,6 +1319,7 @@ void add_vertices(const NVertex *v, std::uint32_t n) {
     Op op{OpKind::draw};
     op.pipeline = cur.pipeline;
     op.group = cur.group;
+    op.dest = cur.dest;
     op.first = first;
     op.count = n;
     op.param = cur.param;
@@ -1117,7 +1361,7 @@ void submit_ops() {
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
     WGPURenderPassEncoder pass = nullptr;
     WGPURenderPipeline bound_pipeline = nullptr;
-    WGPUBindGroup bound_group = nullptr;
+    WGPUBindGroup bound_group = nullptr, bound_dest = nullptr;
     std::uint32_t bound_scissor[4] = {~0u};
     float bound_fix = -1.0f;
     const auto close = [&] {
@@ -1146,6 +1390,7 @@ void submit_ops() {
             pass = wgpuCommandEncoderBeginRenderPass(enc, &pd);
             wgpuRenderPassEncoderSetVertexBuffer(pass, 0, g_vertex_buffer, 0, g_vertex_capacity);
             wgpuRenderPassEncoderSetBindGroup(pass, 0, g_param_group, 0, nullptr);
+            wgpuRenderPassEncoderSetBindGroup(pass, 2, bound_dest = g_blank_dest_group, 0, nullptr);
             bound_pipeline = nullptr;
             bound_group = nullptr;
             bound_scissor[0] = ~0u;
@@ -1156,6 +1401,7 @@ void submit_ops() {
             if (!pass) break;
             if (bound_pipeline != op.pipeline) wgpuRenderPassEncoderSetPipeline(pass, bound_pipeline = op.pipeline);
             if (bound_group != op.group) wgpuRenderPassEncoderSetBindGroup(pass, 1, bound_group = op.group, 0, nullptr);
+            if (bound_dest != op.dest) wgpuRenderPassEncoderSetBindGroup(pass, 2, bound_dest = op.dest, 0, nullptr);
             if (std::memcmp(bound_scissor, op.scissor, sizeof bound_scissor) != 0) {
                 std::memcpy(bound_scissor, op.scissor, sizeof bound_scissor);
                 wgpuRenderPassEncoderSetScissorRect(pass, op.scissor[0], op.scissor[1], op.scissor[2], op.scissor[3]);
@@ -1181,16 +1427,35 @@ void submit_ops() {
             close();
             WGPURenderPassColorAttachment ca = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
             ca.view = op.color;
-            ca.loadOp = op.scissor[1] ? WGPULoadOp_Load : WGPULoadOp_Clear;
+            ca.loadOp = op.scissor[1] || op.scissor[3] < op.height ? WGPULoadOp_Load : WGPULoadOp_Clear;
             ca.storeOp = WGPUStoreOp_Store;
             WGPURenderPassDescriptor pd = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
             pd.colorAttachmentCount = 1;
             pd.colorAttachments = &ca;
             WGPURenderPassEncoder p = wgpuCommandEncoderBeginRenderPass(enc, &pd);
-            wgpuRenderPassEncoderSetViewport(p, 0.0f, static_cast<float>(op.scissor[1]), static_cast<float>(op.width), static_cast<float>(op.height - op.scissor[1]), 0.0f, 1.0f);
+            wgpuRenderPassEncoderSetScissorRect(p, 0, op.scissor[1], op.width, op.scissor[3] - op.scissor[1]);
             wgpuRenderPassEncoderSetPipeline(p, g_init_pipeline);
             wgpuRenderPassEncoderSetBindGroup(p, 0, op.group, 0, nullptr);
             wgpuRenderPassEncoderDraw(p, 3, 1, 0, 0);
+            wgpuRenderPassEncoderEnd(p);
+            wgpuRenderPassEncoderRelease(p);
+            break;
+        }
+        case OpKind::convert: {
+            close();
+            WGPURenderPassColorAttachment ca = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+            ca.view = op.color;
+            ca.loadOp = WGPULoadOp_Load;
+            ca.storeOp = WGPUStoreOp_Store;
+            WGPURenderPassDescriptor pd = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+            pd.colorAttachmentCount = 1;
+            pd.colorAttachments = &ca;
+            WGPURenderPassEncoder p = wgpuCommandEncoderBeginRenderPass(enc, &pd);
+            wgpuRenderPassEncoderSetScissorRect(p, op.scissor[0], op.scissor[1], op.scissor[2], op.scissor[3]);
+            wgpuRenderPassEncoderSetPipeline(p, op.pipeline);
+            wgpuRenderPassEncoderSetBindGroup(p, 0, g_param_group, 0, nullptr);
+            wgpuRenderPassEncoderSetBindGroup(p, 1, op.group, 0, nullptr);
+            wgpuRenderPassEncoderDraw(p, 3, 1, 0, op.param);
             wgpuRenderPassEncoderEnd(p);
             wgpuRenderPassEncoderRelease(p);
             break;
@@ -1249,6 +1514,7 @@ bool shown_buffer(const gs::DisplayRegs &r, Shown &out) {
         ensure_height(t, out.y + (out.halved ? out.height / 2 : out.height));
         out.target = &t;
     }
+    if (out.target) resolve(*out.target);
     return out.target != nullptr;
 }
 
@@ -1328,6 +1594,39 @@ void pump() {
 #ifndef __EMSCRIPTEN__
     wgpuDevicePoll(g_device, true, nullptr);
 #endif
+}
+
+// A 4-byte-per-texel texture read back to the CPU (waits for the GPU).
+void read_pixels(WGPUTexture tex, std::uint32_t width, std::uint32_t height, std::vector<std::uint32_t> &rgba) {
+    const std::uint32_t row = (width * 4 + 255) & ~255u;
+    const std::uint64_t bytes = static_cast<std::uint64_t>(row) * height;
+    if (bytes > g_readback_size) {
+        if (g_readback) wgpuBufferRelease(g_readback);
+        g_readback = make_buffer(bytes, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
+        g_readback_size = bytes;
+    }
+    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
+    WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+    src.texture = tex;
+    WGPUTexelCopyBufferInfo dst = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
+    dst.buffer = g_readback;
+    dst.layout.bytesPerRow = row;
+    dst.layout.rowsPerImage = height;
+    const WGPUExtent3D size{width, height, 1};
+    wgpuCommandEncoderCopyTextureToBuffer(enc, &src, &dst, &size);
+    submit_commands(enc);
+    bool mapped = false;
+    WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
+    cb.mode = WGPUCallbackMode_AllowProcessEvents;
+    cb.callback = [](WGPUMapAsyncStatus, WGPUStringView, void *flag, void *) { *static_cast<bool *>(flag) = true; };
+    cb.userdata1 = &mapped;
+    wgpuBufferMapAsync(g_readback, WGPUMapMode_Read, 0, bytes, cb);
+    while (!mapped) pump();
+    const auto *p = static_cast<const std::uint8_t *>(wgpuBufferGetConstMappedRange(g_readback, 0, bytes));
+    rgba.resize(static_cast<std::size_t>(width) * height);
+    if (p)
+        for (std::uint32_t y = 0; y < height; ++y) std::memcpy(rgba.data() + static_cast<std::size_t>(y) * width, p + static_cast<std::size_t>(y) * row, width * 4);
+    wgpuBufferUnmap(g_readback);
 }
 
 }
@@ -1420,11 +1719,21 @@ bool init() {
     ld.entryCount = 3;
     ld.entries = te;
     g_texture_layout = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
-    const WGPUBindGroupLayout layouts[2] = {g_params_layout, g_texture_layout};
+    ld.entryCount = 1;
+    g_dest_layout = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
+    const WGPUBindGroupLayout layouts[3] = {g_params_layout, g_texture_layout, g_dest_layout};
     WGPUPipelineLayoutDescriptor pld = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
-    pld.bindGroupLayoutCount = 2;
+    pld.bindGroupLayoutCount = 3;
     pld.bindGroupLayouts = layouts;
     g_draw_layout = wgpuDeviceCreatePipelineLayout(g_device, &pld);
+    te[1].sampler.type = WGPUSamplerBindingType_BindingNotUsed;
+    te[1].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
+    ld.entryCount = 2;
+    g_convert_layout = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
+    const WGPUBindGroupLayout convert_layouts[2] = {g_params_layout, g_convert_layout};
+    pld.bindGroupLayoutCount = 2;
+    pld.bindGroupLayouts = convert_layouts;
+    g_convert_pipeline_layout = wgpuDeviceCreatePipelineLayout(g_device, &pld);
 
     for (std::uint32_t i = 0; i < 4; ++i) {
         WGPUSamplerDescriptor sd = WGPU_SAMPLER_DESCRIPTOR_INIT;
@@ -1447,8 +1756,21 @@ bool init() {
     write_texture(blank, 0, 1, 1, &white);
     WGPUTextureView blank_view = make_view(blank);
     g_blank_group = texture_group(blank_view, 0);
-    if (!g_module || !g_init_pipeline || !g_display_pipeline) return false;
+    WGPUBindGroupEntry be = WGPU_BIND_GROUP_ENTRY_INIT;
+    be.binding = 0;
+    be.textureView = blank_view;
+    WGPUBindGroupDescriptor bd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+    bd.layout = g_dest_layout;
+    bd.entryCount = 1;
+    bd.entries = &be;
+    g_blank_dest_group = wgpuDeviceCreateBindGroup(g_device, &bd);
+    g_to16_pipeline = convert_pipeline("fs_to16");
+    g_to32_pipeline = convert_pipeline("fs_to32");
+    g_pack16_pipeline = full_pipeline("fs_pack16", WGPUTextureFormat_R32Uint);
+    g_pack32_pipeline = full_pipeline("fs_pack32", WGPUTextureFormat_R32Uint);
+    if (!g_module || !g_init_pipeline || !g_display_pipeline || !g_to16_pipeline || !g_to32_pipeline || !g_pack16_pipeline || !g_pack32_pipeline) return false;
     load_tables();
+    g_lut = make_lut();
     g_packs = texpack::init();
     for (std::uint32_t p = 0; p < kPages; ++p) g_page_gen[p] = 1;
     std::fprintf(stderr, "[native] renderer on, scale %u, aspect %.0f:%.0f\n", g_scale, g_aspect_w, g_aspect_h);
@@ -1529,8 +1851,8 @@ void draw(const State &st, const Vertex *v, int) {
         n = 3;
         ++g_triangles;
     }
-    float maxy = out[0].y;
-    for (std::uint32_t i = 1; i < n; ++i) maxy = std::max(maxy, out[i].y);
+    float minx = out[0].x, miny = out[0].y, maxx = out[0].x, maxy = out[0].y;
+    for (std::uint32_t i = 1; i < n; ++i) minx = std::min(minx, out[i].x), miny = std::min(miny, out[i].y), maxx = std::max(maxx, out[i].x), maxy = std::max(maxy, out[i].y);
     const std::int32_t rows = std::min(static_cast<std::int32_t>(std::ceil(maxy)), cur.scissor_y1 + 1);
     if (rows > static_cast<std::int32_t>(cur.target->height)) {
         ensure_height(*cur.target, static_cast<std::uint32_t>(rows));
@@ -1538,8 +1860,16 @@ void draw(const State &st, const Vertex *v, int) {
         if (cur.skip) return;
         for (std::uint32_t i = 0; i < n; ++i) out[i].param = cur.param;
     }
+    const std::int32_t box[4] = {static_cast<std::int32_t>(std::floor(minx)), static_cast<std::int32_t>(std::floor(miny)),
+                                 static_cast<std::int32_t>(std::ceil(maxx)) + 1, static_cast<std::int32_t>(std::ceil(maxy)) + 1};
+    if (cur.masked) {
+        // The destination copy must hold what earlier primitives drew under this one.
+        const std::int32_t *d = cur.target->dirty;
+        if (d[2] > d[0] && box[0] < d[2] && d[0] < box[2] && box[1] < d[3] && d[1] < box[3]) copy_target(*cur.target);
+        ++g_masked;
+    }
     ++g_prims;
-    add_vertices(out, n);
+    add_vertices(out, n, box);
 }
 
 void finish_upload() {
@@ -1547,6 +1877,24 @@ void finish_upload() {
     if (!u.active) return;
     write_upload(u);
     texpack::tag_upload(u.bp, u.bw, u.psm, u.x, u.y, u.w, u.h, u.bytes.data(), u.bytes.size());
+    // Targets under the upload get the rows it touched back from memory; views convert from their parent.
+    for (Target *t : u.targets) {
+        if (t->parent) {
+            t->ahead = false;
+            t->synced = ~0u;
+            continue;
+        }
+        const std::int32_t first = static_cast<std::int32_t>(u.lo / 8192u) - static_cast<std::int32_t>(t->fbp);
+        const std::int32_t last = static_cast<std::int32_t>((u.hi - 1) / 8192u) - static_cast<std::int32_t>(t->fbp);
+        const std::uint32_t ph = t->sixteen() ? 64u : 32u;
+        const std::uint32_t from = static_cast<std::uint32_t>(std::max(first, 0)) / t->fbw * ph;
+        const std::uint32_t to = std::min(static_cast<std::uint32_t>(last / static_cast<std::int32_t>(t->fbw) + 1) * ph, t->height);
+        if (from < to) fill_target(*t, from, to);
+        ++t->version;
+        t->stamp = ++g_stamp;
+    }
+    if (!u.targets.empty()) g_cur.valid = false;
+    u.targets.clear();
     u.active = false;
     u.bytes.clear();
 }
@@ -1570,7 +1918,10 @@ void image_begin(const State &s) {
         lo = std::min(lo, p * 8192u);
         hi = std::max(hi, p * 8192u + 8192u);
     });
-    if (target_under(lo, hi)) missing("upload into a render target's memory");
+    u.lo = lo;
+    u.hi = hi;
+    u.targets = targets_under(lo, hi);
+    for (Target *t : u.targets) read_back(*t);
     u.expected = static_cast<std::size_t>(u.w) * u.h * bits_per_pixel(u.psm) / 8;
     u.active = true;
 }
@@ -1582,7 +1933,24 @@ void image_data(const std::uint8_t *data, std::size_t bytes) {
     if (u.bytes.size() >= u.expected) finish_upload();
 }
 
-void transfer(std::uint32_t dir) { missing(dir == 1 ? "GS downloads (EE reads)" : "local copies"); }
+void transfer(std::uint32_t dir) {
+    if (dir != 1) {
+        missing("local copies");
+        return;
+    }
+    // Download: targets under the source rectangle go into the CPU memory copy, which gs.cpp then reads.
+    finish_upload();
+    const std::uint64_t buf = gs::g_state.bitbltbuf, pos = gs::g_state.trxpos, reg = gs::g_state.trxreg;
+    const std::uint32_t w = static_cast<std::uint32_t>(reg) & 0xFFFu, h = static_cast<std::uint32_t>(reg >> 32) & 0xFFFu;
+    if (!w || !h) return;
+    std::uint32_t lo = ~0u, hi = 0;
+    for_pages(static_cast<std::uint32_t>(buf) & 0x3FFFu, static_cast<std::uint32_t>(buf >> 16) & 0x3Fu, static_cast<std::uint32_t>(buf >> 24) & 0x3Fu,
+              static_cast<std::uint32_t>(pos) & 0x7FFu, static_cast<std::uint32_t>(pos >> 16) & 0x7FFu, w, h, [&](std::uint32_t p) {
+                  lo = std::min(lo, p * 8192u);
+                  hi = std::max(hi, p * 8192u + 8192u);
+              });
+    for (Target *t : targets_under(lo, hi)) read_back(*t);
+}
 
 void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
     finish_upload();
@@ -1599,35 +1967,7 @@ void wait_idle() {
 
 bool display(const gs::DisplayRegs &r, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) {
     if (!render_shown(r, width, height)) return false;
-    const std::uint32_t row = (width * 4 + 255) & ~255u;
-    const std::uint64_t bytes = static_cast<std::uint64_t>(row) * height;
-    if (bytes > g_readback_size) {
-        if (g_readback) wgpuBufferRelease(g_readback);
-        g_readback = make_buffer(bytes, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
-        g_readback_size = bytes;
-    }
-    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
-    WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
-    src.texture = g_shown;
-    WGPUTexelCopyBufferInfo dst = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
-    dst.buffer = g_readback;
-    dst.layout.bytesPerRow = row;
-    dst.layout.rowsPerImage = height;
-    const WGPUExtent3D size{width, height, 1};
-    wgpuCommandEncoderCopyTextureToBuffer(enc, &src, &dst, &size);
-    submit_commands(enc);
-    bool mapped = false;
-    WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
-    cb.mode = WGPUCallbackMode_AllowProcessEvents;
-    cb.callback = [](WGPUMapAsyncStatus, WGPUStringView, void *flag, void *) { *static_cast<bool *>(flag) = true; };
-    cb.userdata1 = &mapped;
-    wgpuBufferMapAsync(g_readback, WGPUMapMode_Read, 0, bytes, cb);
-    while (!mapped) pump();
-    const auto *p = static_cast<const std::uint8_t *>(wgpuBufferGetConstMappedRange(g_readback, 0, bytes));
-    rgba.resize(static_cast<std::size_t>(width) * height);
-    if (p)
-        for (std::uint32_t y = 0; y < height; ++y) std::memcpy(rgba.data() + static_cast<std::size_t>(y) * width, p + static_cast<std::size_t>(y) * row, width * 4);
-    wgpuBufferUnmap(g_readback);
+    read_pixels(g_shown, width, height, rgba);
     return true;
 }
 
@@ -1747,9 +2087,11 @@ void stats(std::uint64_t gs_raster) {
                  static_cast<unsigned long long>(g_skipped[0] + g_skipped[1] + g_skipped[2] + g_skipped[3] + g_skipped[4] + g_skipped[5] + g_skipped[6] + g_skipped[7]),
                  static_cast<unsigned long long>(gs_raster), static_cast<unsigned long long>(g_decoded), static_cast<unsigned long long>(g_replaced), g_targets.size(),
                  static_cast<unsigned long long>(g_flushes));
+    std::fprintf(stderr, "[native] masked primitives %llu, format conversions %llu, target read-backs %llu\n", static_cast<unsigned long long>(g_masked),
+                 static_cast<unsigned long long>(g_conversions), static_cast<unsigned long long>(g_read_backs));
     for (const auto &[what, n] : g_missing) std::fprintf(stderr, "[native] not done yet: %s (%llu times)\n", what.c_str(), static_cast<unsigned long long>(n));
     for (const auto &[key, t] : g_targets)
-        std::fprintf(stderr, "[native] target fbp 0x%X fbw %u psm 0x%X %ux%u\n", t.fbp, t.fbw, t.psm, t.width, t.height);
+        std::fprintf(stderr, "[native] target fbp 0x%X fbw %u psm 0x%X %ux%u%s\n", t.fbp, t.fbw, t.psm, t.width, t.height, t.parent ? " (view of a 32-bit target)" : "");
 }
 
 }

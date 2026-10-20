@@ -2,7 +2,7 @@
 
 Status: **Phases 5–7 and the conversion tool done (except the
 second-game trial); Phase 8 done as far as planned (T36-T48); fully native
-planned (T52, D37, owner review D38); survey and emulation counters done (T56); GS-draw translator first layer done (T57, D40).** Order (owner, D31): fully
+planned (T52, D37, owner review D38); survey and emulation counters done (T56); GS-draw translator first layer done (T57, D40), render targets and effects done (T58, D41).** Order (owner, D31): fully
 native for the pilot game → wrap-up → other games (T40). Phases 6–9 were re-planned (D23, 2026-10-18) around the
 vendored ps2-web-recomp, which already provides most of what the original
 Phases 6 and 7 planned to build. Strategy decisions: D3, D5, D6, D9, D14,

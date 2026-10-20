@@ -612,12 +612,35 @@ and K, or K with LCM), REPEAT and CLAMP. Blending: every
 `Cd * (1 + C)`) as fixed function, with dual-source blending so FBA's
 written alpha and the blend's As differ; alpha test per pixel (fail KEEP)
 and NEVER with RGB_ONLY / FB_ONLY / ZB_ONLY as write masks; Z tests and
-ZMSK; FBMSK per whole channel (FF000000 = no alpha write). Left out, each
-counted as `[native] not done yet: <what> (N times)` at exit: DTHE, fog,
-DATE, PABE, region clamps, FBMSK masks inside a channel, other alpha-test
-fail modes, a target read in another format, local copies and downloads
-(T58). The display is the DISPFB target, read like the GS path's display
+ZMSK; FBMSK per whole channel (FF000000 = no alpha write) as a write mask,
+bits inside a channel in the shader (below). Left out, each counted as
+`[native] not done yet: <what> (N times)` at exit: DTHE, fog, DATE, PABE,
+region clamps, other alpha-test fail modes, a texture inside a target in
+another format that is not a view (below), local copies. The display is
+the DISPFB target of the circuit the GS path shows (circuit 2 if enabled,
+else 1; interlace halving, any size), read like the GS path's display
 (16-bit targets in 5-bit steps); the window blits it with the T32 aspect.
+
+Shared GS memory (T58, D41):
+- **16-bit views.** A CT16/CT16S frame or texture whose base lies in a
+  CT32/CT24 target of the same width, at a page row, is a view of it (exit
+  line: `(view of a 32-bit target)`): its own texture, converted from the
+  parent when the parent changed and written back before the parent's next
+  use, per GS pixel through lookup tables from the GS swizzles (sub-pixels
+  at scale keep their place). So a frame drawn as CT32 and re-read or drawn
+  as CT16 (channel moves between halves) works.
+- **FBMSK bits inside a channel** (the 16-bit packing of the mask, as the
+  GS does it): the draw reads a copy of its target in the shader, blends
+  with the GS formula there and merges the bits; the copy is refreshed when
+  a primitive overlaps what was drawn since the last copy.
+- **Downloads** (TRXDIR 1): the targets under the source are read back
+  into the CPU copy of GS memory (oldest content first, the newest wins),
+  which gs.cpp's download then reads; **uploads into a target's memory**
+  read back the same way, write the upload and fill the touched rows back
+  into the targets. Each read-back waits for the GPU (rare: loading screens).
+- **Nearest sampling of a target at scale > 1** takes the texel at the GS
+  pixel the sub-pixel belongs to, plus the sub-pixel's offset, so 1:1
+  copies stay exact.
 
 Textures come from a CPU copy of GS memory that the translator keeps from
 uploads (no rendered pixels in it) and the CLUT loads (repeated loads with
@@ -668,6 +691,17 @@ ms (1.3), race intro 25.3 (15.5), racing 19.9 (11.8): render-limited below
 frame (draw-state rebuild ~1 µs and a wgpu draw call ~1.3 µs each), ~7 MB
 of uploads per frame copied into the CPU memory (~5 ms), texture decode
 (~1.5 ms); T59 works on it.
+
+Check after T58 (pilot game, scale 1, frames and diff images looked at):
+menu run from boot 107/107 within the bar (mean 1.96, max 4.72 / 3.13%;
+the race-intro start now 1.9-3.2: cars painted, roads lit); race intro mean
+2.2 (max 2.4 / 0.3%), racing 1.9 (2.1 / 0.3%), menu state 1.7 (2.9 / 1.7%);
+scale 3 with the pack: racing 1.6, menus 1.7 against the GS path at scale 3.
+What still differs: one 5-bit step on the 16-bit display, sub-texel edges
+of bilinear full-screen quads (intro movie), DTHE left out. Cycles
+unchanged on and off. Window scale 3, 16:9, pack, render thread busy per
+frame: menus 2.5 ms, race intro 25.9, racing 20.3 (T57: 2.7, 25.3, 19.9;
+GS path 1.3, 15.5, 11.8).
 
 ### Chain handlers (T46)
 

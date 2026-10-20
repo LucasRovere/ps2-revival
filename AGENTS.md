@@ -207,6 +207,7 @@ the same change.
   primitives with WebGPU render pipelines into native targets (rgba16float, dual-source
   blending), textures from a CPU copy of uploads cached by content, packs work;
   `recomp/framediff.py` pixel diff, bar mean ≤ 5 and ≤ 4% over 24: menus/movies within it,
-  races not yet (T58: a frame re-read as 16-bit, downloads); slower than the GS path (T59).
+  races too since T58 (16-bit views of 32-bit targets with FBMSK bit masks in the shader,
+  downloads and uploads through target read-backs); slower than the GS path (T59).
   Owner (D39): decompile only hot spots; one picture per screen refresh (T67).
 - Next up: see [docs/tasks.md](docs/tasks.md). The owner runs tasks with `/next-task`.
