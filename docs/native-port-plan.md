@@ -1,9 +1,9 @@
-# Native port plan (Phases 5–9, conversion tool)
+# Native port plan (Phases 5–9, conversion tool, fully native)
 
 Status: **Phases 5–7 and the conversion tool done (except the
-second-game trial); Phase 8 started (T36, D32).** Order (owner, D31):
-Phase 8 → Phase 9 → fully native for the pilot game → wrap-up → other
-games (T40). Phases 6–9 were re-planned (D23, 2026-10-18) around the
+second-game trial); Phase 8 done as far as planned (T36-T48); fully native
+planned (T52, D37, pending owner review).** Order (owner, D31): fully
+native for the pilot game → wrap-up → other games (T40). Phases 6–9 were re-planned (D23, 2026-10-18) around the
 vendored ps2-web-recomp, which already provides most of what the original
 Phases 6 and 7 planned to build. Strategy decisions: D3, D5, D6, D9, D14,
 D16, D23, D26, D31, D32 in [decisions.md](decisions.md).
@@ -246,16 +246,17 @@ itself. Steps, one session each:
    static meshes, VU1 program path re-implemented on the CPU, primitives
    into the GS renderer, frames compared with the VU path (T46, done:
    byte-identical, little speed gain).
-3. Lit car meshes the same way (T47; may go straight to the GPU path).
+3. Lit car meshes the same way (T47; dropped by T52: cars become a mesh
+   kind of the native renderer, T61).
 4. GPU mesh path: chain vertex data cached on the GPU, compute passes
    build and bin the GS primitives (skip the VIF unpacks, VU1 work and GS
    front end); fps and thread load measured at scale 1 and 3 (T48, done:
    pre-lit scenery, byte-identical, on by default).
 5. Model replacement through the handler (a glTF model in place of a
-   car's chain) (T49).
+   car's chain) (T49; moved by T52 to the native renderer, T70).
 6. Look extras, decided after 4 and 5: forced best LOD (EE override),
    better lighting in the GPU path (T50). Per-pixel lighting and MSAA need
-   a native raster stage: fully native renderer.
+   a native raster stage: fully native renderer (T52: T69).
 
 Expected gains (racing, *estimate* from the shares): both mesh kinds on
 the GPU path take about 70% off the VU thread and about 35% off the render
@@ -285,22 +286,186 @@ game draws, with their world matrices and materials, exported to glTF
 from the chain handlers (T51; covers the track geometry whose disc format
 is not decoded).
 
-## Fully native (final intent, D26)
+## Fully native (D26, D37; plan from T52, pending owner review)
 
-The end state of a converted game has no PS2 hardware layer: a native
-renderer, native audio and IO, and the game logic as hand-written or
-decompiled C++ instead of recompiled MIPS. Phases 8 and 9 are steps on the
-way (native draw paths, own asset formats). The route is the override table
-(D5): replace functions one by one, checked against the recompiled original,
-until the runtime's emulation parts are no longer called. Game-specific code
-stays in `local/games/<serial>/` (D24).
+The end state of a converted game has no PS2 hardware layer. Planned in
+T52 for the pilot game; the order and task list are in
+[tasks.md](tasks.md) (T56-T72). Game-specific detail (functions, modules,
+mesh kinds) is in the local notes, section "Fully native plan (T52)".
 
-The detailed plan is written when we do this for the first game (T52,
-after Phase 9, D31). Target pace: about a week of agent work per game
-(D26). Starting point from T36: the pilot engine's renderer is a thin
-layer over VU1 (constants by id, material bind, virtual submesh draw
-methods); implementing that layer natively replaces the VU1/GS path for the
-whole scene, and Phase 8's handlers and GPU mesh path are its first pieces.
+### What "fully native" means here
+
+- **Replaced:** every emulated hardware part: GS (compute raster in GS
+  memory), GIF, VIF/DMAC, VU1, IPU, IOP CPU and its modules, SIF, SPU2,
+  CDVD, SIO2 (pad, card), hardware timers and interrupts. In their place:
+  a native renderer, a native mixer, native file, pad and save services and
+  the host clock.
+- **Kept:** the game's code as recompiled C++ (EE code from `eerecomp`,
+  already native x86) on a guest memory model (32 MB RAM array, guest
+  pointers, 128-bit registers), a small OS layer (threads, semaphores,
+  callbacks: the kernel HLE) and our overrides.
+- **Line between native and emulated:** our code may read the game's own
+  data formats (DMA lists, GIF packets, VAG audio, RPC buffers) and turn
+  them into host API calls when the game hands them over. It may not model
+  hardware state, cycles or memory layout (no GS memory, no VIF state
+  machine, no IOP instructions).
+- **Game logic decompilation (D5):** only where the native layers need it
+  (frame loop and timer, the renderer's kick and wait) or for a goal (LOD,
+  car setup for model replacement, mods). The rest stays recompiled.
+  Decompiling all game logic is not part of the week (*estimate:* thousands
+  of game functions at tens of checked functions per agent hour is 100+
+  hours; owner question).
+- **Done for the pilot game when:** (1) a `native` build of the port links
+  without the emulation modules above and plays; (2) the emulation
+  counters (T56) are zero over the scripted runs (menu, save, load, race
+  intro, racing) and an exploration run; (3) owner play test at owner
+  settings (16:9, texture pack, display resolution): title, menus, garage,
+  a full race, save and load, sound; 60 fps without dips the owner notices.
+
+### How we verify
+
+- **Renderer:** hardware raster is not byte-identical to the GS raster.
+  The bar is a pixel diff against the GS path at the same guest frame
+  (same state, presses and cycles): mean difference and share of pixels
+  over a threshold per frame (thresholds set in T57 on real frames, then
+  fixed), and the diff images looked at. Renderer changes must not change
+  EE behaviour: cycle counts stay identical.
+- **Native IOP and audio:** replies come at other times than from the
+  emulated IOP, so cycles change. Checks: an RPC log of the same run both
+  ways (requests and reply bytes match), the scripted runs reach the same
+  screens (frames at milestones), saves load both ways, WAV dumps compared
+  (length, levels, envelope), the owner listens.
+- **Timing:** a test mode keeps the emulated clock (deterministic frames
+  for every comparison); play mode uses the host clock.
+- **Playable at every step:** each native piece has an on/off setting (as
+  `gpu_mesh`), is on by default only after its checks, and the old path
+  stays until the `native` build (T68).
+
+### Architecture
+
+```
+recompiled game code (EE C++) + overrides (D5)
+   | frame list kick        | SIF RPC calls           | timer, vblank
+   v                        v                         v
+native renderer          native IOP servers         host clock, OS layer
+ list reader (DMA, VIF,   CD/DVD, file I/O, loader,  (kernel HLE: threads,
+ GIF formats)             pad, card (generic)        semaphores, callbacks)
+ mesh kinds (per engine)  sound driver, stream
+ GS-draw translator       (per engine) -> native mixer
+ WebGPU render pipelines
+```
+
+- **Native renderer** (`recomp/native/`, our code outside the vendored
+  tree; WebGPU render pipelines on wgpu-native, D20). Three layers, built in
+  this order so the game always runs:
+  1. *GS-draw translator* (generic): GS primitives (triangles, strips,
+     sprites) with their state (alpha blend, tests, Z, texture, CLUT) drawn
+     by hardware raster into native render targets at any resolution, no GS
+     memory. Textures decoded once per upload; render targets are native
+     textures found by frame-buffer address (render to texture, frame
+     copies, fades, frame blend). A CPU-side map of GS addresses keeps what
+     lives where (uploads, targets, CLUTs) and the D25 keys, so texture
+     packs keep working. First fed by the existing VIF/VU1 path (VU1 output
+     goes to the translator instead of the GS raster).
+  2. *Mesh kinds* (per engine): the engine's mesh programs as WGSL vertex
+     shaders over vertex buffers cached from the static chains (T48's cache
+     and the VU1 layouts from T46/T48 are reused; its compute build,
+     binning and raster are replaced). Hardware clipping replaces the VU1
+     clipper. Lighting and env maps in shaders, so per-pixel lighting, MSAA
+     and model replacement fit.
+  3. *List reader* (generic formats, per-engine meaning): at the engine's
+     frame kick our code walks the frame's DMA list in guest RAM (tags, VIF
+     unpacks into a constant file, GIF packets) and calls the mesh kinds and
+     the translator: no DMAC, VIF or VU1. The engine's kick, wait and
+     interrupt functions become overrides (game-specific).
+  Later, optional: the engine's draw functions (constant setter, material
+  bind, submesh draws) overridden to call the renderer directly (skips
+  building the list; only for speed or deeper mods).
+- **Reuse of Phase 8:** the chain handler seam, the mesh vertex cache and
+  the VU1 program knowledge stay; the GPU mesh path's compute raster, T47
+  (cars on the GS path) and T55 (its follow-ups) are dropped.
+- **Native IOP** (generic framework, `recomp/native/`): the EE's SIF
+  functions (bind, call, DMA, IOP reboot, module load, IOP heap) become
+  overrides that route RPC calls to native servers in the same process.
+  Standard Sony modules (CD/DVD file server, file I/O, module loader, pad,
+  memory card) are generic servers in the repo; the runtime already serves
+  the CD/DVD RPCs natively (`iop/cdvdfsv.cpp`). A game's own driver modules
+  (sound, streaming) are per-engine servers in `local/`. With every bound
+  server native, the IOP CPU no longer runs.
+- **Audio:** a native mixer (generic: VAG ADPCM decode, voices with pitch,
+  volume, ADSR, streams; host audio thread on the host clock) behind the
+  game's sound-driver server. Replaces SPU2 and the IOP sound modules; T30
+  is dropped. Reverb approximated or left out (owner question).
+- **Input:** the pad server writes the pad state into the game's buffer
+  from SDL each frame (pressure buttons, rumble). Wheel devices: "no
+  device" first (owner question).
+- **Files and disc:** the CD/DVD and file servers read the port folder
+  (D27) or the ISO through the existing disc reader; mods (D29) keep working.
+- **Saves:** the memory card server works on the card image (`.ps2`, T34),
+  so PCSX2 saves keep loading (owner question: or plain save files).
+- **Timing:** play mode: the game's hardware timer reads come from the host
+  clock, vblank callbacks from the present loop; the frame rate may go
+  above 60 (the pilot measures its own timestep, D11). Test mode: emulated
+  clock.
+
+### Game-specific vs generic (D24)
+
+| Generic (repo, every game) | Per engine or game (`local/games/<serial>/`) |
+|---|---|
+| GS-draw translator, render target and texture caches, packs | Mesh kinds (VU1 program meaning as shaders) |
+| List reader for DMA, VIF and GIF formats | Which list entries are mesh calls, constant addresses |
+| Native IOP framework, standard Sony module servers | Sound driver and stream servers |
+| Native mixer, VAG decoder | Renderer kick/wait overrides, timer override if needed |
+| Host clock, `native` build, emulation counters | Decompiled functions (LOD, car setup, mods) |
+| Pixel-diff and RPC-log compare tools | Model replacement data |
+| SIF/SDK function finder by rules (strings, RPC ids) | Names in `game.json` |
+
+Tooling for the next game: the emulation counters say what still runs
+emulated; the SDK finder names the SIF functions to override; the RPC log
+lists a game's modules and commands; the GS-draw translator covers 2D and
+effects drawn with plain GS packets; a `/native-port` skill (T72) carries
+the method. A game on the same engine (D6) reuses the mesh kinds and the
+sound servers.
+
+### Order (one-session tasks; full text in tasks.md)
+
+1. T56 survey and emulation counters (the measure for everything after).
+2. Renderer: T57 GS-draw translator, T58 render targets and effects, T59
+   coverage and default on; T60 pre-lit mesh kind, T61 car and other mesh
+   kinds (VU1 off); T62 list reader and kick overrides (VIF, DMAC off).
+3. IOP: T63 framework and file servers, T64 pad, card, USB; T65 sound
+   driver survey, T66 native mixer and sound servers (SPU2 and IOP off).
+4. T67 host clock and frame loop; T68 `native` build, full check, owner
+   play test: **the pilot game is fully native**.
+5. After: T69 look extras (was T50), T70 car model replacement (was T49),
+   T71 decompilation tools and a first decompiled subsystem, T72 wrap-up and
+   `/native-port` skill; then T40 (second game), T44 and T51 re-scoped.
+
+Pace (*estimate*): 17 tasks, about 19 sessions, about a week at the pace of
+Phases 0-8. The renderer (T57-T62) is half of it and holds most of the risk.
+
+### Risks and when to revisit
+
+- **GS features with no fixed-function match** (blend modes, destination
+  alpha, frame-buffer feedback, 16-bit formats, a target read in another
+  format): T56 lists what the pilot uses. An effect that cannot pass the
+  pixel diff in two sessions is drawn from its engine call (override)
+  instead, or stays on the GS path until T68.
+- **EE reads from the GS** (downloads, SIGNAL/FINISH/LABEL events, status
+  polls): the translator must answer them; T56 counts them.
+- **Sound driver protocol** unknown and timing-bound (stream buffer
+  handshakes). Plan B: keep the IOP and SPU2 for sound only, on the host
+  clock (T30's idea), and finish the rest.
+- **Texture pack keys** come from per-column upload hashes (D25); the
+  native cache must keep them or packs need re-keying.
+- **Host clock:** physics may misbehave at high frame rates (D11 revisit:
+  sub-steps); then cap at the display rate.
+- **Vendored patch list** grows: native code lives in `recomp/native/`
+  with one small hook patch (D23 revisit).
+- **Revisit the plan if:** the translator cannot reach the bar on the
+  pilot's effects; the list reader meets data it cannot read without VU1;
+  the sound server needs more than two sessions; or the second game shows
+  the generic parts are not generic (D6).
 
 ## Generalising
 

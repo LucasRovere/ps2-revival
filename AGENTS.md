@@ -87,7 +87,8 @@ work/                scratch space, git-ignored
 
 Planned modules (see roadmap): `mods/`. Runtime and graphics work happens
 in the vendored code under `recomp/` (D23); no separate `runtime/` or
-`graphics/`.
+`graphics/`. Fully native layers (D37, from T57): our own code in
+`recomp/native/`, hooked into the vendored build by one listed patch.
 
 ## Skills
 
@@ -137,8 +138,8 @@ the same change.
 - Saves and launcher (Phase 6, T34): `port.py --saves` (game saves to the
   port's card, a new run loads it; PCSX2 `.ps2` layout, a PCSX2-made save
   loads); `recomp/play.py <serial>` starts the window port with settings from
-  `local/games/<serial>/play.json` (card, scale, fullscreen). Phase 6 left:
-  T29/T30 (parked by the owner).
+  `local/games/<serial>/play.json` (card, scale, fullscreen). T29/T30
+  dropped by T52 (D37).
 - Widescreen and resolution (Phase 7, T32): `play.json` `aspect` (`"16:9"`
   → `PS2_ASPECT`, presentation only; frame dumps unchanged); `PS2_SCALE` 2/3
   sharper with small race-intro fps dips, default 1, clamp 3. Owner check
@@ -193,4 +194,12 @@ the same change.
   data, frames byte-identical, on by default (`PS2_GPU_MESH=0` /
   `"gpu_mesh": false` turns it off). Order (owner, D31): Phase 8 → Phase 9 → fully native for the
   pilot game → wrap-up → other games (T40).
+- Fully native plan (T52, D37, pending owner review): no emulated hardware
+  while the game runs; game code stays recompiled, decompilation selective
+  (D5). Native renderer in `recomp/native/` (GS-draw translator on WebGPU
+  render pipelines, per-engine mesh kinds, list reader at the frame kick),
+  native IOP servers behind SIF overrides with a native mixer, host clock.
+  Tasks T56-T68 to fully native (T56 survey and emulation counters first),
+  then T69-T72, then T40. T47, T55, T29, T30 dropped. Plan:
+  [docs/native-port-plan.md](docs/native-port-plan.md) "Fully native".
 - Next up: see [docs/tasks.md](docs/tasks.md). The owner runs tasks with `/next-task`.

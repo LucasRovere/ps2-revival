@@ -812,3 +812,63 @@ best of the tried variants.
 intro at scale 3 is GPU-bound with the path on); the fully native renderer
 (T52) replaces the GS renderer for these meshes; another handler needs
 fog or UV output (not in the path: such batches stay on the CPU path).
+
+## D37: Fully native plan for the pilot game (pending owner review)
+
+**Decision (T52, 2026-10-19; every point pending owner review):**
+1. **Definition.** Fully native = no emulated hardware while the game runs
+   (GS, GIF, VIF/DMAC, VU1, IPU, IOP CPU and modules, SIF, SPU2, CDVD,
+   SIO2, hardware timers). The game's code stays recompiled C++ on the guest
+   memory model with a small OS layer (kernel HLE) and our overrides. Our
+   code may read the game's data formats (DMA lists, GIF packets, VAG, RPC
+   buffers) when handed over; it may not model hardware state, cycles or
+   memory layout. Done = a `native` build without the emulation modules
+   plays, emulation counters zero over the scripted runs, owner play test.
+2. **Decompilation stays selective (D5):** frame loop and timer, the
+   renderer's kick and wait, and what a goal needs (LOD, car setup, mods).
+   All game logic decompiled is not part of the pilot's week (*estimate*
+   100+ agent hours).
+3. **Renderer:** a native renderer in `recomp/native/` on WebGPU render
+   pipelines, built in three layers so the game always runs: a generic
+   GS-draw translator (hardware raster, native render targets and texture
+   cache, D25 keys kept), per-engine mesh kinds as shaders (VU1 off), and a
+   list reader that walks the frame's DMA list at the engine's kick (DMAC
+   and VIF off). Bar: pixel diff against the GS path at the same guest
+   frame, cycles unchanged.
+4. **IOP:** SIF functions overridden on the EE side; RPC calls go to native
+   servers in-process: generic servers for the standard Sony modules (repo),
+   the game's own sound and stream drivers per engine (`local/`). Audio: a
+   generic native mixer behind the sound server.
+5. **Timing:** host clock in play mode; the emulated clock stays as a test
+   mode for deterministic comparisons.
+6. **Backlog re-decided:** T47 (cars on the GS path) and T55 (GPU mesh path
+   follow-ups) dropped: cars become a native mesh kind (T61) and the compute
+   raster is replaced. T49 → T70 and T50 → T69, both in the native
+   renderer, after the fully native check (T68). T44 and T51 kept after
+   T72 (T51 re-scoped: capture from the native draw list). T29 and T30
+   dropped (superseded by the native renderer and the native mixer on the
+   host clock). T40 stays after the wrap-up (D31).
+
+**Why:**
+- Most of a frame's emulation cost and all of the scale-3 limits are in the
+  VU1/GS path (T36, T45, T48). Growing the GPU mesh path inside the GS
+  emulation keeps the GS memory model, the compute raster (GPU-bound without
+  a pack, T48) and bit-exactness work that the final renderer throws away.
+  The owner prefers progress toward the final goal (cut T48 short for it).
+- A rough scan of the pilot's export (local notes) finds that only about 1%
+  of its functions touch hardware registers or syscalls directly, mostly in
+  the renderer layer and the SDK libraries; the rest is plain logic that
+  already runs as native recompiled code. So "no hardware layer" needs few
+  overrides, while "all logic decompiled" is a much larger, separate job.
+- RPC-level servers keep the SDK code on the EE unchanged, are generic for
+  the standard modules, and the runtime already does it for the CD/DVD
+  server. The GS-draw translator is generic for every game's 2D and effects;
+  only mesh programs and sound drivers are per engine (D6).
+
+**Revisit if:** the owner wants all game logic decompiled (then a
+decompilation track with tooling, T71 first); the GS-draw translator cannot
+reach the pixel-diff bar on the pilot's effects in two sessions (then those
+draws from engine overrides); the list reader needs VU1 results it cannot
+compute; the sound driver protocol needs more than two sessions (plan B:
+IOP and SPU2 for sound only, on the host clock); or the second game shows
+the generic layers are not generic.
