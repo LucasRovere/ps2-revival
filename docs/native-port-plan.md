@@ -2,7 +2,7 @@
 
 Status: **Phases 5–7 and the conversion tool done (except the
 second-game trial); Phase 8 done as far as planned (T36-T48); fully native
-planned (T52, D37, owner review D38); survey and emulation counters done (T56); GS-draw translator first layer done (T57, D40), render targets and effects done (T58, D41).** Order (owner, D31): fully
+planned (T52, D37, owner review D38); survey and emulation counters done (T56); GS-draw translator first layer done (T57, D40), render targets and effects done (T58, D41); speed work started, still opt-in (T59, D42).** Order (owner, D31): fully
 native for the pilot game → wrap-up → other games (T40). Phases 6–9 were re-planned (D23, 2026-10-18) around the
 vendored ps2-web-recomp, which already provides most of what the original
 Phases 6 and 7 planned to build. Strategy decisions: D3, D5, D6, D9, D14,
@@ -449,7 +449,8 @@ sound servers.
 
 1. T56 survey and emulation counters (the measure for everything after).
 2. Renderer: T57 GS-draw translator, T58 render targets and effects, T59
-   coverage and default on; T60 pre-lit mesh kind, T61 car and other mesh
+   speed and coverage (default stays off, D42), T59b uploads and texture
+   decode on the GPU, T59c fewer draw calls, then default on; T60 pre-lit mesh kind, T61 car and other mesh
    kinds (VU1 off); T62 list reader and kick overrides (VIF, DMAC off).
 3. IOP: T63 framework and file servers, T64 pad, card, USB; T65 sound
    driver survey, T66 native mixer and sound servers (SPU2 and IOP off).

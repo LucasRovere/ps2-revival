@@ -978,6 +978,8 @@ textures as 32-bit); it holds no rendered pixels.
 255 between blends; COLCLAMP clamps only on display and texture reads), the
 CPU decode and upload copy stay too slow for the D38 render target (move
 them to the GPU), or a target is read in another format (done in T58: D41).
+**T59 (D42):** still opt-in; the upload copy and decode are too slow (~3.7
+ms per frame in races): they move to the GPU in T59b.
 
 ## D41: Native renderer: targets read in another format, read-backs, scaled nearest sampling (T58)
 
@@ -1011,4 +1013,45 @@ are rare (loading screens) so a GPU wait there costs nothing in play.
 **Revisit if:** a game draws into a 32-bit target as 16-bit at another
 width or an unaligned base (then views by memory range), read-backs show
 up during play (then a GPU-side memory copy, D40's revisit), or local
-copies (TRXDIR 2) appear.
+copies (TRXDIR 2) appear. **T59 (D42):** read-backs stay on the loading
+screen (132 in the pilot's menu run); their GPU waits are accepted.
+
+## D42: Native renderer stays opt-in until its render thread is at the GS path's (T59)
+
+**Decision (T59, 2026-10-20; the defaults the owner's session chose, the
+owner may override):**
+1. **Default rule:** the native renderer becomes the default only when its
+   render-thread busy time per presented frame is at or below the GS
+   path's in every measured scene at owner settings (window, scale 3,
+   16:9, texture pack; menus, race intro, racing; 3 runs each). The
+   owner's goal is removing emulator overhead (D38: render thread ≤ 2 ms
+   in the end).
+2. **Read-backs:** loading-screen read-backs (D41, GPU waits) are fine.
+3. **Result of T59:** not reached, so `PS2_RENDERER=native` stays opt-in.
+   Pilot, render thread busy per presented frame, native vs GS path (same
+   day): menus 2.4 vs 1.3 ms, race intro 17.8 vs 15.6, racing 14.5 vs 11.5
+   (T58: 2.5, 25.9, 20.3); all ~60 fps now. Kept speed changes: the
+   present acquires the surface texture before submitting the frame (after
+   the submit it waited for the GPU to finish the whole frame: -5 ms race
+   intro, -4 racing), PSMT4 uploads as whole bytes or words; timing
+   `PS2_NATIVE_TIME` with GPU timestamps.
+4. **Next (T59b, T59c before T60):** uploads into a GPU copy of GS memory
+   and texture decode on the GPU (the GS path already swizzles uploads on
+   the GPU), then fewer draw calls (texture binding arrays or similar:
+   ~2,700-3,500 wgpu draws per frame at ~1.3 µs, one per texture change)
+   and cheaper texture keys.
+
+**Why:** a default that costs more CPU than the path it replaces works
+against D38; the native renderer's frames are already within the bar, so
+only speed holds it back. Tried in T59 and dropped (measured on the pilot,
+details in the local game notes): skipping uploads that repeat the
+last upload to the same rectangle byte for byte (5% of uploads), writing
+uploads into the CPU memory only when read (CLUT loads and textures whose
+D25 column tags are incomplete read the same blocks: almost every upload
+was written anyway), chunked submits during the frame (more passes cost
+more than the overlap gained once the acquire order was fixed), a larger
+texture-key memo (keys change with every upload).
+
+**Revisit if:** the owner prefers the native renderer on by default
+earlier (e.g. for its look or the fully native track), or T60's mesh kinds
+change the balance (fewer translator draws).

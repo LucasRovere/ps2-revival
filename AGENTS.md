@@ -208,6 +208,8 @@ the same change.
   blending), textures from a CPU copy of uploads cached by content, packs work;
   `recomp/framediff.py` pixel diff, bar mean ≤ 5 and ≤ 4% over 24: menus/movies within it,
   races too since T58 (16-bit views of 32-bit targets with FBMSK bit masks in the shader,
-  downloads and uploads through target read-backs); slower than the GS path (T59).
+  downloads and uploads through target read-backs). T59 (D42): `PS2_NATIVE_TIME` split,
+  ~60 fps at scale 3 but render thread still above the GS path (racing 14.5 vs 11.5 ms):
+  stays opt-in; T59b/T59c (uploads and decode on the GPU, fewer draw calls) first.
   Owner (D39): decompile only hot spots; one picture per screen refresh (T67).
 - Next up: see [docs/tasks.md](docs/tasks.md). The owner runs tasks with `/next-task`.

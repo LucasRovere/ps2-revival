@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -65,6 +66,34 @@ std::map<std::uint32_t, WGPURenderPipeline> g_pipelines;
 std::uint64_t g_prims = 0, g_triangles = 0, g_sprites = 0, g_skipped[8] = {}, g_decoded = 0, g_replaced = 0, g_flushes = 0;
 std::uint64_t g_conversions = 0, g_read_backs = 0, g_masked = 0;
 std::map<std::string, std::uint64_t> g_missing;
+
+// PS2_NATIVE_TIME: render-thread split, counts and GPU time per present, printed every 600 presents (window).
+enum Time { T_REBUILD, T_DECODE, T_UPLOAD, T_TAG, T_SUBMIT, T_PRESENT, T_ACQUIRE, T_TIMES };
+enum Count { C_REBUILD, C_PASS, C_DRAW, C_COPY, C_SUBMIT, C_UPLOAD, C_COUNTS };
+bool g_time = false;
+double g_time_ms[T_TIMES] = {}, g_gpu_ms = 0.0;
+std::uint64_t g_counts[C_COUNTS] = {}, g_gpu_frames = 0, g_timed_presents = 0;
+// GPU time: a timestamp at the start and end of every command encoder, summed per present.
+constexpr std::uint32_t kStamps = 512;
+WGPUQuerySet g_stamps = nullptr;
+WGPUBuffer g_stamp_resolve = nullptr, g_stamp_read[3] = {};
+bool g_stamp_busy[3] = {};
+std::uint32_t g_stamp_count = 0, g_stamp_ring = 0;
+
+struct Timer {
+    Time what;
+    std::chrono::steady_clock::time_point start;
+    explicit Timer(Time w) : what(w) {
+        if (g_time) start = std::chrono::steady_clock::now();
+    }
+    ~Timer() {
+        if (g_time) g_time_ms[what] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    }
+};
+
+void count(Count c) {
+    if (g_time) ++g_counts[c];
+}
 
 void missing(const std::string &what) {
     if (g_missing[what]++ == 0) std::fprintf(stderr, "[native] not done yet: %s\n", what.c_str());
@@ -390,6 +419,36 @@ void write_row(std::uint8_t *mem, const std::uint8_t *d, std::size_t bit, const 
     }
 }
 
+// PSMT4 rectangles aligned to 8 x 4: the byte holding pixel (x, y) also holds (x ^ 4, y ^ 2) (low nibble when y & 2
+// is 0), and from x % 32 == 0 the word holding (x, y) holds x, x + 8, x + 16, x + 24 in its bytes: whole bytes or words
+// instead of nibbles (T4 uploads were the slowest part of the upload copy).
+void write_t4(const Upload &u, std::uint8_t *mem, std::uint32_t per_row, std::uint32_t pws, std::uint32_t phs, std::uint32_t pw, std::uint32_t ph) {
+    const std::uint8_t *d = u.bytes.data();
+    const std::uint32_t w = u.w;
+    const auto byte = [&](std::uint32_t row, std::uint32_t col) {
+        const std::size_t i = static_cast<std::size_t>(row) * w + col, j = static_cast<std::size_t>(row + 2) * w + (col ^ 4u);
+        return ((d[i / 2] >> ((i & 1u) * 4)) & 15u) | (((d[j / 2] >> ((j & 1u) * 4)) & 15u) << 4);
+    };
+    for (std::uint32_t row = 0; row < u.h; ++row) {
+        const std::uint32_t y = (u.y + row) & 0x7FFu;
+        if (y & 2u) continue;
+        const std::uint32_t base = u.bp * 256u + (y >> phs) * per_row * 8192u;
+        const std::uint32_t *trow = swz::off4 + (y & (ph - 1)) * pw;
+        std::uint32_t col = 0;
+        for (; u.x % 32 == 0 && col + 32 <= w; col += 32)
+            for (std::uint32_t j = 0; j < 8; ++j) {
+                const std::uint32_t x = (u.x + col + j) & 0x7FFu;
+                const std::uint32_t at = base + (x >> pws) * 8192u + trow[x & (pw - 1)] / 2;
+                const std::uint32_t word = byte(row, col + j) | byte(row, col + j + 8) << 8 | byte(row, col + j + 16) << 16 | byte(row, col + j + 24) << 24;
+                std::memcpy(mem + (at & (gs::kMemorySize - 4)), &word, 4);
+            }
+        for (; col < w; ++col) {
+            const std::uint32_t x = (u.x + col) & 0x7FFu;
+            mem[(base + (x >> pws) * 8192u + trow[x & (pw - 1)] / 2) & (gs::kMemorySize - 1)] = static_cast<std::uint8_t>(byte(row, col));
+        }
+    }
+}
+
 // Writes a finished image transfer as gs.cpp's per-pixel transfer would.
 void write_upload(const Upload &u) {
     using namespace swz;
@@ -413,6 +472,10 @@ void write_upload(const Upload &u) {
     }
     const std::size_t row_bits = static_cast<std::size_t>(u.w) * bits;
     const std::uint32_t rows = static_cast<std::uint32_t>(std::min<std::size_t>(u.h, u.bytes.size() * 8 / std::max<std::size_t>(row_bits, 1)));
+    if (u.psm == gs::PSMT4 && rows == u.h && u.x % 8 == 0 && u.w % 8 == 0 && u.y % 4 == 0 && u.h % 4 == 0) {
+        write_t4(u, mem, per_row, pws, phs, pw, ph);
+        return;
+    }
     for (std::uint32_t row = 0; row < rows; ++row) {
         const std::uint32_t y = (u.y + row) & 0x7FFu;
         const std::size_t bit = row * row_bits;
@@ -478,6 +541,14 @@ void read_clut(std::uint64_t tex0, std::uint64_t texclut) {
 void submit_ops();
 void submit_commands(WGPUCommandEncoder enc);
 void read_pixels(WGPUTexture tex, std::uint32_t width, std::uint32_t height, std::vector<std::uint32_t> &out);
+
+WGPUCommandEncoder encoder() {
+    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
+#ifndef __EMSCRIPTEN__
+    if (g_stamps && g_stamp_count + 2 <= kStamps) wgpuCommandEncoderWriteTimestamp(enc, g_stamps, g_stamp_count++);
+#endif
+    return enc;
+}
 
 std::uint32_t target_key(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm) { return fbp | (fbw << 9) | (psm << 15); }
 
@@ -726,7 +797,7 @@ void read_back(Target &t) {
     d.entries = &e;
     WGPUBindGroup group = wgpuDeviceCreateBindGroup(g_device, &d);
     wgpuBindGroupLayoutRelease(layout);
-    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
+    WGPUCommandEncoder enc = encoder();
     WGPURenderPassColorAttachment ca = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
     ca.view = packed_view;
     ca.loadOp = WGPULoadOp_Clear;
@@ -931,6 +1002,7 @@ bool texture_source(const State &st, const gs::Context &c, const Target *drawing
                 for (std::uint32_t i = 0; i < count; ++i) key = mix(key, gs::g_state.clut[(first + i) & 511u]);
             }
             if (!texture_entry(key)) {
+                const Timer timer(T_DECODE);
                 Texture &t = add_texture(key, 1u << tw, 1u << th, levels);
                 std::vector<std::uint32_t> texels;
                 for (std::uint32_t l = 0; l < levels; ++l) {
@@ -1128,6 +1200,8 @@ std::uint32_t write_mask(const gs::Context &c, const Target &t, bool &partial) {
 }
 
 void rebuild(const State &st, std::uint64_t attr) {
+    const Timer timer(T_REBUILD);
+    count(C_REBUILD);
     Current &cur = g_cur;
     cur.valid = true;
     cur.skip = false;
@@ -1333,6 +1407,7 @@ void add_vertices(const NVertex *v, std::uint32_t n, const std::int32_t *box) {
 
 void submit_ops() {
     if (g_ops.empty()) return;
+    const Timer timer(T_SUBMIT);
     ++g_flushes;
     const std::uint64_t vbytes = std::max<std::uint64_t>(g_vertices.size() * sizeof(NVertex), 16);
     if (vbytes > g_vertex_capacity) {
@@ -1358,7 +1433,7 @@ void submit_ops() {
     }
     if (!g_vertices.empty()) wgpuQueueWriteBuffer(g_queue, g_vertex_buffer, 0, g_vertices.data(), g_vertices.size() * sizeof(NVertex));
     if (!g_params.empty()) wgpuQueueWriteBuffer(g_queue, g_param_buffer, 0, g_params.data(), g_params.size() * sizeof(Params));
-    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
+    WGPUCommandEncoder enc = encoder();
     WGPURenderPassEncoder pass = nullptr;
     WGPURenderPipeline bound_pipeline = nullptr;
     WGPUBindGroup bound_group = nullptr, bound_dest = nullptr;
@@ -1388,6 +1463,7 @@ void submit_ops() {
             pd.colorAttachments = &ca;
             pd.depthStencilAttachment = &da;
             pass = wgpuCommandEncoderBeginRenderPass(enc, &pd);
+            count(C_PASS);
             wgpuRenderPassEncoderSetVertexBuffer(pass, 0, g_vertex_buffer, 0, g_vertex_capacity);
             wgpuRenderPassEncoderSetBindGroup(pass, 0, g_param_group, 0, nullptr);
             wgpuRenderPassEncoderSetBindGroup(pass, 2, bound_dest = g_blank_dest_group, 0, nullptr);
@@ -1412,6 +1488,7 @@ void submit_ops() {
                 wgpuRenderPassEncoderSetBlendConstant(pass, &c);
             }
             wgpuRenderPassEncoderDraw(pass, op.count, 1, op.first, 0);
+            count(C_DRAW);
             break;
         }
         case OpKind::copy: {
@@ -1421,6 +1498,7 @@ void submit_ops() {
             dst.texture = op.dst;
             const WGPUExtent3D size{op.width, op.height, 1};
             wgpuCommandEncoderCopyTextureToTexture(enc, &src, &dst, &size);
+            count(C_COPY);
             break;
         }
         case OpKind::init: {
@@ -1463,10 +1541,7 @@ void submit_ops() {
         }
     }
     close();
-    WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
-    wgpuQueueSubmit(g_queue, 1, &cmd);
-    wgpuCommandBufferRelease(cmd);
-    wgpuCommandEncoderRelease(enc);
+    submit_commands(enc);
     for (WGPUBindGroup g : g_dead_groups) wgpuBindGroupRelease(g);
     for (WGPUTextureView v : g_dead_views) wgpuTextureViewRelease(v);
     for (WGPUTexture t : g_dead_textures) wgpuTextureRelease(t);
@@ -1481,6 +1556,10 @@ void submit_ops() {
 }
 
 void submit_commands(WGPUCommandEncoder enc) {
+#ifndef __EMSCRIPTEN__
+    if (g_stamps && (g_stamp_count & 1u)) wgpuCommandEncoderWriteTimestamp(enc, g_stamps, g_stamp_count++);
+#endif
+    count(C_SUBMIT);
     WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
     wgpuQueueSubmit(g_queue, 1, &cmd);
     wgpuCommandBufferRelease(cmd);
@@ -1554,7 +1633,7 @@ bool render_shown(const gs::DisplayRegs &r, std::uint32_t &w, std::uint32_t &h) 
     d.entries = e;
     WGPUBindGroup group = wgpuDeviceCreateBindGroup(g_device, &d);
     wgpuBindGroupLayoutRelease(layout);
-    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
+    WGPUCommandEncoder enc = encoder();
     WGPURenderPassColorAttachment ca = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
     ca.view = g_shown_view;
     ca.loadOp = WGPULoadOp_Clear;
@@ -1605,7 +1684,7 @@ void read_pixels(WGPUTexture tex, std::uint32_t width, std::uint32_t height, std
         g_readback = make_buffer(bytes, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
         g_readback_size = bytes;
     }
-    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
+    WGPUCommandEncoder enc = encoder();
     WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
     src.texture = tex;
     WGPUTexelCopyBufferInfo dst = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
@@ -1627,6 +1706,54 @@ void read_pixels(WGPUTexture tex, std::uint32_t width, std::uint32_t height, std
     if (p)
         for (std::uint32_t y = 0; y < height; ++y) std::memcpy(rgba.data() + static_cast<std::size_t>(y) * width, p + static_cast<std::size_t>(y) * row, width * 4);
     wgpuBufferUnmap(g_readback);
+}
+
+// Reads the last presents' GPU timestamps (no wait: a ring of map buffers) and prints the split every 600 presents.
+void time_present() {
+#ifndef __EMSCRIPTEN__
+    if (g_stamps && g_stamp_count >= 2 && !g_stamp_busy[g_stamp_ring]) {
+        const std::uint32_t n = g_stamp_count & ~1u;
+        WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
+        wgpuCommandEncoderResolveQuerySet(enc, g_stamps, 0, n, g_stamp_resolve, 0);
+        wgpuCommandEncoderCopyBufferToBuffer(enc, g_stamp_resolve, 0, g_stamp_read[g_stamp_ring], 0, n * 8ull);
+        WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
+        wgpuQueueSubmit(g_queue, 1, &cmd);
+        wgpuCommandBufferRelease(cmd);
+        wgpuCommandEncoderRelease(enc);
+        g_stamp_busy[g_stamp_ring] = true;
+        WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
+        cb.mode = WGPUCallbackMode_AllowProcessEvents;
+        cb.callback = [](WGPUMapAsyncStatus status, WGPUStringView, void *slot, void *stamps) {
+            const std::size_t i = reinterpret_cast<std::size_t>(slot), n = reinterpret_cast<std::size_t>(stamps);
+            if (status == WGPUMapAsyncStatus_Success) {
+                const auto *t = static_cast<const std::uint64_t *>(wgpuBufferGetConstMappedRange(g_stamp_read[i], 0, n * 8));
+                std::uint64_t ticks = 0;
+                for (std::size_t k = 0; t && k < n; k += 2) ticks += t[k + 1] > t[k] ? t[k + 1] - t[k] : 0;
+                g_gpu_ms += static_cast<double>(ticks) * wgpuQueueGetTimestampPeriod(g_queue) / 1e6;
+                ++g_gpu_frames;
+                wgpuBufferUnmap(g_stamp_read[i]);
+            }
+            g_stamp_busy[i] = false;
+        };
+        cb.userdata1 = reinterpret_cast<void *>(static_cast<std::size_t>(g_stamp_ring));
+        cb.userdata2 = reinterpret_cast<void *>(static_cast<std::size_t>(n));
+        wgpuBufferMapAsync(g_stamp_read[g_stamp_ring], WGPUMapMode_Read, 0, n * 8ull, cb);
+        g_stamp_ring = (g_stamp_ring + 1) % 3;
+    }
+    g_stamp_count = 0;
+    wgpuDevicePoll(g_device, false, nullptr);
+#endif
+    if (++g_timed_presents % 600) return;
+    const double n = 600.0;
+    std::fprintf(stderr, "[native] ms per present: rebuild %.2f, decode %.2f, upload %.2f (tags %.2f), submit %.2f, present %.2f (acquire %.2f); "
+                 "per present: rebuilds %.0f, uploads %.0f, passes %.0f, draws %.0f, copies %.0f, submits %.0f; GPU %.2f ms\n",
+                 g_time_ms[T_REBUILD] / n, g_time_ms[T_DECODE] / n, g_time_ms[T_UPLOAD] / n, g_time_ms[T_TAG] / n, g_time_ms[T_SUBMIT] / n, g_time_ms[T_PRESENT] / n,
+                 g_time_ms[T_ACQUIRE] / n, g_counts[C_REBUILD] / n, g_counts[C_UPLOAD] / n, g_counts[C_PASS] / n, g_counts[C_DRAW] / n, g_counts[C_COPY] / n,
+                 g_counts[C_SUBMIT] / n, g_gpu_frames ? g_gpu_ms / static_cast<double>(g_gpu_frames) : 0.0);
+    std::memset(g_time_ms, 0, sizeof g_time_ms);
+    std::memset(g_counts, 0, sizeof g_counts);
+    g_gpu_ms = 0.0;
+    g_gpu_frames = 0;
 }
 
 }
@@ -1670,9 +1797,16 @@ bool init() {
         wgpuAdapterInfoFreeMembers(info);
     }
     WGPUDeviceDescriptor dd = WGPU_DEVICE_DESCRIPTOR_INIT;
-    const WGPUFeatureName feature = WGPUFeatureName_DualSourceBlending;
+    WGPUFeatureName features[3] = {WGPUFeatureName_DualSourceBlending};
     dd.requiredFeatureCount = 1;
-    dd.requiredFeatures = &feature;
+    g_time = std::getenv("PS2_NATIVE_TIME") != nullptr;
+    bool stamps = false;
+#ifndef __EMSCRIPTEN__
+    const auto inside = static_cast<WGPUFeatureName>(WGPUNativeFeature_TimestampQueryInsideEncoders);
+    stamps = g_time && wgpuAdapterHasFeature(g_adapter, WGPUFeatureName_TimestampQuery) && wgpuAdapterHasFeature(g_adapter, inside);
+    if (stamps) features[1] = WGPUFeatureName_TimestampQuery, features[2] = inside, dd.requiredFeatureCount = 3;
+#endif
+    dd.requiredFeatures = features;
     dd.uncapturedErrorCallbackInfo.callback = [](WGPUDevice const *, WGPUErrorType type, WGPUStringView message, void *, void *) {
         std::fprintf(stderr, "[native] error %d: %.*s\n", static_cast<int>(type), static_cast<int>(message.length == WGPU_STRLEN ? std::strlen(message.data) : message.length), message.data);
     };
@@ -1689,6 +1823,15 @@ bool init() {
     while (!done) wgpuInstanceProcessEvents(g_instance);
     if (!g_device) return false;
     g_queue = wgpuDeviceGetQueue(g_device);
+    if (stamps) {
+        WGPUQuerySetDescriptor qd = WGPU_QUERY_SET_DESCRIPTOR_INIT;
+        qd.type = WGPUQueryType_Timestamp;
+        qd.count = kStamps;
+        g_stamps = wgpuDeviceCreateQuerySet(g_device, &qd);
+        g_stamp_resolve = make_buffer(kStamps * 8, WGPUBufferUsage_QueryResolve | WGPUBufferUsage_CopySrc);
+        for (WGPUBuffer &b : g_stamp_read) b = make_buffer(kStamps * 8, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
+    }
+    if (g_time) std::fprintf(stderr, "[native] timing on (%s)\n", stamps ? "GPU timestamps" : "no GPU timestamps");
     if (const char *scale = std::getenv("PS2_SCALE")) g_scale = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::atoi(scale)), 1u, 3u);
     if (const char *aspect = std::getenv("PS2_ASPECT"); aspect && std::strcmp(aspect, "16:9") == 0) g_aspect_w = 16.0f, g_aspect_h = 9.0f;
 
@@ -1875,8 +2018,13 @@ void draw(const State &st, const Vertex *v, int) {
 void finish_upload() {
     Upload &u = g_upload;
     if (!u.active) return;
+    const Timer timer(T_UPLOAD);
+    count(C_UPLOAD);
     write_upload(u);
-    texpack::tag_upload(u.bp, u.bw, u.psm, u.x, u.y, u.w, u.h, u.bytes.data(), u.bytes.size());
+    {
+        const Timer tag(T_TAG);
+        texpack::tag_upload(u.bp, u.bw, u.psm, u.x, u.y, u.w, u.h, u.bytes.data(), u.bytes.size());
+    }
     // Targets under the upload get the rows it touched back from memory; views convert from their parent.
     for (Target *t : u.targets) {
         if (t->parent) {
@@ -2031,18 +2179,28 @@ void resize_surface(std::uint32_t width, std::uint32_t height) {
 
 bool present(const gs::DisplayRegs &r) {
     if (!g_surface) return false;
-    std::uint32_t w = 0, h = 0;
-    if (!render_shown(r, w, h)) {
+    const Timer timer(T_PRESENT);
+    if (g_time) time_present();
+    Shown shown;
+    if (!shown_buffer(r, shown)) {
         submit_ops();
         return true;
     }
+    // Acquire before the frame's commands are submitted: the acquire waits for the GPU work submitted before it, and
+    // right after the submit that is the whole frame (T59: ~5 ms of render-thread wait per present in the race intro).
     WGPUSurfaceTexture st = WGPU_SURFACE_TEXTURE_INIT;
-    wgpuSurfaceGetCurrentTexture(g_surface, &st);
+    {
+        const Timer acquire(T_ACQUIRE);
+        wgpuSurfaceGetCurrentTexture(g_surface, &st);
+    }
     if (st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal && st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal) {
         if (st.texture) wgpuTextureRelease(st.texture);
         configure_surface();
+        submit_ops();
         return true;
     }
+    std::uint32_t w = 0, h = 0;
+    render_shown(r, w, h);
     WGPUTextureView target = wgpuTextureCreateView(st.texture, nullptr);
     WGPUBindGroupEntry e[2] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
     e[0].binding = 0;
@@ -2056,7 +2214,7 @@ bool present(const gs::DisplayRegs &r) {
     d.entries = e;
     WGPUBindGroup group = wgpuDeviceCreateBindGroup(g_device, &d);
     wgpuBindGroupLayoutRelease(layout);
-    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
+    WGPUCommandEncoder enc = encoder();
     WGPURenderPassColorAttachment ca = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
     ca.view = target;
     ca.loadOp = WGPULoadOp_Clear;

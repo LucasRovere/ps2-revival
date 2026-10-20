@@ -584,7 +584,8 @@ EE PCs named from the analysis export.
 
 The first layer of the fully native renderer (D37, D40): the GS-draw
 translator, our code in `native/` (`renderer.cpp`, `native.wgsl`), hooked
-into the vendored GS front end by one patch (below). Opt-in until T59:
+into the vendored GS front end by one patch (below). Opt-in: its render
+thread is still above the GS path's at owner settings (T59, D42):
 
 ```powershell
 $env:PS2_RENDERER = "native"     # window or headless; frame dumps read the native targets
@@ -659,6 +660,22 @@ skipped K; GS raster R; textures decoded D, from the pack P; targets T;
 submits F` and one line per target. `GS raster` counts primitives the GS
 raster (CPU or GPU) drew: 0 with the native renderer on (T59/T68 measure).
 
+**Timing (T59):** `PS2_NATIVE_TIME=1` (window) prints every 600 presents
+`[native] ms per present: rebuild, decode, upload (tags), submit, present
+(acquire); per present: rebuilds, uploads, passes, draws, copies, submits;
+GPU ms`: render-thread time in the draw-state rebuilds (texture keys
+included), CPU texture decode, the upload copy into the CPU memory and its
+D25 tags, encoding and submitting the commands, and the present (the
+surface acquire apart); GPU time from timestamps at the start and end of
+every command encoder (needs the adapter's timestamp features; the log says
+`no GPU timestamps` otherwise). Off: one test of a false flag per timed
+spot. The rest of the render thread's busy time (frame log) is the GS front
+end (GIF packets, registers, vertex kicks) and the translator's vertices.
+The present acquires the surface texture before the frame's commands are
+submitted: the acquire waits for the GPU work submitted before it, and
+acquired after the submit it waited for the whole frame (T59: ~5 ms per
+present in the race intro, no CPU/GPU overlap).
+
 **Pixel diff** (`framediff.py`, generic):
 
 ```powershell
@@ -702,6 +719,21 @@ of bilinear full-screen quads (intro movie), DTHE left out. Cycles
 unchanged on and off. Window scale 3, 16:9, pack, render thread busy per
 frame: menus 2.5 ms, race intro 25.9, racing 20.3 (T57: 2.7, 25.3, 19.9;
 GS path 1.3, 15.5, 11.8).
+
+Check after T59 (pilot game; headless frames byte-identical to T58's in the
+menu run from boot and the three state runs, so the same diffs; renderer
+off 107/107 and the same cycles). Window scale 3, 16:9, pack, render
+thread busy per presented frame (3 runs each, GS path in brackets, same
+day): menus 2.4 ms (1.3), race intro 17.8 (15.6), racing 14.5 (11.5); all
+three now ~60 fps (T58: race intro ~39 fps, racing ~49). GPU 0.7 / 5.6 /
+4.7 ms per present. From the acquire order (race intro -5 ms, racing
+-4) and whole bytes or words for PSMT4 uploads (-0.5). The gap (D42):
+upload copy into the CPU memory ~3 ms + tags 0.7 (the GS path swizzles
+uploads on the GPU), ~2,700-3,500 wgpu draws per frame (~1.3 µs each: one
+per texture change), texture keys per rebuild ~1.5 ms (every upload
+invalidates the memo, keys come from the D25 column tags), the menus' CPU
+decode of a texture uploaded every frame (0.6 ms); the VU1 batches the GPU
+mesh path takes on the GS path go through the front end here (T60).
 
 ### Chain handlers (T46)
 
