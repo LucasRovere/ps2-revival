@@ -2,7 +2,7 @@
 
 EE (R5900) → C++ static recompiler (Phase 5). The recompiler and runtime are
 [ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp) (MIT), vendored
-in `ps2-web-recomp/` (D14, D16). Our own code: `port.py` (incl. the port folder), `play.py` (launcher), `drawlist.py` (draw-list report), `emucount.py` (emulation counter report), the function
+in `ps2-web-recomp/` (D14, D16). Our own code: `port.py` (incl. the port folder), `play.py` (launcher), `drawlist.py` (draw-list report), `emucount.py` (emulation counter report), `framediff.py` (pixel diff), the native renderer in `native/` (T57, hooked in by one vendored patch), the function
 override hook (vendored patch, below), generic overrides in `overrides/`
 (none yet; created with the first), the chain handler hook (vendored patch) with a test handler in
 `chains/` and the instruction tests in `tests/`.
@@ -580,6 +580,95 @@ downloads and local copies, the displayed buffers once per frame.
 `emucount.py` prints the tables per file or frame range (`@from-to`), with
 EE PCs named from the analysis export.
 
+### Native renderer (T57)
+
+The first layer of the fully native renderer (D37, D40): the GS-draw
+translator, our code in `native/` (`renderer.cpp`, `native.wgsl`), hooked
+into the vendored GS front end by one patch (below). Opt-in until T59:
+
+```powershell
+$env:PS2_RENDERER = "native"     # window or headless; frame dumps read the native targets
+work\<SERIAL>\recomp\build-window-win\ps2run.exe <elf> --disc <iso> [--window] [--frames-dir <dir>]
+```
+
+The log says `[native] renderer on, scale N, aspect W:H`; without a WebGPU
+adapter that has dual-source blending it says so and the GS renderer runs.
+Unset, nothing changes (menu run 107/107 frames, 52,595,993,647 cycles).
+Renderer changes never change EE behaviour: cycles are the same with it on.
+
+What it draws: GS triangles, strips, fans and sprites (lines and points are
+counted and skipped) as triangle lists in WebGPU render pipelines, into
+native render targets at `PS2_SCALE`: `rgba16float` textures found by FRAME
+base pointer, width and format (RGB value/255, alpha value/128, so the
+blend factors As, Ad and FIX are exact WebGPU factors), Z in `depth32float`
+per ZBP and size. Vertex formats XYZ(F)2, ST/Q (interpolated linearly and
+divided per pixel, as the GS does), UV with FST, RGBAQ with IIP or flat;
+GS pixel coverage by a half-pixel shift. Textures: CT32, CT24, CT16,
+CT16S, T8 and T4 (T8H/T4HL/T4HH too) with CT32/CT16 CLUTs (CSM0 and
+CSM1), TEXA/AEM, MODULATE, DECAL and the two HIGHLIGHT modes with TCC,
+nearest/linear, the game's mip levels (MIPTBP1/2, MXL, LOD from Q with L
+and K, or K with LCM), REPEAT and CLAMP. Blending: every
+`(A - B) * C + D` whose coefficients are 0, 1, C, -C or 1 - C (and
+`Cd * (1 + C)`) as fixed function, with dual-source blending so FBA's
+written alpha and the blend's As differ; alpha test per pixel (fail KEEP)
+and NEVER with RGB_ONLY / FB_ONLY / ZB_ONLY as write masks; Z tests and
+ZMSK; FBMSK per whole channel (FF000000 = no alpha write). Left out, each
+counted as `[native] not done yet: <what> (N times)` at exit: DTHE, fog,
+DATE, PABE, region clamps, FBMSK masks inside a channel, other alpha-test
+fail modes, a target read in another format, local copies and downloads
+(T58). The display is the DISPFB target, read like the GS path's display
+(16-bit targets in 5-bit steps); the window blits it with the T32 aspect.
+
+Textures come from a CPU copy of GS memory that the translator keeps from
+uploads (no rendered pixels in it) and the CLUT loads (repeated loads with
+no upload since are skipped). Decoded textures are cached by content: the
+D25 upload tags of the texture's columns when they have them, else a hash
+of its 8 KB pages, plus the CLUT entries it reads; so a texture uploaded
+again every frame is decoded once. A texture at a target's base pointer in
+the same format class samples the target (a copy of it when the draw writes
+the same target). Texture packs (`PS2_TEXTURES`) use the D25 keys as the
+GS renderer does; pack dumping (`PS2_TEX_DUMP`) is the GS renderer's only.
+With the native renderer the GPU mesh path (T48) is off: the chain
+handler's VU1 batches go through the translator.
+
+At exit: `[native] translator drew N primitives (T triangles, S sprites),
+skipped K; GS raster R; textures decoded D, from the pack P; targets T;
+submits F` and one line per target. `GS raster` counts primitives the GS
+raster (CPU or GPU) drew: 0 with the native renderer on (T59/T68 measure).
+
+**Pixel diff** (`framediff.py`, generic):
+
+```powershell
+python recomp/framediff.py <GS frames> <native frames> [--threshold 24] [--out <diff dir>] [--max-mean 5 --max-share 4]
+```
+
+Frames with the same name in both folders; a pixel's difference is its
+largest channel difference; per frame the mean and the share of pixels over
+the threshold; `--out` writes diff images (x4, grey); with a bar the exit
+code is 1 when a frame is over it. **Bar (T57):** mean ≤ 5 and ≤ 4% of
+pixels over 24 per frame, set on the menus, movies, title and loading
+screen of the pilot's menu run (max mean 4.7, max share 3.1%: one 5-bit
+step on the 16-bit display on ~13% of pixels, sub-texel differences of
+bilinear full-screen quads along edges).
+
+Check (pilot game, scale 1, same states and presses both ways, frames and
+diff images looked at): menu run from boot 107 frames: logos, logo movies,
+intro movie, title, menus, loading within the bar; the race-intro start
+over it; menu state run mean 1.7 (max 2.9), 0.6% over; race intro mean 39
+(48% over), racing 23 (39%): the road and walls are lit through a pass that
+draws into the main frame read as 16-bit (format reinterpretation, T58), so
+they come out dark; from boot the race-intro cars also lack their paint
+(loading-screen downloads, T58, *likely*). Scale 3 with the pack: the same
+211 pack textures replaced (GS renderer 212), sharp, placed right.
+Speed (no pack unless said): headless `PS2_TIME` menus 4.7 ms (GS
+renderer 3.2), race intro 34.5 (23.2), racing 33.3 (20.1), the same at
+scale 3; window scale 3, 16:9, pack, render thread busy per frame menus 2.7
+ms (1.3), race intro 25.3 (15.5), racing 19.9 (11.8): render-limited below
+60 fps in races. Where it goes (racing, headless): ~3,400 state changes per
+frame (draw-state rebuild ~1 µs and a wgpu draw call ~1.3 µs each), ~7 MB
+of uploads per frame copied into the CPU memory (~5 ms), texture decode
+(~1.5 ms); T59 works on it.
+
 ### Chain handlers (T46)
 
 Game code can take over a VIF1 chain at its DMA `call` (D32, D35): e.g. an
@@ -751,6 +840,7 @@ except:
 | `runtime/src/gs/gpu/texpack.cpp` (`Slot`, `load`, `claim`, `start_loaders`, `find`) | Pack loader threads (T53): with `PS2_TEXTURES` set, `init` starts threads that decode every pack image; `find` decodes or waits for an image not decoded yet, so frames do not depend on timing. Without a pack nothing starts; frames and cycles unchanged. |
 | `runtime/include/ps2/chain.hpp`, `runtime/src/chain.cpp`, `chain.hpp` (new), `CMakeLists.txt`, `runtime/src/dmac.cpp` (`run_chain`, `to_vif`), `runtime/src/vif.cpp`, `vif.hpp` (`transfer_chain`, `run_hooked`, `feed`, hook in `run_vu`), `runtime/src/gs/queue.hpp` (`kVif1Chain`), `runtime/src/system.cpp` (VU thread), `runtime/src/vu_micro.cpp`, `vu_micro.hpp` (`program_key`), `runtime/src/draw_profile.cpp`, `draw_profile.hpp` (`handler_ran`), `host/main.cpp`, `host/web.cpp` (`register_chain_handlers()`) | Chain handlers (T46, D32): a claimed VIF1 `call`'s data goes to the handler as one (`kVif1Chain` in the window), `chain::run` with a hook at each VU1 start; profile `ret` now after the tag's data. No handler: one test of a null pointer per `call` tag and VU1 start; frames and cycles unchanged. |
 | `runtime/include/ps2/chain.hpp`, `runtime/src/chain.cpp` (`mesh_path`, `mesh_add`, `mesh_draw`, `run` with an unpack hook), `runtime/src/vif.cpp`, `vif.hpp` (unpack hook in `unpack`, `run_hooked`), `runtime/src/gs/gs.cpp`, `gs.hpp` (`render_mesh`, `kMesh`/`kMeshData`), `runtime/src/gs/queue.hpp`, `runtime/src/gs/gpu/gpu.cpp`, `gpu.hpp` (`draw_mesh`, `mesh_add`, `flush_meshes`, `setup_for`/`add_prim`/`finish_batch`/`dispatch_decodes` split out of `draw`/`flush_batch`, arena `base`, mesh pipelines), `runtime/src/gs/gpu/gs.wgsl` (`raster_mesh`), `runtime/src/gs/gpu/mesh.wgsl` (new: `mesh_build`, `mesh_bin`), `CMakeLists.txt` (`kMeshShader`), `host/main.cpp` (`gpu_mesh` setting) | GPU mesh path (T48, D36): mesh vertices cached on the GPU, strips built and binned there (see [Chain handlers](#chain-handlers-t46)). Off (`PS2_GPU_MESH=0`) or no mesh draws: the same frames and cycles (menu run 107/107, no handler and identity handler). |
+| `CMakeLists.txt` (`../native` sources and `native.wgsl` in the wgpu block), `runtime/src/gs/gs.cpp` (`native::` calls in `init`, `render_reset`, `kick`, TRXDIR, `feed_image`, `load_clut`, `vblank`, kVblank, present, display, window attach/resize, `flush_and_wait`, state load, `stats`; `cpu_raster()` false with it on) | Native renderer hook (T57, D40): with `PS2_RENDERER=native` the GS front end feeds `recomp/native/` instead of the GS raster ([Native renderer](#native-renderer-t57)). Unset: frames and cycles unchanged (menu run 107/107, 52,595,993,647). |
 | `runtime/src/emu_count.cpp`, `emu_count.hpp` (new), `CMakeLists.txt`, hooks in `runtime/src/memory.cpp` (EE register accesses), `hw.cpp` (INTC, DMAC interrupts), `kernel.cpp` (syscalls), `dmac.cpp`, `vif.cpp`, `vu_micro.cpp` (VU1 runs by key, VCALLMS), `gs/gif.cpp`, `gs/gs.cpp` (primitives, registers, transfers, mesh strips), `iop/kernel.cpp` (IOP instructions, HLE calls), `iop/hw.cpp`, `iop/spu2.cpp`, `iop/sif.cpp`, `system.cpp` (per frame, exit, off when the window threads start) | Emulation counters (T56): `PS2_EMU_COUNT=<file>`, headless, see [Emulation counters](#emulation-counters-t56). Unset: one test of a false flag per event; frames and cycles unchanged (menu run 107/107, also set). |
 
 The headless Windows build (T22) needs no changes to upstream: the headless path
@@ -789,6 +879,7 @@ python recomp/tests/oracle.py [--mode rec interp ...]     # Windows: vectors on 
 | `tests/test_port.py` | `port.py`'s pure parts: serial from the boot ELF name, default `game.json`, refusal to overwrite, folder `settings.json` |
 | `tests/test_explore.py` | `explore.py` on synthetic frames: frame signature, black/frozen/repeated frames are not new scenes, stall rule, pattern order (stalls in a row try every pattern), generated presses |
 | `tests/test_drawlist.py` | `drawlist.py` on a synthetic chain: log parsing (incl. chain handler lines), chain read and VIF fingerprint, kinds and shares, `--match` at an odd file offset |
+| `tests/test_framediff.py` | `framediff.py` on synthetic frames: largest-channel difference, mean and share over the threshold, diff images, folders with unmatched names, the bar's exit code |
 | `tests/test_emucount.py` | `emucount.py` on a synthetic counter file: sections and frame ranges, names, GS state decode, report lines |
 | `tests/harness/` | C++ harness (`main.cpp`: load state, `dispatch`, print state as JSON), `override.cpp` (the override case's C++) and its CMake project (links upstream `ps2runtime`) |
 

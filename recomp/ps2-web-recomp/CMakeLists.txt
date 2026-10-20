@@ -88,7 +88,15 @@ if(EMSCRIPTEN OR EXISTS "${PS2_WGPU_LIB}")
     add_custom_command(OUTPUT "${PS2_MESH_WGSL}"
         COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/mesh.wgsl -DOUT=${PS2_MESH_WGSL} -DNAME=kMeshShader -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
         DEPENDS runtime/src/gs/gpu/mesh.wgsl cmake/embed.cmake)
-    target_sources(ps2runtime PRIVATE runtime/src/gs/gpu/gpu.cpp runtime/src/gs/gpu/texpack.cpp "${PS2_GS_WGSL}" "${PS2_BLIT_WGSL}" "${PS2_MESH_WGSL}")
+    # Native renderer (T57): our code in recomp/native, next to the vendored tree.
+    set(PS2_NATIVE_DIR "${CMAKE_SOURCE_DIR}/../native")
+    set(PS2_NATIVE_WGSL "${CMAKE_BINARY_DIR}/native_wgsl.cpp")
+    add_custom_command(OUTPUT "${PS2_NATIVE_WGSL}"
+        COMMAND ${CMAKE_COMMAND} -DSRC=${PS2_NATIVE_DIR}/native.wgsl -DOUT=${PS2_NATIVE_WGSL} -DNAME=kNativeShader -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
+        DEPENDS ${PS2_NATIVE_DIR}/native.wgsl cmake/embed.cmake)
+    target_sources(ps2runtime PRIVATE runtime/src/gs/gpu/gpu.cpp runtime/src/gs/gpu/texpack.cpp "${PS2_GS_WGSL}" "${PS2_BLIT_WGSL}" "${PS2_MESH_WGSL}"
+        "${PS2_NATIVE_DIR}/renderer.cpp" "${PS2_NATIVE_WGSL}")
+    target_include_directories(ps2runtime PRIVATE "${PS2_NATIVE_DIR}")
     target_compile_definitions(ps2runtime PUBLIC PS2_GPU)
     if(EMSCRIPTEN)
         target_compile_options(ps2runtime PUBLIC --use-port=emdawnwebgpu)

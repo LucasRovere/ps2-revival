@@ -203,4 +203,10 @@ the same change.
   then T69-T72, then T40. T47, T55, T29, T30 dropped. Plan:
   [docs/native-port-plan.md](docs/native-port-plan.md) "Fully native".
 - Emulation counters (T56): `PS2_EMU_COUNT=<file>` (headless, opt-in) + `recomp/emucount.py`: what emulated hardware a scene uses (IOP, VU1, VIF, DMA, GIF, GS census, EE registers by guest function, SIF RPC, SPU2); the measure for T57-T68.
+- Native renderer (T57, D40): `PS2_RENDERER=native` (opt-in): `recomp/native/` draws GS
+  primitives with WebGPU render pipelines into native targets (rgba16float, dual-source
+  blending), textures from a CPU copy of uploads cached by content, packs work;
+  `recomp/framediff.py` pixel diff, bar mean ≤ 5 and ≤ 4% over 24: menus/movies within it,
+  races not yet (T58: a frame re-read as 16-bit, downloads); slower than the GS path (T59).
+  Owner (D39): decompile only hot spots; one picture per screen refresh (T67).
 - Next up: see [docs/tasks.md](docs/tasks.md). The owner runs tasks with `/next-task`.

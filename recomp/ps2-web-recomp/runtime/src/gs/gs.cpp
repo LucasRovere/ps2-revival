@@ -7,6 +7,7 @@
 #include "../hw.hpp"
 #ifdef PS2_GPU
 #include "gpu/gpu.hpp"
+#include "native.hpp"
 #endif
 
 #include "ps2/state.hpp"
@@ -38,11 +39,11 @@ alignas(64) std::uint8_t g_memory[kMemorySize];
 std::uint64_t g_pmode, g_smode1, g_smode2, g_srfsh, g_synch1, g_synch2, g_syncv;
 std::uint64_t g_dispfb[2], g_display[2], g_extbuf, g_extdata, g_extwrite, g_bgcolor;
 std::uint64_t g_csr = 0x551B4000ull, g_imr = 0x7F00ull, g_busdir, g_siglblid;
-std::uint64_t g_primitives = 0;
+std::uint64_t g_primitives = 0, g_raster_primitives = 0;
 
 #ifdef PS2_GPU
 bool gpu_on() { return gpu::mode() != gpu::Mode::off; }
-bool cpu_raster() { return gpu::mode() != gpu::Mode::primary; }
+bool cpu_raster() { return gpu::mode() != gpu::Mode::primary && !native::on(); }
 // GS memory written on the CPU too: for the CPU rasterizer, or for the texture dump.
 bool cpu_memory() { return cpu_raster() || gpu::texture_dump(); }
 #else
@@ -254,6 +255,7 @@ std::size_t g_carried = 0;
 void feed_image(const std::uint8_t *data, std::size_t bytes) {
 #ifdef PS2_GPU
     if (gpu_on() && (g_state.trxdir & 3u) == 0) gpu::image_data(data, bytes);
+    if (native::on() && (g_state.trxdir & 3u) == 0) native::image_data(data, bytes);
 #endif
     if (!cpu_memory()) return;
     if (!g_transfer.active || (g_state.trxdir & 3u) != 0) return;
@@ -317,6 +319,7 @@ void load_clut(std::uint64_t tex0) {
     const std::uint32_t csa = static_cast<std::uint32_t>(tex0 >> 56) & 0x1Fu;
 #ifdef PS2_GPU
     if (gpu_on()) gpu::load_clut(tex0, g_state.texclut);
+    if (native::on()) native::load_clut(tex0, g_state.texclut);
 #endif
     if (!cpu_memory()) return;
     const bool eight = psm == PSMT8 || psm == PSMT8H;
@@ -442,6 +445,7 @@ void init() {
     build_tables();
     built = true;
 #ifdef PS2_GPU
+    if (native::init()) return;
     const char *backend = std::getenv("PS2_GS");
     const gpu::Mode wanted = !backend || std::strcmp(backend, "gpu") == 0 ? gpu::Mode::primary : std::strcmp(backend, "both") == 0 ? gpu::Mode::mirror : gpu::Mode::off;
     if (wanted != gpu::Mode::off && !gpu::init(wanted)) std::fprintf(stderr, "[gs] WebGPU unavailable, using the software renderer\n");
@@ -460,6 +464,9 @@ void render_reset() {
     g_transfer = Transfer{};
     g_primitives = 0;
     raster::reset();
+#ifdef PS2_GPU
+    if (native::on()) native::reset();
+#endif
 }
 
 void reset() {
@@ -483,7 +490,9 @@ void kick(bool draw) {
         if (cpu_raster()) raster::draw(s, s.queue, needed);
 #ifdef PS2_GPU
         if (gpu_on()) gpu::draw(s, s.queue, needed);
+        if (native::on()) native::draw(s, s.queue, needed);
 #endif
+        if (cpu_raster() || gpu_on()) ++g_raster_primitives;
         ++g_primitives;
         if (emu_count::g_on) emu_count::gs_draw(s);
     }
@@ -610,6 +619,10 @@ void write(std::uint32_t reg, std::uint64_t value) {
             if ((value & 3u) == 0) gpu::image_begin(s);
             else if ((value & 3u) == 2) gpu::local_copy(s);
             else if ((value & 3u) == 1 && !cpu_raster()) download_source(s);
+        }
+        if (native::on()) {
+            if ((value & 3u) == 0) native::image_begin(s);
+            else native::transfer(static_cast<std::uint32_t>(value & 3u));
         }
 #endif
         if ((value & 3u) == 0) g_transfer.active = true;
@@ -821,6 +834,7 @@ void vblank(bool start) {
         if (queue::active()) queue::post(queue::kVblank, 0, 0, nullptr, 0);
 #ifdef PS2_GPU
         else if (gpu_on()) gpu::flush();
+        else if (native::on()) native::flush();
 #endif
     }
 }
@@ -829,6 +843,7 @@ bool interlaced_odd_field() { return g_odd_field; }
 
 bool attach_window(int kind, void *display, std::uint64_t window, void *surface, const char *selector, std::uint32_t width, std::uint32_t height) {
 #ifdef PS2_GPU
+    if (native::on()) return native::attach_surface(kind, display, window, surface, width, height);
     if (gpu::mode() != gpu::Mode::primary) return false;
     const gpu::SurfaceTarget target{static_cast<gpu::SurfaceTarget::Kind>(kind), display, window, surface, selector, width, height};
     return gpu::attach_surface(target);
@@ -840,6 +855,7 @@ bool attach_window(int kind, void *display, std::uint64_t window, void *surface,
 
 void resize_window(std::uint32_t width, std::uint32_t height) {
 #ifdef PS2_GPU
+    if (native::on()) native::resize_surface(width, height);
     gpu::resize_surface(width, height);
 #else
     (void)width, (void)height;
@@ -860,6 +876,7 @@ bool present() { return present(display_regs()); }
 
 bool present(const DisplayRegs &r) {
 #ifdef PS2_GPU
+    if (native::on()) return native::present(r);
     if (!gpu::has_surface()) return false;
     const int circuit = (r.pmode & 2u) ? 1 : (r.pmode & 1u) ? 0 : -1;
     if (circuit < 0) return true;
@@ -878,6 +895,9 @@ bool present(const DisplayRegs &r) {
 bool display(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) { return display(display_regs(), rgba, width, height); }
 
 bool display(const DisplayRegs &r, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) {
+#ifdef PS2_GPU
+    if (native::on()) return native::display(r, rgba, width, height);
+#endif
     const int circuit = (r.pmode & 2u) ? 1 : (r.pmode & 1u) ? 0 : -1;
     if (circuit < 0) return false;
     const std::uint64_t fb = r.dispfb[circuit], disp = r.display[circuit];
@@ -966,6 +986,7 @@ std::uint32_t g_presented_frame = 0;
 void flush_and_wait() {
 #ifdef PS2_GPU
     if (gpu_on()) gpu::wait_idle();
+    if (native::on()) native::wait_idle();
 #endif
 }
 
@@ -996,6 +1017,7 @@ Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_prese
         case queue::kVblank:
 #ifdef PS2_GPU
             if (gpu_on()) gpu::flush();
+            if (native::on()) native::flush();
 #endif
             break;
         case queue::kPresent: {
@@ -1118,6 +1140,7 @@ void stats() {
     if (const char *spec = std::getenv("PS2_DUMP_VRAM")) dump_region(spec);
 #ifdef PS2_GPU
     gpu::stats();
+    if (native::on()) native::stats(g_raster_primitives);
 #endif
     std::fprintf(stderr, "[gs] %llu primitives drawn, register writes:", static_cast<unsigned long long>(g_primitives));
     for (int r = 0; r < 128; ++r)
@@ -1182,6 +1205,7 @@ void render_state(ps2::state::Stream &s) {
         }
         gpu::write_state(vram, scale, clut);
     }
+    if (s.loading() && native::on()) native::reset();
 #endif
 }
 

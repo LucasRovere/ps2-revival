@@ -917,3 +917,64 @@ written for a 300 MHz CPU. A measured target keeps each task honest.
 logic (then the owner decides how far decompilation goes, D37 point 2), or
 the game's physics or timers break above 60 fps (then fixed-step logic with
 interpolation, or cap at the display rate).
+
+## D39: Owner answers after T56: decompile only hot spots; one picture per screen refresh
+
+**Decision (owner, 2026-10-20, chat):**
+- Q: "If removing emulation isn't enough to get the game's own code under
+  3 ms/frame, how far should decompilation go?" A (verbatim): **"Only hot
+  spots"**: profile the EE thread, decompile just the costliest functions
+  (overrides, D5) until the EE target (D38) is met; no wholesale
+  decompilation of game logic.
+- Q: "In races the game renders ~1.6 pictures per shown frame. OK to render
+  once per screen refresh (optional 90 fps cap) with game speed
+  unchanged?" A (verbatim): **"Yes"**.
+
+**Why:** the D38 target is about speed; decompiling all logic is a separate,
+much larger job (D37 point 2) with no speed benefit outside the hot spots.
+The pictures nobody sees are pure cost.
+
+**Effect on the backlog:** T67 renders one picture per present (with the
+optional 90 fps cap) and keeps game speed, physics and audio independent of
+the frame rate; T71's first subsystem is chosen by an EE profile (hot
+spots) and decompilation stops when the EE target is met. D37 point 2 and
+the D38 revisit line ("owner decides how far decompilation goes") are
+answered by this.
+
+## D40: Native renderer design (T57)
+
+**Decision (T57, 2026-10-20):** the GS-draw translator (`recomp/native/`,
+`PS2_RENDERER=native`, opt-in until T59):
+- Own WebGPU device; render targets are `rgba16float` textures at the
+  internal scale found by FRAME base pointer, width and format, with RGB
+  stored as value/255 and alpha as value/128. So the GS blend factors As,
+  Ad and FIX (128 = 1.0) are plain WebGPU factors, values over 1.0 are kept
+  (destination alpha with FBA set) and `Cd * (1 + C)` works with a source of
+  1 and a `Dst` factor.
+- Dual-source blending (WebGPU feature, required): blend source 0 carries
+  the alpha that is written (after FBA), source 1 the alpha the blend uses
+  (As). Without the feature the GS renderer is used.
+- Depth: `depth32float` per (ZBP, target size), z / 2^24 for Z24: exact.
+- Primitives as triangle lists; GS pixel coverage (points, not centres)
+  by a half-pixel shift; S, T, Q interpolated linearly and divided per pixel
+  as on the GS (clip w = 1); the game's mip levels with the GS LOD formula
+  from Q.
+- Textures decoded on the CPU from a CPU copy of GS memory that the
+  translator keeps from uploads (no GS raster, no drawing into it); decoded
+  textures are cached by content (D25 upload tags, else page hashes) and
+  the CLUT's content; packs use the D25 keys unchanged. A texture at a
+  target's base pointer in the same format class samples the target.
+- The GPU mesh path (T48) is off with the native renderer (the handler's
+  VU1 batches feed the translator); T60 replaces it.
+
+**Why:** fixed-function blending with exact factors needs a float target
+(unorm clamps factors and alpha over 1.0); dual-source blending is the only
+way to write FBA alpha and still blend with the source alpha in one pass.
+A CPU copy of uploaded memory is the simplest way to decode textures
+uploaded in one format and read in another (the pilot uploads 4-bit
+textures as 32-bit); it holds no rendered pixels.
+
+**Revisit if:** colour clamping matters (float targets keep results over
+255 between blends; COLCLAMP clamps only on display and texture reads), the
+CPU decode and upload copy stay too slow for the D38 render target (move
+them to the GPU), or a target is read in another format (T58).
