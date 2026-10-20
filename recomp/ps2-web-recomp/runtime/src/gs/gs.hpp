@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ps2/chain.hpp"
 #include "ps2/cpu.hpp"
 #include "ps2/system.hpp"
 
@@ -90,5 +91,11 @@ Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_prese
 double gpu_busy_ms();
 std::uint64_t primitives_drawn();
 void stats();
+
+// GPU mesh path (T48, ps2/chain.hpp): from the thread that runs VIF1, in stream order.
+bool mesh_path();
+void mesh_add(std::uint32_t id, const ps2::chain::MeshVertex *v, std::uint32_t count);
+// screen: each vertex's c.xy / c.w (NaN behind the camera), for binning.
+void mesh_draw(const ps2::chain::MeshDraw &d, const float *screen);
 
 }

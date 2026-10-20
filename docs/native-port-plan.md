@@ -214,6 +214,27 @@ runtime, so handlers do not change cycle counts. Findings:
   VU1 part; frame times unchanged within noise. The gain needs the GPU
   path (step 4), which must skip the VIF unpacks too: the chain's VIF state
   (double-buffer offsets) still has to advance as if it ran.
+
+**GPU mesh path (T48, D36; details in `recomp/README.md` and the local
+notes).** A handler keeps each static chain's batch input (VU1 memory at
+TOP) from the chain's first call; later calls skip the batch unpacks (the
+VIF state still advances), run the per-object setup program on VU1 as
+before and send each batch to the renderer as a `MeshDraw` (strip, GS
+PRIM, matrix, flags) in stream order. On the GPU, one pass builds the
+strip triangles' primitive records from the cached vertices with the VU
+and GS front-end arithmetic (products rounded one by one, the reciprocal
+truncated: bit-exact), the CPU lists 64-record chunks per tile from the
+strips' projected boxes, a pass picks each tile's records and a raster
+pass like the existing one shades them. Findings (pilot's pre-lit
+scenery): frames byte-identical with the GPU path, same cycles; batches
+that need the clipper (~0.6%) are decided before their unpacks and run as
+before. Headless racing 25.5 → 22.1 ms/frame (scale 1), 27.0 → 23.1
+(scale 3); race intro 29.8 → 23.2, 30.6 → 26.0. Window (owner settings
+with pack): racing 60 fps either way with the render thread 78% → 69% of a
+core at scale 3; race intro scale 3 mean 56.1 → 58.2 fps (lowest 1 s 36 →
+47), scale 1 58.1 → 60.0 (lowest 40 → 56). Mesh batches hold no other
+primitives, so other draws in between split them; without a texture pack
+the race intro at scale 3 is GPU-bound with the path on (open, backlog).
 **Plan (D32).** The hook is a generic runtime seam: a handler registered
 for static mesh chains is called where VIF1 `call`s the chain (on the VU
 thread in the window, so GS ordering stays right) and may draw the mesh
@@ -225,10 +246,11 @@ itself. Steps, one session each:
    static meshes, VU1 program path re-implemented on the CPU, primitives
    into the GS renderer, frames compared with the VU path (T46, done:
    byte-identical, little speed gain).
-3. Lit car meshes the same way (T47).
-4. GPU mesh path: chain vertex data cached on the GPU, a compute pass
-   builds the GS primitives (skips the VU1 work and the GS front end);
-   fps and thread load measured at scale 3 (T48).
+3. Lit car meshes the same way (T47; may go straight to the GPU path).
+4. GPU mesh path: chain vertex data cached on the GPU, compute passes
+   build and bin the GS primitives (skip the VIF unpacks, VU1 work and GS
+   front end); fps and thread load measured at scale 1 and 3 (T48, done:
+   pre-lit scenery, byte-identical, on by default).
 5. Model replacement through the handler (a glTF model in place of a
    car's chain) (T49).
 6. Look extras, decided after 4 and 5: forced best LOD (EE override),

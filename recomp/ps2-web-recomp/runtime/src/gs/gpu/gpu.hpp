@@ -28,6 +28,10 @@ Mode mode();
 bool texture_dump();
 bool init(Mode m);
 void draw(const State &s, const Vertex *v, int count);
+// GPU mesh path (T48): on in primary mode unless PS2_GPU_MESH=0.
+bool mesh_path();
+void mesh_add(std::uint32_t id, const ps2::chain::MeshVertex *v, std::uint32_t count);
+void draw_mesh(const State &s, const ps2::chain::MeshDraw &d, const float *screen);
 void image_begin(const State &s);
 void image_data(const std::uint8_t *data, std::size_t bytes);
 void local_copy(const State &s);

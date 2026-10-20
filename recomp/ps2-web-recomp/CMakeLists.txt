@@ -83,7 +83,11 @@ if(EMSCRIPTEN OR EXISTS "${PS2_WGPU_LIB}")
     add_custom_command(OUTPUT "${PS2_BLIT_WGSL}"
         COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/blit.wgsl -DOUT=${PS2_BLIT_WGSL} -DNAME=kBlitShader -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
         DEPENDS runtime/src/gs/gpu/blit.wgsl cmake/embed.cmake)
-    target_sources(ps2runtime PRIVATE runtime/src/gs/gpu/gpu.cpp runtime/src/gs/gpu/texpack.cpp "${PS2_GS_WGSL}" "${PS2_BLIT_WGSL}")
+    set(PS2_MESH_WGSL "${CMAKE_BINARY_DIR}/mesh_wgsl.cpp")
+    add_custom_command(OUTPUT "${PS2_MESH_WGSL}"
+        COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/mesh.wgsl -DOUT=${PS2_MESH_WGSL} -DNAME=kMeshShader -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
+        DEPENDS runtime/src/gs/gpu/mesh.wgsl cmake/embed.cmake)
+    target_sources(ps2runtime PRIVATE runtime/src/gs/gpu/gpu.cpp runtime/src/gs/gpu/texpack.cpp "${PS2_GS_WGSL}" "${PS2_BLIT_WGSL}" "${PS2_MESH_WGSL}")
     target_compile_definitions(ps2runtime PUBLIC PS2_GPU)
     if(EMSCRIPTEN)
         target_compile_options(ps2runtime PUBLIC --use-port=emdawnwebgpu)

@@ -28,6 +28,7 @@ State g_state;
 std::uint32_t g_setup_generation = 0;
 
 void serve_state(const void *payload);
+void render_mesh(const chain::MeshDraw &d, const float *screen);
 
 namespace {
 
@@ -1002,6 +1003,17 @@ Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_prese
             break;
         }
         case queue::kState: serve_state(payload); break;
+        case queue::kMesh: {
+            chain::MeshDraw d;
+            float screen[256];
+            std::memcpy(&d, payload, sizeof d);
+            std::memcpy(screen, payload + sizeof d, d.count * 8);
+            render_mesh(d, screen);
+            break;
+        }
+#ifdef PS2_GPU
+        case queue::kMeshData: gpu::mesh_add(h.arg0, reinterpret_cast<const chain::MeshVertex *>(payload), h.arg1); break;
+#endif
         case queue::kDownload: {
             std::uintptr_t target;
             std::memcpy(&target, payload, sizeof target);
@@ -1033,6 +1045,50 @@ Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_prese
 }
 
 std::uint64_t primitives_drawn() { return g_primitives; }
+
+bool mesh_path() {
+#ifdef PS2_GPU
+    return gpu::mesh_path();
+#else
+    return false;
+#endif
+}
+
+// As the strip's path 1 packet would: GIF tag (Q reset, PRE writes PRIM), then the strip.
+void render_mesh(const chain::MeshDraw &d, const float *screen) {
+    g_state.q = 1.0f;
+    write(0x00, d.prim);
+#ifdef PS2_GPU
+    gpu::draw_mesh(g_state, d, screen);
+#else
+    (void)screen;
+#endif
+    g_primitives += d.count > 2 ? d.count - 2 : 0;
+}
+
+void mesh_add(std::uint32_t id, const chain::MeshVertex *v, std::uint32_t count) {
+    if (queue::active()) {
+        queue::post(queue::kMeshData, id, count, v, count * static_cast<std::uint32_t>(sizeof *v));
+        return;
+    }
+#ifdef PS2_GPU
+    gpu::mesh_add(id, v, count);
+#endif
+}
+
+void mesh_draw(const chain::MeshDraw &d, const float *screen) {
+    if (queue::active()) {
+        struct {
+            chain::MeshDraw d;
+            float screen[256];
+        } packet;
+        packet.d = d;
+        std::memcpy(packet.screen, screen, d.count * 8);
+        queue::post(queue::kMesh, 0, 0, &packet, static_cast<std::uint32_t>(sizeof d + d.count * 8));
+        return;
+    }
+    render_mesh(d, screen);
+}
 
 void dump_region(const char *spec) {
 #ifdef PS2_GPU

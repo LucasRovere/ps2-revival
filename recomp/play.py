@@ -14,6 +14,7 @@ and are created with defaults on first use:
   textures    texture pack folder (PS2_TEXTURES, relative to the repo or absolute); "" = off
   mods        mod folder: replacement files at their disc paths (PS2_MODS, relative to the repo or absolute); "" = off
   frame_log   true: per-frame times and thread waits in frame_log.txt next to the card (PS2_FRAME_LOG)
+  gpu_mesh    false: no GPU mesh path (PS2_GPU_MESH=0; chain handlers then draw as before)
 
 Usage:
   python recomp/play.py <SERIAL>
@@ -30,7 +31,7 @@ from port import BUILD_SUFFIX, GAMES_DIR, REPO, WORK_DIR, default_aspect
 
 def load_settings(serial, aspect):
     path = GAMES_DIR / serial / "play.json"
-    defaults = {"memcard": f"local/games/{serial}/memcard.ps2", "scale": 1, "fullscreen": False, "aspect": aspect, "textures": "", "mods": "", "frame_log": False}
+    defaults = {"memcard": f"local/games/{serial}/memcard.ps2", "scale": 1, "fullscreen": False, "aspect": aspect, "textures": "", "mods": "", "frame_log": False, "gpu_mesh": True}
     if not path.exists():
         path.write_text(json.dumps(defaults, indent=2) + "\n")
         print(f"created {path} with defaults")
@@ -64,6 +65,8 @@ def main():
         env["PS2_TEXTURES"] = str(REPO / settings["textures"])
     if settings["mods"]:
         env["PS2_MODS"] = str(REPO / settings["mods"])
+    if not settings["gpu_mesh"]:
+        env["PS2_GPU_MESH"] = "0"
     if settings["frame_log"]:
         env["PS2_FRAME_LOG"] = str(card.parent / "frame_log.txt")
         print(f"frame log: {env['PS2_FRAME_LOG']}", flush=True)

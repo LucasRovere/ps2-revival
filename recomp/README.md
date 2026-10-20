@@ -196,6 +196,7 @@ git-ignored), created with defaults on first use:
 | `textures` | `""` | Texture pack folder (`PS2_TEXTURES`, relative to the repo or absolute), e.g. `local/games/<SERIAL>/textures`; `""` = off (below) |
 | `mods` | `""` | Mod folder (`PS2_MODS`, relative to the repo or absolute): replacement disc files ([Mods](#mods-t42)); `""` = off |
 | `frame_log` | `false` | `true`: frame-time log in `frame_log.txt` next to the card (`PS2_FRAME_LOG`, [below](#draw-profile-and-frame-time-log-t45)) |
+| `gpu_mesh` | `true` | `false`: no GPU mesh path (`PS2_GPU_MESH=0`, [Chain handlers](#chain-handlers-t46)); also read from the port folder's `settings.json` |
 
 Keys missing from an older `play.json` take the defaults. The log shows
 `settings: ...`, `[gpu] scale N`, `[gpu] aspect W:H` and
@@ -605,6 +606,42 @@ the batches' VU1 work (excl. the GS front end of their kicks) ~20% less
 (VIF unpacks and the GS front end stay); headless and window frame times
 unchanged within noise, fewer VU-limited frames at scale 1 (race intro
 60 → 16 of 2,397). The speed is for the GPU mesh path (T48).
+**GPU mesh path (T48, D36).** In the GPU renderer (window and headless
+Windows builds; not with `PS2_GS=both` or the CPU rasterizer;
+`PS2_GPU_MESH=0` turns it off) a handler may draw a batch's strip from
+vertices kept on the GPU instead of running its VU1 program:
+`ps2::chain::mesh_path()` says whether it is on, `mesh_add(vertices,
+count)` copies a mesh (position, RGBA, two ST sets, ADC flag per vertex)
+and returns its id, `mesh_draw(d)` stands for one path 1 packet of the
+strip in stream order (GIF tag with PRE, then ST, RGBAQ, XYZF2 per vertex):
+c = m[3] + m[0] x + m[1] y + m[2] z, q = 1 / c.w, ST = st q, XYZF2 =
+ftoi4 of c.xyz q (z >> 4), no fog; flat colour, which ST set and extra
+ADC bits per draw. `chain::run(data, qwc, hook, unpack)` takes an
+unpack hook that may skip an UNPACK's writes (mode 0/1) while the VIF
+state advances, so a handler can skip the vertex data it already has.
+`mesh_draw` projects the strip's vertices on the calling thread (screen
+boxes); the render thread keeps the GS state effects of the tag, and the
+GPU does the rest: `mesh_build` (one invocation per triangle) makes the
+primitive records `draw()` would make, with VU1's arithmetic (each product
+rounded on its own, the reciprocal truncated; 1/area rounded): bit-exact;
+a batch of mesh strips holds no other primitives; at its flush the CPU
+gives each chunk of 64 records the box of its strips and lists the chunks
+per tile, `mesh_bin` keeps each tile's records that touch it (box and
+edges) in order, and `raster_mesh` shades them like `raster`. Records and
+tile lists sit in `g_data` below the arena (never uploaded); one
+`mesh_build` per submit.
+
+Check (pilot's pre-lit scenery, local handler): frames byte-identical with
+the path on (racing 15/15, race intro 52/52, menu run 107/107, scale 3
+with the pack: racing 15/15 and race intro 26/26 against the path off),
+same cycles; ~0.5% of the batches (clipper) unpacked and drawn as before.
+Headless (`PS2_TIME`, 200 frames, off → on): racing 25.5 → 22.1 ms
+(scale 1), 27.0 → 23.1 (scale 3); race intro 29.8 → 23.2, 30.6 → 26.0.
+Window (16:9, pack, frame log, 40 s, off → on): racing 60 fps at scale 1
+and 3 (render thread 78% → 69% of a core at scale 3); race intro scale 1
+mean 58.1 → 60.0 fps (lowest 1 s window 40 → 56), scale 3 56.1 → 58.2
+(36 → 47). Without a texture pack the race intro at scale 3 is GPU-bound
+with the path on (~51 fps vs ~59 off; open).
 ### Patches and overrides (T31)
 
 **Patches:** the top-level `game.json` `patches` (the Phase 4 recipe, see
@@ -680,6 +717,7 @@ except:
 | `runtime/src/gs/queue.hpp`, `queue.cpp` (`time_waits`, `wait_began`, `wait_ended`, `waited_ms`, `wait` kind), `runtime/src/gs/gs.cpp`, `gs.hpp` (`post_present(frame)`, `presented_frame`), `runtime/src/system.cpp`, `runtime/include/ps2/system.hpp` (wrappers, present timed), `host/window.cpp` (`PS2_FRAME_LOG`, `pace`) | Frame-time log (T45): time each thread waits by kind (only after `time_waits()`, i.e. with `PS2_FRAME_LOG`); the present carries its guest frame in the queue header. Pacing: timer-spaced frames with an audio-queue correction instead of waiting for the audio queue (window only; headless unchanged). |
 | `runtime/src/gs/gpu/texpack.cpp` (`Slot`, `load`, `claim`, `start_loaders`, `find`) | Pack loader threads (T53): with `PS2_TEXTURES` set, `init` starts threads that decode every pack image; `find` decodes or waits for an image not decoded yet, so frames do not depend on timing. Without a pack nothing starts; frames and cycles unchanged. |
 | `runtime/include/ps2/chain.hpp`, `runtime/src/chain.cpp`, `chain.hpp` (new), `CMakeLists.txt`, `runtime/src/dmac.cpp` (`run_chain`, `to_vif`), `runtime/src/vif.cpp`, `vif.hpp` (`transfer_chain`, `run_hooked`, `feed`, hook in `run_vu`), `runtime/src/gs/queue.hpp` (`kVif1Chain`), `runtime/src/system.cpp` (VU thread), `runtime/src/vu_micro.cpp`, `vu_micro.hpp` (`program_key`), `runtime/src/draw_profile.cpp`, `draw_profile.hpp` (`handler_ran`), `host/main.cpp`, `host/web.cpp` (`register_chain_handlers()`) | Chain handlers (T46, D32): a claimed VIF1 `call`'s data goes to the handler as one (`kVif1Chain` in the window), `chain::run` with a hook at each VU1 start; profile `ret` now after the tag's data. No handler: one test of a null pointer per `call` tag and VU1 start; frames and cycles unchanged. |
+| `runtime/include/ps2/chain.hpp`, `runtime/src/chain.cpp` (`mesh_path`, `mesh_add`, `mesh_draw`, `run` with an unpack hook), `runtime/src/vif.cpp`, `vif.hpp` (unpack hook in `unpack`, `run_hooked`), `runtime/src/gs/gs.cpp`, `gs.hpp` (`render_mesh`, `kMesh`/`kMeshData`), `runtime/src/gs/queue.hpp`, `runtime/src/gs/gpu/gpu.cpp`, `gpu.hpp` (`draw_mesh`, `mesh_add`, `flush_meshes`, `setup_for`/`add_prim`/`finish_batch`/`dispatch_decodes` split out of `draw`/`flush_batch`, arena `base`, mesh pipelines), `runtime/src/gs/gpu/gs.wgsl` (`raster_mesh`), `runtime/src/gs/gpu/mesh.wgsl` (new: `mesh_build`, `mesh_bin`), `CMakeLists.txt` (`kMeshShader`), `host/main.cpp` (`gpu_mesh` setting) | GPU mesh path (T48, D36): mesh vertices cached on the GPU, strips built and binned there (see [Chain handlers](#chain-handlers-t46)). Off (`PS2_GPU_MESH=0`) or no mesh draws: the same frames and cycles (menu run 107/107, no handler and identity handler). |
 
 The headless Windows build (T22) needs no changes to upstream: the headless path
 leaves out `host/window.cpp` (SDL2), `host/profile.cpp` (Linux only) and the

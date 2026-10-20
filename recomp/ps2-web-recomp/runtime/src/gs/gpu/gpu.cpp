@@ -21,6 +21,7 @@
 
 extern const char kGsShader[];
 extern const char kBlitShader[];
+extern const char kMeshShader[];
 
 namespace ps2::gs {
 void swizzle_tables(std::vector<std::uint32_t> &out);
@@ -30,8 +31,9 @@ namespace ps2::gs::gpu {
 
 namespace {
 
-enum Pipeline { kUpload, kCopyRead, kCopyWrite, kLoadClut, kDisplay, kRaster, kResolve, kSnapshot, kDecode, kPipelines };
-const char *const kEntryPoints[kPipelines] = {"upload", "copy_read", "copy_write", "load_clut", "display", "raster", "resolve", "snapshot", "decode"};
+// kMeshBuild and kMeshBin (T48) come from their own module and bind group (g_data writable there).
+enum Pipeline { kUpload, kCopyRead, kCopyWrite, kLoadClut, kDisplay, kRaster, kResolve, kSnapshot, kDecode, kRasterMesh, kPipelines, kMeshBuild = kPipelines, kMeshBin, kAllPipelines };
+const char *const kEntryPoints[kAllPipelines] = {"upload", "copy_read", "copy_write", "load_clut", "display", "raster", "resolve", "snapshot", "decode", "raster_mesh", "mesh_build", "mesh_bin"};
 
 constexpr std::uint32_t kParamStride = 256;
 constexpr std::uint32_t kClutSlots = 2048;
@@ -42,7 +44,7 @@ constexpr std::uint32_t kDecodedWords = 4u << 20;
 constexpr std::uint32_t kDecodePrims = 64;
 
 Mode g_mode = Mode::off;
-std::uint64_t g_dispatches[kPipelines] = {}, g_submits = 0;
+std::uint64_t g_dispatches[kAllPipelines] = {}, g_submits = 0;
 
 WGPUInstance g_instance = nullptr;
 WGPUAdapter g_adapter = nullptr;
@@ -101,7 +103,29 @@ std::uint64_t g_params_size = 0, g_data_size = 0;
 WGPUBindGroupLayout g_layout = nullptr;
 WGPUPipelineLayout g_pipeline_layout = nullptr;
 WGPUBindGroup g_group = nullptr;
-WGPUComputePipeline g_pipelines[kPipelines] = {};
+WGPUComputePipeline g_pipelines[kAllPipelines] = {};
+
+// GPU mesh path (T48): each mesh's vertices (CPU copy) and their offset in g_mesh_buffer (~0u: not uploaded);
+// primitive records built by kMeshBuild go to the first kBuiltWords of g_data, which the arena never uploads.
+constexpr std::uint32_t kMeshVertexWords = sizeof(ps2::chain::MeshVertex) / 4;
+constexpr std::uint32_t kMeshBufferWords = 16u << 20;
+constexpr std::uint32_t kBuiltWords = 8u << 20;
+// Then the tile lists of a mesh batch (mesh_bin, raster_mesh), reused by each batch.
+constexpr std::uint32_t kListWords = 16u << 20;
+constexpr std::uint32_t kMeshItemWords = 32;
+struct Mesh {
+    std::vector<ps2::chain::MeshVertex> v;
+    std::uint32_t at = ~0u;
+};
+std::vector<Mesh> g_meshes;
+bool g_mesh_on = false;
+WGPUBuffer g_mesh_buffer = nullptr;
+WGPUBindGroupLayout g_mesh_layout = nullptr;
+WGPUBindGroup g_mesh_group = nullptr;
+std::uint32_t g_mesh_used = 0, g_built_used = 0;
+// Strips flushed since the last submit: one kMeshBuild for all of them runs first in the submit.
+std::vector<std::uint32_t> g_submit_items;
+std::uint32_t g_submit_records = 0;
 
 struct Command {
     Pipeline pipeline;
@@ -123,7 +147,7 @@ std::vector<Command> g_commands;
 std::vector<std::array<std::uint32_t, kParamStride / 4>> g_param_records;
 struct Arena {
     std::unique_ptr<std::uint32_t[]> words;
-    std::size_t used = 0, capacity = 0;
+    std::size_t used = 0, capacity = 0, base = 0; // words below base are never uploaded (mesh path)
 
     std::uint32_t *grow(std::size_t count) {
         if (used + count > capacity) {
@@ -139,8 +163,8 @@ struct Arena {
         return at;
     }
     std::size_t size() const { return used; }
-    bool empty() const { return !used; }
-    void clear() { used = 0; }
+    bool empty() const { return used == base; }
+    void clear() { used = base; }
     std::uint32_t *data() { return words.get(); }
     std::uint32_t &operator[](std::size_t i) { return words[i]; }
 } g_arena;
@@ -173,6 +197,11 @@ struct Batch {
     std::uint32_t texflushes = 0;
     int rx0 = 0, ry0 = 0, rx1 = -2, ry1 = -2;
     Range fb_range, z_range;
+    // Mesh strips (T48): a batch holds strips or other primitives, not both. Per strip a record of kind 4 (4 first
+    // built record, 5 count) in prims and kMeshItemWords for kMeshBuild.
+    bool mesh = false;
+    std::vector<std::uint32_t> mesh_items;
+    std::uint32_t mesh_records = 0;
 } g_batch;
 
 struct SetupCache {
@@ -274,6 +303,9 @@ std::uint32_t push_params(const std::initializer_list<std::uint32_t> values) {
     g_param_records.push_back(record);
     return static_cast<std::uint32_t>(g_param_records.size() - 1);
 }
+
+// One workgroup per tile index.
+void dispatch_tiles(Pipeline p, std::uint32_t tiles, std::uint32_t param) { g_commands.push_back({p, std::min(tiles, 1024u), (tiles + 1023) / 1024, param}); }
 
 void dispatch_linear(Pipeline p, std::uint32_t items, std::uint32_t param) {
     const std::uint32_t groups = (items + 63) / 64;
@@ -531,6 +563,21 @@ void plan_decodes(std::uint32_t prims) {
     }
 }
 
+// The texture decodes plan_decodes chose, for setups uploaded at setup_offset.
+void dispatch_decodes(std::uint32_t setup_offset) {
+    if (g_decodes.empty()) return;
+    const auto count = static_cast<std::uint32_t>(g_decodes.size());
+    std::uint32_t *records = g_arena.grow(count * 3u);
+    const auto offset = static_cast<std::uint32_t>(records - g_arena.data());
+    std::uint32_t total = 0;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        records[i * 3] = setup_offset + g_decodes[i].setup * kSetupWords;
+        records[i * 3 + 1] = g_decodes[i].offset;
+        records[i * 3 + 2] = total;
+        total += g_decodes[i].words;
+    }
+    dispatch_linear(kDecode, total, push_params({offset, count, total}));
+}
 std::uint32_t snapshot_batch(std::uint32_t prims, std::uint32_t &lo, std::uint32_t &hi) {
     Batch &b = g_batch;
     lo = hi = 0;
@@ -569,10 +616,115 @@ void note_raster(std::uint32_t prims, std::uint32_t tiles, std::uint32_t entries
     g_command_info.push_back({g_commands.size(), {prims, tiles, entries, snapshot, b.prims[1], first[3] | (first[14] << 8) | (first[6] << 16), first[0], textured}});
 }
 
+// Marks what the batch wrote and empties it.
+void finish_batch() {
+    Batch &b = g_batch;
+    const Range fb = pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy);
+    mark_rendered(fb);
+    note_vram_write(fb);
+    if (b.zwrite) {
+        const Range z = pages(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy);
+        mark_rendered(z);
+        note_vram_write(z);
+    }
+    b.prims.clear();
+    b.setups.clear();
+    b.boxes.clear();
+    g_batch_reads.clear();
+    b.key = ~0ull;
+    b.minx = b.miny = 1 << 30;
+    b.maxx = b.maxy = -1;
+    b.mesh = false;
+    b.mesh_items.clear();
+    b.mesh_records = 0;
+}
+
+// A batch of mesh strips (T48): kMeshBuild builds the records; each chunk of 64 records gets the box of the strips
+// it holds and is listed for the tiles under it (as flush_batch lists primitives); kRasterMesh tests the records of
+// a tile's chunks against the tile and shades those that touch it.
+void flush_meshes() {
+    Batch &b = g_batch;
+    const std::uint32_t records = b.mesh_records, chunks = (records + 63) / 64, first = b.prims[4];
+    plan_decodes(records);
+    const std::uint32_t setup_offset = arena_append(b.setups.data(), b.setups.size() * 4);
+    dispatch_decodes(setup_offset);
+    for (std::size_t i = 10; i < b.mesh_items.size(); i += kMeshItemWords) b.mesh_items[i] += g_submit_records;
+    g_submit_items.insert(g_submit_items.end(), b.mesh_items.begin(), b.mesh_items.end());
+    g_submit_records += records;
+    static std::vector<int> boxes;
+    boxes.assign(static_cast<std::size_t>(chunks) * 4, 0);
+    for (std::uint32_t c = 0; c < chunks; ++c) {
+        boxes[c * 4] = boxes[c * 4 + 1] = 1 << 30;
+        boxes[c * 4 + 2] = boxes[c * 4 + 3] = -1;
+    }
+    const std::uint32_t strips = static_cast<std::uint32_t>(b.prims.size() / kPrimWords);
+    for (std::uint32_t i = 0; i < strips; ++i) {
+        const std::uint32_t *rec = b.prims.data() + i * kPrimWords, at = rec[4] - first;
+        for (std::uint32_t c = at / 64; c <= (at + rec[5] - 1) / 64; ++c) {
+            boxes[c * 4] = std::min(boxes[c * 4], static_cast<int>(rec[2] & 0xFFFFu));
+            boxes[c * 4 + 1] = std::min(boxes[c * 4 + 1], static_cast<int>(rec[2] >> 16));
+            boxes[c * 4 + 2] = std::max(boxes[c * 4 + 2], static_cast<int>(rec[3] & 0xFFFFu));
+            boxes[c * 4 + 3] = std::max(boxes[c * 4 + 3], static_cast<int>(rec[3] >> 16));
+        }
+    }
+    const int sc = static_cast<int>(g_scale), row = g_tiles_per_row;
+    const auto each_tile = [&](std::uint32_t c, auto &&f) {
+        const int *box = boxes.data() + c * 4;
+        for (int ty = box[1] * sc / 16; ty <= (box[3] * sc + sc - 1) / 16; ++ty)
+            for (int tx = box[0] * sc / 16; tx <= (box[2] * sc + sc - 1) / 16; ++tx) f(static_cast<std::uint32_t>(ty * row + tx));
+    };
+    g_touched.clear();
+    std::uint32_t total = 0;
+    for (std::uint32_t c = 0; c < chunks; ++c)
+        each_tile(c, [&](std::uint32_t t) {
+            if (!g_tile_count[t]++) g_touched.push_back(t);
+            ++total;
+        });
+    const auto tiles = static_cast<std::uint32_t>(g_touched.size());
+    std::uint32_t *list = g_arena.grow(tiles * 3 + 3 + total);
+    const auto tile_offset = static_cast<std::uint32_t>(list - g_arena.data()), entry_offset = tile_offset + tiles * 3 + 3;
+    std::uint32_t cursor = 0;
+    for (std::uint32_t i = 0; i < tiles; ++i) {
+        const std::uint32_t t = g_touched[i];
+        list[i * 3] = (t % static_cast<std::uint32_t>(row)) | ((t / static_cast<std::uint32_t>(row)) << 16);
+        list[i * 3 + 1] = cursor;
+        g_tile_fill[t] = cursor;
+        cursor += g_tile_count[t];
+    }
+    list[tiles * 3] = 0;
+    list[tiles * 3 + 1] = cursor;
+    list[tiles * 3 + 2] = 0;
+    for (std::uint32_t c = 0; c < chunks; ++c) each_tile(c, [&](std::uint32_t t) { list[tiles * 3 + 3 + g_tile_fill[t]++] = c; });
+    std::uint32_t snapshot_lo, snapshot_hi;
+    snapshot_batch(strips, snapshot_lo, snapshot_hi);
+    // each tile's list holds up to 64 records per chunk; tiles go in groups that fit the list area
+    std::uint32_t group = 0, used = 0;
+    const auto dispatch_group = [&](std::uint32_t end) {
+        if (end == group) return;
+        const std::uint32_t at = tile_offset + group * 3;
+        dispatch_tiles(kMeshBin, end - group, push_params({end - group, first, records, at, entry_offset}));
+        dispatch_tiles(kRasterMesh, end - group, push_params({end - group, first, setup_offset, at, snapshot_lo, snapshot_hi}));
+        group = end;
+        used = 0;
+    };
+    for (std::uint32_t i = 0; i < tiles; ++i) {
+        const std::uint32_t words = 1 + 64 * g_tile_count[g_touched[i]];
+        if (used + words > kListWords) dispatch_group(i);
+        list[i * 3 + 2] = kBuiltWords + used;
+        used += words;
+    }
+    dispatch_group(tiles);
+    for (std::uint32_t t : g_touched) g_tile_count[t] = 0;
+}
 void flush_batch() {
     Batch &b = g_batch;
     if (b.prims.empty()) {
         b.key = ~0ull;
+        return;
+    }
+    if (b.mesh) {
+        flush_meshes();
+        finish_batch();
         return;
     }
     const std::uint32_t prims = static_cast<std::uint32_t>(b.prims.size() / kPrimWords);
@@ -593,19 +745,8 @@ void flush_batch() {
     plan_decodes(prims);
     const std::uint32_t prim_offset = arena_append(b.prims.data(), b.prims.size() * 4);
     const std::uint32_t setup_offset = arena_append(b.setups.data(), b.setups.size() * 4);
-    if (!g_decodes.empty()) {
-        const auto count = static_cast<std::uint32_t>(g_decodes.size());
-        std::uint32_t *records = g_arena.grow(count * 3u);
-        const auto offset = static_cast<std::uint32_t>(records - g_arena.data());
-        std::uint32_t total = 0;
-        for (std::uint32_t i = 0; i < count; ++i) {
-            records[i * 3] = setup_offset + g_decodes[i].setup * kSetupWords;
-            records[i * 3 + 1] = g_decodes[i].offset;
-            records[i * 3 + 2] = total;
-            total += g_decodes[i].words;
-        }
-        dispatch_linear(kDecode, total, push_params({offset, count, total}));
-    }
+    dispatch_decodes(setup_offset);
+
     std::uint32_t total = 0;
     for (std::uint32_t t : g_touched) total += g_tile_count[t];
     const std::uint32_t tiles = static_cast<std::uint32_t>(g_touched.size());
@@ -639,21 +780,7 @@ void flush_batch() {
     const std::uint32_t param = push_params({tile_offset, prim_offset, setup_offset, tiles, list_offset, snapshot_lo, snapshot_hi});
     note_raster(prims, tiles, total, snapshot);
     g_commands.push_back({kRaster, std::min(tiles, 1024u), (tiles + 1023) / 1024, param});
-    const Range fb = pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy);
-    mark_rendered(fb);
-    note_vram_write(fb);
-    if (b.zwrite) {
-        const Range z = pages(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy);
-        mark_rendered(z);
-        note_vram_write(z);
-    }
-    b.prims.clear();
-    b.setups.clear();
-    b.boxes.clear();
-    g_batch_reads.clear();
-    b.key = ~0ull;
-    b.minx = b.miny = 1 << 30;
-    b.maxx = b.maxy = -1;
+    finish_batch();
 }
 
 // Whether r touches a page under the rectangle; frame and Z buffers start on a page.
@@ -877,6 +1004,20 @@ void rebuild_group() {
     d.entryCount = 9;
     d.entries = e;
     g_group = wgpuDeviceCreateBindGroup(g_device, &d);
+    if (!g_mesh_on) return;
+    if (g_mesh_group) wgpuBindGroupRelease(g_mesh_group);
+    WGPUBindGroupEntry m[3] = {};
+    const WGPUBuffer mesh_buffers[3] = {g_data, g_params, g_mesh_buffer};
+    for (int i = 0; i < 3; ++i) {
+        m[i] = WGPU_BIND_GROUP_ENTRY_INIT;
+        m[i].binding = static_cast<std::uint32_t>(i);
+        m[i].buffer = mesh_buffers[i];
+        m[i].size = i == 1 ? kParamStride : WGPU_WHOLE_SIZE;
+    }
+    d.layout = g_mesh_layout;
+    d.entryCount = 3;
+    d.entries = m;
+    g_mesh_group = wgpuDeviceCreateBindGroup(g_device, &d);
 }
 
 void ensure_capacity() {
@@ -898,6 +1039,21 @@ void ensure_capacity() {
     if (changed || !g_group) rebuild_group();
 }
 
+// The submit's kMeshBuild runs first (it reads only the arena and the mesh buffer).
+void queue_mesh_build() {
+    if (g_submit_records) {
+        const std::uint32_t items = arena_append(g_submit_items.data(), g_submit_items.size() * 4);
+        const std::uint32_t groups = (g_submit_records + 63) / 64;
+        g_commands.insert(g_commands.begin(), {kMeshBuild, std::min(groups, 1024u), (groups + 1023) / 1024, push_params({items, static_cast<std::uint32_t>(g_submit_items.size() / kMeshItemWords), g_submit_records})});
+        g_submit_items.clear();
+        g_submit_records = 0;
+    }
+}
+
+void upload_arena() {
+    wgpuQueueWriteBuffer(g_queue, g_data, g_arena.base * 4, g_arena.data() + g_arena.base, (g_arena.size() - g_arena.base) * 4);
+}
+
 void profile_submit() {
     constexpr std::uint32_t kMax = 2048;
     if (!g_profile_queries) {
@@ -908,8 +1064,9 @@ void profile_submit() {
         g_profile_resolve = make_buffer(kMax * 16, WGPUBufferUsage_QueryResolve | WGPUBufferUsage_CopySrc);
         g_profile_read = make_buffer(kMax * 16, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
     }
+    queue_mesh_build();
     ensure_capacity();
-    wgpuQueueWriteBuffer(g_queue, g_data, 0, g_arena.data(), g_arena.size() * 4);
+    upload_arena();
     wgpuQueueWriteBuffer(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
     const std::uint32_t n = static_cast<std::uint32_t>(std::min<std::size_t>(g_commands.size(), kMax));
@@ -924,7 +1081,7 @@ void profile_submit() {
         WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
         wgpuComputePassEncoderSetPipeline(pass, g_pipelines[c.pipeline]);
         const std::uint32_t offset = c.param * kParamStride;
-        wgpuComputePassEncoderSetBindGroup(pass, 0, g_group, 1, &offset);
+        wgpuComputePassEncoderSetBindGroup(pass, 0, c.pipeline >= kMeshBuild ? g_mesh_group : g_group, 1, &offset);
         wgpuComputePassEncoderDispatchWorkgroups(pass, c.x, c.y, 1);
         wgpuComputePassEncoderEnd(pass);
         wgpuComputePassEncoderRelease(pass);
@@ -963,6 +1120,7 @@ void profile_submit() {
     g_param_records.clear();
     g_arena.clear();
     g_decoded_used = 0;
+    g_built_used = 0;
     g_clut_loads = 0;
 }
 
@@ -973,8 +1131,9 @@ void submit(WGPUTextureView present_view = nullptr) {
         profile_submit();
         return;
     }
+    queue_mesh_build();
     ensure_capacity();
-    wgpuQueueWriteBuffer(g_queue, g_data, 0, g_arena.data(), g_arena.size() * 4);
+    upload_arena();
     wgpuQueueWriteBuffer(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
     if (g_query_ready) {
         const void *mapped = wgpuBufferGetConstMappedRange(g_query_read, 0, 16);
@@ -998,7 +1157,7 @@ void submit(WGPUTextureView present_view = nullptr) {
     WGPUComputePassDescriptor cd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
     if (measure) cd.timestampWrites = &writes;
     WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
-    Pipeline current = kPipelines;
+    Pipeline current = kAllPipelines;
     ++g_submits;
     ++g_total_passes;
     for (const Command &c : g_commands) {
@@ -1008,7 +1167,7 @@ void submit(WGPUTextureView present_view = nullptr) {
             current = c.pipeline;
         }
         const std::uint32_t offset = c.param * kParamStride;
-        wgpuComputePassEncoderSetBindGroup(pass, 0, g_group, 1, &offset);
+        wgpuComputePassEncoderSetBindGroup(pass, 0, c.pipeline >= kMeshBuild ? g_mesh_group : g_group, 1, &offset);
         wgpuComputePassEncoderDispatchWorkgroups(pass, c.x, c.y, 1);
     }
     wgpuComputePassEncoderEnd(pass);
@@ -1061,6 +1220,7 @@ void submit(WGPUTextureView present_view = nullptr) {
     g_param_records.clear();
     g_arena.clear();
     g_decoded_used = 0;
+    g_built_used = 0;
     g_clut_loads = 0;
 }
 
@@ -1309,6 +1469,70 @@ std::uint32_t replacement(const std::uint32_t *w) {
     return r.code;
 }
 
+// kMeshBuild: its own layout (g_data writable, params, g_mesh_buffer); the records area below the arena's base.
+bool init_mesh_path() {
+    g_mesh_buffer = make_buffer(static_cast<std::uint64_t>(kMeshBufferWords) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+    WGPUBindGroupLayoutEntry le[3] = {};
+    const WGPUBufferBindingType types[3] = {WGPUBufferBindingType_Storage, WGPUBufferBindingType_Uniform, WGPUBufferBindingType_ReadOnlyStorage};
+    for (int i = 0; i < 3; ++i) {
+        le[i] = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+        le[i].binding = static_cast<std::uint32_t>(i);
+        le[i].visibility = WGPUShaderStage_Compute;
+        le[i].buffer.type = types[i];
+        le[i].buffer.hasDynamicOffset = i == 1;
+        le[i].buffer.minBindingSize = i == 1 ? kParamStride : 0;
+    }
+    WGPUBindGroupLayoutDescriptor ld = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+    ld.entryCount = 3;
+    ld.entries = le;
+    g_mesh_layout = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
+    WGPUPipelineLayoutDescriptor pld = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+    pld.bindGroupLayoutCount = 1;
+    pld.bindGroupLayouts = &g_mesh_layout;
+    WGPUPipelineLayout layout = wgpuDeviceCreatePipelineLayout(g_device, &pld);
+    WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+    source.code = view(kMeshShader);
+    WGPUShaderModuleDescriptor md = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+    md.nextInChain = &source.chain;
+    WGPUShaderModule module = wgpuDeviceCreateShaderModule(g_device, &md);
+    WGPUComputePipelineDescriptor cd = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
+    cd.layout = layout;
+    cd.compute.module = module;
+    WGPUConstantEntry constant = WGPU_CONSTANT_ENTRY_INIT;
+    constant.key = view("SCALE");
+    constant.value = static_cast<double>(g_scale);
+    cd.compute.constantCount = 1;
+    cd.compute.constants = &constant;
+    for (const Pipeline p : {kMeshBuild, kMeshBin}) {
+        cd.compute.entryPoint = view(kEntryPoints[p]);
+        g_pipelines[p] = wgpuDeviceCreateComputePipeline(g_device, &cd);
+        if (!g_pipelines[p]) return false;
+    }
+    wgpuShaderModuleRelease(module);
+    g_arena.grow(kBuiltWords + kListWords);
+    g_arena.base = kBuiltWords + kListWords;
+    g_mesh_on = true;
+    std::fprintf(stderr, "[gpu] mesh path on\n");
+    return true;
+}
+
+// Puts a mesh's vertices in g_mesh_buffer; when it is full, the work so far is submitted and it starts over.
+bool make_mesh_resident(Mesh &mesh) {
+    if (mesh.at != ~0u) return true;
+    const std::uint64_t words = mesh.v.size() * kMeshVertexWords;
+    if (!words || words > kMeshBufferWords) return false;
+    if (g_mesh_used + words > kMeshBufferWords) {
+        flush_all();
+        submit();
+        for (Mesh &m : g_meshes) m.at = ~0u;
+        g_mesh_used = 0;
+    }
+    wgpuQueueWriteBuffer(g_queue, g_mesh_buffer, static_cast<std::uint64_t>(g_mesh_used) * 4, mesh.v.data(), words * 4);
+    mesh.at = g_mesh_used;
+    g_mesh_used += static_cast<std::uint32_t>(words);
+    return true;
+}
+
 }
 
 Mode mode() { return g_mode; }
@@ -1467,17 +1691,16 @@ bool init(Mode m) {
         if (!g_pipelines[i]) return false;
     }
     wgpuShaderModuleRelease(module);
+    const char *mesh_env = std::getenv("PS2_GPU_MESH");
+    if (m == Mode::primary && !(mesh_env && std::strcmp(mesh_env, "0") == 0) && !init_mesh_path()) return false;
     ensure_capacity();
     g_mode = m;
     return true;
 }
 
-void draw(const State &st, const Vertex *v, int count) {
-    if (g_image.active && !g_image.pending.empty()) flush_image();
-    std::uint64_t attr = st.prim;
-    if (!(st.prmodecont & 1u)) attr = (st.prim & 7u) | (st.prmode & ~7ull);
-    const std::uint32_t prim = static_cast<std::uint32_t>(st.prim) & 7u;
-    const Context &c = st.ctx[(attr >> 9) & 1u];
+std::uint64_t prim_attr(const State &st) { return (st.prmodecont & 1u) ? st.prim : (st.prim & 7u) | (st.prmode & ~7ull); }
+
+const SetupCache &setup_for(const State &st, std::uint64_t attr) {
     SetupCache &cache = g_setup_cache;
     if (cache.generation != g_setup_generation || cache.attr != attr || cache.clut != g_clut_slot) {
         cache.generation = g_setup_generation;
@@ -1494,6 +1717,64 @@ void draw(const State &st, const Vertex *v, int count) {
             if (g_textures) cache.setup[24] = replacement(cache.setup);
         }
     }
+    return cache;
+}
+
+// Adds a primitive record (setup index and box filled in here) to the batch; returns its setup index.
+std::uint32_t add_prim(const SetupCache &cache, std::uint32_t *rec, int minx, int miny, int maxx, int maxy) {
+    Batch &b = g_batch;
+    const std::uint32_t *setup = cache.setup;
+    const std::uint32_t flags = cache.flags;
+    const bool zte = flags & 512u;
+    const Range &tex = cache.tex;
+    if (b.prims.empty()) {
+        b.texflushes = g_texflushes;
+        b.key = cache.key;
+        b.fbp = setup[1];
+        b.fbw = setup[2];
+        b.fpsm = setup[3];
+        b.zbp = setup[5];
+        b.zpsm = setup[6];
+        b.zte = false;
+        b.zwrite = false;
+        b.rx1 = -2;
+    }
+    b.zte = b.zte || zte;
+    b.zwrite = b.zwrite || (zte && !(flags & 32u));
+    const std::size_t setups = b.setups.size() / kSetupWords;
+    std::uint32_t setup_index;
+    if (setups && std::memcmp(b.setups.data() + (setups - 1) * kSetupWords, setup, kSetupWords * 4) == 0) {
+        setup_index = static_cast<std::uint32_t>(setups - 1);
+    } else {
+        setup_index = static_cast<std::uint32_t>(setups);
+        b.setups.insert(b.setups.end(), setup, setup + kSetupWords);
+    }
+    if (flags & 2u) {
+        if (g_batch_reads.empty() || g_batch_reads.back().lo != tex.lo || g_batch_reads.back().hi != tex.hi) {
+            bool known = false;
+            for (const Range &t : g_batch_reads) known = known || (t.lo <= tex.lo && tex.hi <= t.hi);
+            if (!known) g_batch_reads.push_back(tex);
+        }
+    }
+    rec[0] = setup_index;
+    rec[2] = static_cast<std::uint32_t>(minx) | (static_cast<std::uint32_t>(miny) << 16);
+    rec[3] = static_cast<std::uint32_t>(maxx) | (static_cast<std::uint32_t>(maxy) << 16);
+    b.prims.insert(b.prims.end(), rec, rec + kPrimWords);
+    b.boxes.push_back(rec[2]);
+    b.boxes.push_back(rec[3]);
+    b.minx = std::min(b.minx, minx);
+    b.miny = std::min(b.miny, miny);
+    b.maxx = std::max(b.maxx, maxx);
+    b.maxy = std::max(b.maxy, maxy);
+    return setup_index;
+}
+
+void draw(const State &st, const Vertex *v, int count) {
+    if (g_image.active && !g_image.pending.empty()) flush_image();
+    const std::uint64_t attr = prim_attr(st);
+    const std::uint32_t prim = static_cast<std::uint32_t>(st.prim) & 7u;
+    const Context &c = st.ctx[(attr >> 9) & 1u];
+    const SetupCache &cache = setup_for(st, attr);
     const std::uint32_t *setup = cache.setup;
     const std::uint32_t flags = cache.flags;
     const bool fst = flags & 16u, iip = flags & 1u;
@@ -1590,9 +1871,8 @@ void draw(const State &st, const Vertex *v, int count) {
     if (minx > maxx || miny > maxy) return;
 
     Batch &b = g_batch;
-    const bool zte = flags & 512u;
     const std::uint64_t key = cache.key;
-    if (b.key != ~0ull && b.key != key) emit_all();
+    if (b.mesh || (b.key != ~0ull && b.key != key)) emit_all();
     const Range &tex = cache.tex;
     if (flags & 2u) {
         if (!b.prims.empty()) {
@@ -1612,48 +1892,88 @@ void draw(const State &st, const Vertex *v, int count) {
             }
         }
     }
-    if (b.prims.empty()) {
-        b.texflushes = g_texflushes;
-        b.key = key;
-        b.fbp = setup[1];
-        b.fbw = setup[2];
-        b.fpsm = setup[3];
-        b.zbp = setup[5];
-        b.zpsm = setup[6];
-        b.zte = false;
-        b.zwrite = false;
-        b.rx1 = -2;
-    }
-    b.zte = b.zte || zte;
-    b.zwrite = b.zwrite || (zte && !(flags & 32u));
-    const std::size_t setups = b.setups.size() / kSetupWords;
-    std::uint32_t setup_index;
-    if (setups && std::memcmp(b.setups.data() + (setups - 1) * kSetupWords, setup, kSetupWords * 4) == 0) {
-        setup_index = static_cast<std::uint32_t>(setups - 1);
-    } else {
-        setup_index = static_cast<std::uint32_t>(setups);
-        b.setups.insert(b.setups.end(), setup, setup + kSetupWords);
-    }
-    if (flags & 2u) {
-        if (g_batch_reads.empty() || g_batch_reads.back().lo != tex.lo || g_batch_reads.back().hi != tex.hi) {
-            bool known = false;
-            for (const Range &t : g_batch_reads) known = known || (t.lo <= tex.lo && tex.hi <= t.hi);
-            if (!known) g_batch_reads.push_back(tex);
-        }
-    }
-    rec[0] = setup_index;
-    rec[2] = static_cast<std::uint32_t>(minx) | (static_cast<std::uint32_t>(miny) << 16);
-    rec[3] = static_cast<std::uint32_t>(maxx) | (static_cast<std::uint32_t>(maxy) << 16);
-    b.prims.insert(b.prims.end(), rec, rec + kPrimWords);
-    b.boxes.push_back(rec[2]);
-    b.boxes.push_back(rec[3]);
-    b.minx = std::min(b.minx, minx);
-    b.miny = std::min(b.miny, miny);
-    b.maxx = std::max(b.maxx, maxx);
-    b.maxy = std::max(b.maxy, maxy);
+    add_prim(cache, rec, minx, miny, maxx, maxy);
     if (b.prims.size() >= kPrimWords * 65536) emit_all();
 }
 
+bool mesh_path() { return g_mesh_on; }
+
+void mesh_add(std::uint32_t id, const ps2::chain::MeshVertex *v, std::uint32_t count) {
+    if (id >= g_meshes.size()) g_meshes.resize(id + 1);
+    g_meshes[id].v.assign(v, v + count);
+    g_meshes[id].at = ~0u;
+}
+
+// A strip's records are built on the GPU (mesh.wgsl) into the area below the arena and binned there (raster_mesh);
+// the batch gets a record of kind 4 with the box of the strip's drawn triangles, from the projected vertices (the
+// scissor when one is behind the camera).
+void draw_mesh(const State &st, const ps2::chain::MeshDraw &d, const float *screen) {
+    if (!g_mesh_on || d.count < 3 || d.count > 128 || d.mesh >= g_meshes.size()) return;
+    if (g_image.active && !g_image.pending.empty()) flush_image();
+    const std::uint32_t records = d.count - 2;
+    if (g_built_used + records * kPrimWords > kBuiltWords) {
+        flush_all();
+        submit();
+    }
+    Mesh &mesh = g_meshes[d.mesh];
+    if (d.first + d.count > mesh.v.size() || !make_mesh_resident(mesh)) return;
+    const std::uint64_t attr = prim_attr(st);
+    const Context &c = st.ctx[(attr >> 9) & 1u];
+    const SetupCache &cache = setup_for(st, attr);
+    const std::uint32_t *setup = cache.setup;
+    float lx = 1e30f, ly = 1e30f, hx = -1e30f, hy = -1e30f;
+    bool drawn = false, behind = false;
+    for (std::uint32_t k = 2; k < d.count; ++k) {
+        if (mesh.v[d.first + k].adc || ((d.adc[k / 32] >> (k % 32)) & 1u)) continue;
+        drawn = true;
+        for (const float *s = screen + (k - 2) * 2; s < screen + k * 2 + 2; s += 2) {
+            behind = behind || std::isnan(s[0]) || std::isnan(s[1]);
+            lx = std::min(lx, s[0]);
+            hx = std::max(hx, s[0]);
+            ly = std::min(ly, s[1]);
+            hy = std::max(hy, s[1]);
+        }
+    }
+    if (!drawn) return;
+    int minx = static_cast<int>(setup[10] & 0xFFFFu), maxx = static_cast<int>(setup[10] >> 16);
+    int miny = static_cast<int>(setup[11] & 0xFFFFu), maxy = static_cast<int>(setup[11] >> 16);
+    if (!behind) {
+        // the GPU's vertices (12.4 fixed, truncated) are within 1/16 pixel below these
+        const auto pixel = [](float v) { return static_cast<int>(std::floor(std::clamp(v, -4096.0f, 4096.0f))); };
+        const float ofx = static_cast<float>(c.xyoffset & 0xFFFFu) / 16.0f, ofy = static_cast<float>((c.xyoffset >> 32) & 0xFFFFu) / 16.0f;
+        minx = std::max(minx, pixel(lx - ofx - 0.1f));
+        maxx = std::min(maxx, pixel(hx - ofx + 0.1f));
+        miny = std::max(miny, pixel(ly - ofy - 0.1f));
+        maxy = std::min(maxy, pixel(hy - ofy + 0.1f));
+    }
+    minx = std::max(minx, 0);
+    miny = std::max(miny, 0);
+    maxx = std::min(maxx, 2047);
+    maxy = std::min(maxy, 2047);
+    if (minx > maxx || miny > maxy) return;
+
+    Batch &b = g_batch;
+    if (!b.mesh || (b.key != ~0ull && b.key != cache.key)) emit_all();
+    if ((cache.flags & 2u) && !b.prims.empty()) {
+        batch_ranges();
+        const Range &t = cache.tex;
+        if (t.overlaps(b.fb_range.lo, b.fb_range.hi) || (b.zwrite && t.overlaps(b.z_range.lo, b.z_range.hi))) emit_all();
+    }
+    std::uint32_t rec[kPrimWords] = {};
+    rec[1] = 4;
+    rec[4] = g_built_used / kPrimWords;
+    rec[5] = records;
+    const std::uint32_t setup_index = add_prim(cache, rec, minx, miny, maxx, maxy);
+    b.mesh = true;
+    std::uint32_t item[kMeshItemWords] = {rec[4], records, mesh.at + d.first * kMeshVertexWords, setup_index,
+                                          (d.st_set ? 1u : 0u) | (d.flat ? 2u : 0u) | ((cache.flags & 1u) ? 4u : 0u), d.rgba,
+                                          static_cast<std::uint32_t>(c.xyoffset & 0xFFFFu), static_cast<std::uint32_t>((c.xyoffset >> 32) & 0xFFFFu),
+                                          setup[10], setup[11], b.mesh_records, d.adc[0], d.adc[1], d.adc[2], d.adc[3], 0};
+    std::memcpy(item + 16, d.matrix, sizeof d.matrix);
+    b.mesh_items.insert(b.mesh_items.end(), item, item + kMeshItemWords);
+    b.mesh_records += records;
+    g_built_used += records * kPrimWords;
+}
 void image_begin(const State &s) {
     flush_image();
     Image &im = g_image;
@@ -1855,7 +2175,7 @@ void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, co
 void stats() {
     if (g_mode == Mode::off) return;
     std::fprintf(stderr, "[gpu] %llu submits, dispatches:", static_cast<unsigned long long>(g_submits));
-    for (int i = 0; i < kPipelines; ++i) std::fprintf(stderr, " %s %llu", kEntryPoints[i], static_cast<unsigned long long>(g_dispatches[i]));
+    for (int i = 0; i < kAllPipelines; ++i) std::fprintf(stderr, " %s %llu", kEntryPoints[i], static_cast<unsigned long long>(g_dispatches[i]));
     std::fprintf(stderr, "\n");
     if (g_textures)
         std::fprintf(stderr, "[tex] lookups %llu: replaced %llu, render targets %llu, unsupported %llu, untagged %llu; textures %zu (replaced %zu)\n", static_cast<unsigned long long>(g_tex_lookups),

@@ -781,3 +781,34 @@ part of the VU thread's work (~20% of the batches' VU1 part, T46).
 **Revisit if:** the GPU mesh path (T48) needs to skip the VIF work too:
 then the chain's VIF state (double-buffer offsets, row/mode) must advance
 as if it ran, e.g. by a state-only VIF pass over the words.
+
+## D36: GPU mesh path: cached batch input, bit-exact GPU build, GPU binning; on by default
+
+**Decision (T48, 2026-10-19; default on by the owner's wrap-up: "leave the
+final version in the best way possible"):** a chain handler may draw a
+batch through the GPU mesh path (`ps2::chain::mesh_draw`): the batch's
+vertices are kept on the GPU (taken from VU1 memory on the chain's first
+call), later calls skip the batch unpacks (the VIF state still advances,
+D35's revisit case) and send one `MeshDraw` per kick. The renderer builds
+the primitive records on the GPU with the same arithmetic as VU1 and its
+own front end (each product rounded, the reciprocal truncated, 1/area
+rounded: an xor with a zero parameter keeps products from fusing into
+FMAs), so frames stay byte-identical; batches of mesh strips hold no other
+primitives; the CPU lists 64-record chunks per tile from the strips'
+projected boxes and the GPU picks and shades each tile's records. On by
+default; `PS2_GPU_MESH=0` (`play.json` / folder `settings.json`
+`"gpu_mesh": false`) gives the T46 CPU path.
+
+**Why:** measured on the pilot's pre-lit scenery: byte-identical frames
+and cycles in every compared run (racing, race intro, menu, scale 3 with
+the pack); headless 13-22% less time per frame; window race intro at
+scale 3 lowest 1 s window 36 → 47 fps, render thread 78% → 69% racing at
+scale 3. Binning per triangle on the CPU cost as much as the old path's
+binning, coarse per-strip boxes overloaded the raster, and binning every
+chunk on the GPU per tile cost GPU time; chunk lists from the CPU were the
+best of the tried variants.
+
+**Revisit if:** the GPU becomes the limit (without a texture pack the race
+intro at scale 3 is GPU-bound with the path on); the fully native renderer
+(T52) replaces the GS renderer for these meshes; another handler needs
+fog or UV output (not in the path: such batches stay on the CPU path).

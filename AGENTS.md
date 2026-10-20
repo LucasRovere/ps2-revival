@@ -188,6 +188,9 @@ the same change.
   `argv[0]` in every mode. PCSX2 modules for PCSX2 players stay.
 - Phase 8 started (T36, D32): draw-list survey of the pilot game; go for
   native draw paths hooked where VIF1 calls the engine's static mesh
-  chains. Order (owner, D31): Phase 8 → Phase 9 → fully native for the
+  chains. Chain handlers (T46, D35) and the GPU mesh path (T48, D36): the
+  pilot's pre-lit scenery is built and binned on the GPU from cached vertex
+  data, frames byte-identical, on by default (`PS2_GPU_MESH=0` /
+  `"gpu_mesh": false` turns it off). Order (owner, D31): Phase 8 → Phase 9 → fully native for the
   pilot game → wrap-up → other games (T40).
 - Next up: see [docs/tasks.md](docs/tasks.md). The owner runs tasks with `/next-task`.

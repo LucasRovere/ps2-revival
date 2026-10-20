@@ -31,6 +31,7 @@ Unit g_vu_side;
 std::uint64_t g_commands[2][128];
 std::uint8_t g_dry_run[16384];
 ps2::chain::VuHook g_vu_hook = nullptr;
+ps2::chain::UnpackHook g_unpack_hook = nullptr;
 
 bool on_vu_thread() { return gs::queue::role() == gs::queue::Role::Vu; }
 bool shadow(int unit) { return unit == 1 && gs::queue::vu_active() && !on_vu_thread(); }
@@ -153,6 +154,10 @@ void unpack(int unit, std::uint32_t cmd, const std::uint32_t *data) {
     if (!num) num = 256;
     std::uint32_t addr = cmd & 0x3FFu;
     if (unit == 1 && ((cmd >> 15) & 1u)) addr += u.tops;
+    if (unit == 1 && g_unpack_hook && u.mode != 2 && g_unpack_hook(cmd, addr & 0x3FFu)) {
+        u.num = 0;
+        return;
+    }
     const std::uint32_t cl = u.cycle & 0xFFu, wl = (u.cycle >> 8) & 0xFFu;
     const std::uint32_t components = vn + 1;
     const std::uint32_t bits = element_bits(vl);
@@ -357,10 +362,12 @@ void transfer_chain(std::uint32_t address, const std::uint8_t *data, std::uint32
     feed(1, data, qwc);
 }
 
-void run_hooked(const std::uint8_t *data, std::uint32_t qwc, ps2::chain::VuHook vu) {
+void run_hooked(const std::uint8_t *data, std::uint32_t qwc, ps2::chain::VuHook vu, ps2::chain::UnpackHook unpack) {
     g_vu_hook = vu;
+    g_unpack_hook = unpack;
     feed(1, data, qwc);
     g_vu_hook = nullptr;
+    g_unpack_hook = nullptr;
 }
 
 bool stalled(int unit) { return state(unit).stalled; }

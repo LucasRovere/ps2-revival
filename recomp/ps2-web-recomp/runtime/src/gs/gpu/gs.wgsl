@@ -1193,3 +1193,45 @@ fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) l
         shade_at(p, s, x, y, k, px, py);
     }
 }
+
+// Mesh batches (T48): records built by mesh_build (in data below the arena), listed per tile by mesh_bin
+// (mesh.wgsl); shaded here like raster. Params: 0 tiles, 1 first record, 2 setups, 3 tiles (origin, first chunk
+// entry, list per tile), 4/5 snapshot. A list is a count, then the record numbers in order.
+@compute @workgroup_size(16, 16)
+fn raster_mesh(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lxy: vec3<u32>) {
+    let index = wid.x + wid.y * 1024u;
+    if (index >= prm(0u)) {
+        return;
+    }
+    let tile = prm(3u) + index * 3u;
+    let origin = data[tile];
+    let sx = (origin & 0xFFFFu) * 16u + lxy.x;
+    let sy = (origin >> 16u) * 16u + lxy.y;
+    let x = i32(sx / SCALE);
+    let y = i32(sy / SCALE);
+    let k = (sy % SCALE) * SCALE + sx % SCALE;
+    let px = f32(x) + f32(sx % SCALE) / f32(SCALE);
+    let py = f32(y) + f32(sy % SCALE) / f32(SCALE);
+    let list = data[tile + 2u];
+    let count = data[list];
+    let first = prm(1u);
+    let setups = prm(2u);
+    snapshot_lo = prm(4u);
+    snapshot_hi = prm(5u);
+    var last_setup = 0xFFFFFFFFu;
+    var s: Setup;
+    for (var i = 0u; i < count; i = i + 1u) {
+        let p = (first + data[list + 1u + i]) * PRIM_WORDS;
+        let si = data[p];
+        if (si != last_setup) {
+            s = load_setup(setups + si * SETUP_WORDS);
+            last_setup = si;
+        }
+        let lo = data[p + 2u];
+        let hi = data[p + 3u];
+        if (x < i32(lo & 0xFFFFu) || y < i32(lo >> 16u) || x > i32(hi & 0xFFFFu) || y > i32(hi >> 16u)) {
+            continue;
+        }
+        shade_at(p, s, x, y, k, px, py);
+    }
+}

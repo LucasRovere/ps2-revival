@@ -6,68 +6,67 @@ fits in one session.
 
 ## Next task
 
-### T47: recomp: lit car mesh handler (Phase 8)
+### T52: plan: fully native for the pilot game
 
-**Goal:** Phase 8 step 3 (D32, D35): the pilot game's lit car meshes
-through the T46 chain handler seam: their VU1 batch programs re-done on
-the CPU with the VU float ops, frames byte-identical to the VU path. The
-second mesh kind on the seam, and the base T49 (model replacement through
-the handler) builds on.
+**Goal:** the detailed plan for running the pilot game fully native on
+Windows (D26, D31): what replaces each emulated part (renderer, VU1 work,
+audio, IO, game logic), in which order, split into one-session tasks with
+success criteria. Owner review before any of them starts. Owner decision
+(after T48): this plan comes next; cars (T47), model replacement (T49)
+and look extras (T50) are re-decided inside it.
 
 **Context:**
-- T46 (`recomp/README.md` "Chain handlers", D35; local notes "Chain
-  handlers: pre-lit scenery", incl. "For T47"): one handler per game,
-  `recomp.chain_handler` = the pilot's local `chains/prelit.cpp`, so the
-  car code joins that handler (a second claim test and batch hook; rename
-  the file if it helps). `chain::run(data, qwc, hook)` runs the chain's VIF
-  commands and calls the hook at each VU1 start; `vu1_program(entry)` gives
-  the program key; the setup program at MSCAL 0 stays on VU1. The
-  `T46_CHECK=1` pattern (each native batch run into a copy, then on VU1,
-  VU1 memory compared) found every difference before frames were compared;
-  batches that need the program's polygon clipper go to VU1 before any side
-  effect.
-- Car kind (fingerprint with normals V4-16 @005, positions @004, ST @003;
-  VU1 entry 0428): profiled racing 4.74 ms VIF1, 4.53 ms VU1, 1.34 ms GS
-  path 1 per frame (16% of the frame); race intro 6.33 ms (19%). Four batch
-  programs at 0428 (keys and run counts in the local notes), a lighting
-  setup program at 0000; some car chains also run a pre-lit program at
-  03F0 (already handled). The car programs are about twice as long as the
-  pre-lit ones (lights and ambient from VU1 memory; possibly an extra pass):
-  read them with `work/t46/simplify.py` and diff the variants first.
-- Expect little speed (T46: ~20% of the batches' VU1 part; VIF unpacks and
-  the GS front end stay): exactness is the point here, speed is T48's.
-- States and presses as T46 (`work/t46/try.ps1`, `cmp.py`, `timing.ps1`,
-  `win.ps1`, `menu.ps1`; base exe `work/t46/lit2/` = T46's handler).
-  Toolchain `. work/t22/env.ps1`. After copying a handler source into
-  `generated/` by hand, touch it (Copy-Item keeps the old time, ninja then
-  skips the rebuild); `port.py` writes it only when it changed.
+- What Phases 6-8 built (`recomp/README.md`, `docs/native-port-plan.md`,
+  D23-D36): the recompiled EE code and runtime, the GS renderer on WebGPU
+  (compute raster), chain handlers at the engine's static mesh `call`s
+  (D35) and the GPU mesh path (D36: cached mesh vertices, primitives built
+  and binned on the GPU, bit-exact). The pilot's pre-lit scenery already
+  skips VIF unpacks, VU1 and the GS front end; cars (0428 programs) still
+  run on VU1 (~4.5 ms VU1 per profiled racing frame), the root list and
+  texture uploads stay (local notes "Renderer draw lists", "Chain
+  handlers", "GPU mesh path").
+- The engine's renderer is a thin layer over VU1 (constant setter, material
+  bind, virtual submesh draw methods; local notes "For T45-T50"): the seam
+  for a native renderer that draws from engine calls instead of the DMA
+  list.
+- Measured limits (T45, T48 frame logs): with the GPU path racing holds
+  60 fps at scale 1 and 3 with headroom; the race intro at scale 3 reaches
+  ~58 fps mean (render thread and, without a pack, the GPU); menu fade
+  screens at scale 3 are GPU-bound (D34). The compute rasterizer is the
+  GPU cost at scale 3.
+- Other parts: audio (SPU2 emulated, T30 parked: tied to the EE clock),
+  IO (disc, card, pad: runtime HLE), game logic (recompiled EE code; D5:
+  engine decisions stay with EE overrides).
 
 **Scope:**
-1. Survey the car programs (which run where, shared pieces, e.g. the clip
-   pass, lighting, passes and kicks).
-2. Handler: claim the car chains, CPU batches for the programs covering
-   most car batches (at least the two main ones), the rest and clipper
-   batches on VU1.
-3. Check mode with 0 mismatches; frames compared; cycles.
-4. Measure: draw profile racing and race intro (car kind VU1 → handler
-   ms), window frame log at scale 1 and 3 against T46's runs.
-5. Docs: local notes, `recomp/README.md` (only if the seam changes),
-   `docs/native-port-plan.md`, roadmap.
+1. Inventory per subsystem: what runs now, its cost (profile/frame log
+   numbers), what a native replacement needs (inputs at the seam, state it
+   must keep in sync with the EE code) and the risk.
+2. Renderer options: native draw from engine calls (hardware raster via
+   WebGPU render pipelines, keeping the GS renderer for render-to-texture
+   and effects first) vs. growing the GPU mesh path per mesh kind; how
+   cars, model replacement (T49) and lighting/MSAA (T50) fit; exactness bar
+   (byte-identical where cheap, pixel-diff otherwise, as T48 set).
+3. Audio, IO, timing: what native means for each (e.g. IOP/SPU2 off the EE
+   clock, T30), order relative to the renderer.
+4. The task list: one-session tasks in order, each with Goal / Context /
+   Scope / Success criteria / Out of scope; flag owner approvals
+   (downloads, installs); re-decide T47, T49, T50 and the GPU mesh path
+   follow-ups (T55) in it.
+5. Docs: `docs/native-port-plan.md` (new section), `docs/decisions.md`
+   (the decisions the plan makes, marked "pending owner review"),
+   `docs/tasks.md` backlog, roadmap.
 
 **Success criteria:**
-- Check mode: 0 differences in VU1 memory (racing, race intro).
-- Racing, race intro and menu run frames byte-identical to the VU path,
-  same cycle counts; the handled car programs' VU1 time gone in
-  `drawlist.py`.
-- No handler and the identity handler unchanged (menu run 107/107,
-  52,595,993,647 cycles).
-- L1 216/216, L2 500/500, harness override case; unit tests; WSL and
-  Windows builds compile.
-- No game data and nothing game-specific in git.
+- A plan the owner can review in one sitting: subsystems, order, risks,
+  estimates at agent pace, and the task list in the backlog.
+- Every claim about costs cites a measurement (local notes, README) or is
+  marked *estimate* / *unverified*.
+- No game data and nothing game-specific in git (game-specific findings in
+  `local/games/<serial>/notes.md`).
 
-**Out of scope:** the GPU mesh path (T48); model replacement (T49); the
-rare pre-lit programs (one 03F0 variant, entry 0400) unless trivial;
-changing what the engine draws (LOD, parts).
+**Out of scope:** implementing any of it (owner review first); other
+games (after the pilot is fully native, D31).
 ## Backlog
 
 Ordered (owner, D31): Phase 8, then Phase 9, then fully native for the
@@ -79,21 +78,28 @@ section "Task details". Each item is one session; split it if it is bigger.
 
 Phase 8 (native draw paths, D32):
 
-1. **T48: recomp: GPU mesh path.** Chain vertex data decoded once and
-   cached on the GPU; per call the handler records only the constants; a
-   compute pass builds the GS primitives into the renderer's batch (skips
-   the VU1 work, the VIF unpacks and the GS front end: T46 showed a CPU
-   path saves little). Skipping the unpacks means the chain's VIF state
-   (double-buffer offsets, row/mode) must still advance as if it ran (D35:
-   e.g. a state-only VIF pass over the words) and the setup program's VU1
-   output must be read or re-done. Window fps and per-thread load at scale
-   1 and 3 (frame log) against the T45/T46 runs; frames compared with
-   T46/T47 (pixel diff if the GPU raster differs).
-2. **T49: mods: car model replacement.** A glTF model (T14/T44 export,
+- **T47: recomp: lit car meshes (re-decided by T52).** The pilot's car
+  chains (0428 programs, ~4.5 ms VU1 per profiled racing frame) through the
+  chain handler: straight to the GPU mesh path if their batches fit
+  `MeshDraw` (lighting would have to move into `mesh_build` or to the CPU
+  per vertex: per-vertex colours from normals and lights), else the T46
+  CPU method first. Full former Next task text: `docs/tasks.md` at
+  `4b2f4fe`; local notes "For T47".
+- **T55: recomp: GPU mesh path follow-ups (re-decided by T52).** From T48
+  (D36, local notes "GPU mesh path"): (a) without a texture pack the race
+  intro at scale 3 is GPU-bound with the path on (~51 vs ~59 fps off): find
+  the GPU cost (mesh batches are split by every other draw and every
+  conflicting upload, ~40 per frame; each adds dispatches); (b) the VU
+  thread's exact clip pass for objects crossing the frustum (~7% of the VU
+  thread); (c) render thread binning of the remaining CPU primitives;
+  (d) fog/UV output for other handlers. Measure with the frame log and the
+  T25 sampler (`work/t48/prof_win.ps1` pattern).
+
+1. **T49: mods: car model replacement.** A glTF model (T14/T44 export,
    edited) drawn in place of a car's chains through the handler (the
    game's matrices and lights, the model's own textures); checked in
    frames and in the window; LOD and part choice stay the game's.
-3. **T50: look: decide and do the look extras.** After T48/T49: forced
+2. **T50: look: decide and do the look extras.** After T49: forced
    best LOD (EE override of the LOD pick), better lighting in the GPU path
    (per-vertex first), whatever the owner picks from the frames; per-pixel
    lighting and MSAA only if they fit without a native raster stage
@@ -101,31 +107,25 @@ Phase 8 (native draw paths, D32):
 
 Phase 9 (assets and mods, left):
 
-4. **T44: assets: mesh export options (local tools only).** Owner request:
+3. **T44: assets: mesh export options (local tools only).** Owner request:
    the pilot game's glTF export (T14, `local/games/<serial>/tools/`) with
    options for upgrade kits (body kit, spoiler, wheels: the part variants
    next to the stock parts in the car archives) and paint colour (the
    material/palette the game tints). Local tools only (D24); check renders
    with `tools/gltfview.py` against the port's frames of the same car
    options.
-5. **T51: assets: scene capture to glTF.** Generic: the chain handlers
+4. **T51: assets: scene capture to glTF.** Generic: the chain handlers
    record what a frame draws (each static chain once, with its world
    matrices and material/texture state) and write a glTF scene (meshes
    decoded from the chains by their VU1 memory layout, textures from the
    port's dumps). On the pilot: a track section from the racing state,
    checked by `tools/gltfview.py` renders against the port's frames.
 
-Fully native (D26, D31):
-
-6. **T52: plan: fully native for the pilot game.** Write the detailed plan
-   (renderer, audio, IO, game logic) from what Phases 8 and 9 built; the
-   pilot engine's renderer layer over VU1 is the seam for a native
-   renderer (local notes "Renderer draw lists"). Split into one-session
-   tasks; owner review before work starts.
+Fully native (D26, D31): T52 is the Next task.
 
 Other games (after the pilot game is fully native, D31):
 
-7. **T40: conversion tool: second-game trial.** Full text in `docs/tasks.md`
+5. **T40: conversion tool: second-game trial.** Full text in `docs/tasks.md`
    at `e51cf7b` ("Next task"); in short: run a second game from the
    owner's discs (ISO already listed in `local/MACHINE.md`) through
    `/port-game` (`port.py init <iso> --textures`) with no game-specific
@@ -142,7 +142,7 @@ Texture work (small, owner-driven):
 Parked by the owner (the native renderer is the intended fix for the fps
 dips, D31):
 
-8. **T29: recomp: speed headroom for racing.** After T28 the race intro is
+6. **T29: recomp: speed headroom for racing.** After T28 the race intro is
    60 fps paced but only ~71 fps unpaced, with the VU and render threads both
    near 100% there (at 60 fps: VU ~83%, render ~80%). Record VU1 programs
    during real gameplay (`PS2_VU_RECORD` / `port.py`) and check how many
@@ -155,7 +155,7 @@ dips, D31):
    the owner's OK to drop CPUs without AVX2, D22). Same save-state runs and
    byte-identical frame checks as T25-T28. (T36: a racing run from a state
    had fewer than 5,000 interpreted VU1 calls.)
-9. **T30: recomp: decouple IOP/SPU2 from the EE clock.** Owner request: audio
+7. **T30: recomp: decouple IOP/SPU2 from the EE clock.** Owner request: audio
    must not depend on the frame rate. Today the EE, IOP and SPU2 share one
    emulated clock, so when the EE falls behind real time the SPU2 makes
    fewer samples and the audio underruns. On a real PS2 the IOP/SPU2 run on
@@ -218,4 +218,5 @@ Results with game-specific numbers: `local/games/<serial>/notes.md`.
 | T36: analysis: renderer draw lists (Phase 8 start) | 2026-10-19 | Local profiler build (VIF1 cost per DMA call target, VU1 per program entry, GS front end per path; same cycles) + chain fingerprints from a RAM dump: the pilot engine sends matrices, lights and material state per object, then calls the mesh's static VIF chain; racing frame: pre-lit static meshes ~32%, root list ~18%, car meshes ~16%; two VU1 program paths 95% of VU1 time; window racing at owner settings 59-62 fps (2 s samples), render thread ~80% at scale 3; D31 (owner: Phases 8, 9, then fully native, then other games), D32 (go: handlers at the chain calls, then a GPU mesh path; est. -70% VU thread, -35% render thread); racing save state; backlog re-ordered (T45-T52, T40 after fully native) | `7542466` |
 | T45: recomp: draw-list profiler and frame-time log (Phase 8) | 2026-10-19 | Opt-in `PS2_DRAW_PROFILE` (headless: VIF1 per DMA call target, VU1 per entry, GS per path) + `recomp/drawlist.py` (kinds by VIF fingerprint, share of the frame, `--match` names chains in a folder's files; unit test): T36 shares within a point; window `PS2_FRAME_LOG` (`play.json` `frame_log`): per-frame time and EE/VU/render waits, limit, summary; window pacing by timer with audio correction (menus: presents 2-30 → 13-20 ms apart); menu dips (owner: menus, D33) = pacing bursts (fixed), texture pack loads on the render thread, GPU-bound menu screens at scale 3 (T53); unset: frames and cycles unchanged | `1450207` |
 | T53: recomp: menu dips (pack loads off the render thread) | 2026-10-19 | Texture pack images decoded by loader threads from the start (pilot pack 1.3 s), a lookup decodes or waits so frames never depend on timing: window menu run at scale 3 max frame 782 → 73 ms, frames over 33 ms 31 → 8, p99 32.6 → 28.1 ms; race intro max 194 → 40 ms; frames with the pack byte-identical, no pack 107/107 and same cycles; options, dialogs and main menu clean (max 21.5 ms); GPU-bound fade screens at scale 3 found (game draws the full screen many times per frame, ~40 ms GPU), not fixed: T54, owner pick | `098850f` |
-| T46: recomp: chain handlers (first: pre-lit static meshes) | 2026-10-19 | Runtime seam (D35): a handler claims VIF1 `call` targets on the EE thread, gets the chain's words where VIF1 runs them (one packet to the VU thread in the window) and runs them through `chain::run` with a hook at each VU1 start; `recomp.chain_handler` built in by `port.py`; VU1 costs no EE cycles, so none charged; no handler: menu 107/107, same cycles, speed within noise; identity handler byte-identical; pilot's pre-lit scenery (local): three batch programs re-done on the CPU with the VU float ops, 0 VU1-memory differences in 15 M checked batches, racing/race intro/menu frames byte-identical, same cycles, ~20% less VU1 work for those batches, frame times unchanged (speed is T48's); owner: T54 fades accepted, decoded pack in RAM OK (D34) | this commit |
+| T46: recomp: chain handlers (first: pre-lit static meshes) | 2026-10-19 | Runtime seam (D35): a handler claims VIF1 `call` targets on the EE thread, gets the chain's words where VIF1 runs them (one packet to the VU thread in the window) and runs them through `chain::run` with a hook at each VU1 start; `recomp.chain_handler` built in by `port.py`; VU1 costs no EE cycles, so none charged; no handler: menu 107/107, same cycles, speed within noise; identity handler byte-identical; pilot's pre-lit scenery (local): three batch programs re-done on the CPU with the VU float ops, 0 VU1-memory differences in 15 M checked batches, racing/race intro/menu frames byte-identical, same cycles, ~20% less VU1 work for those batches, frame times unchanged (speed is T48's); owner: T54 fades accepted, decoded pack in RAM OK (D34) | `4b2f4fe` |
+| T48: recomp: GPU mesh path | 2026-10-19 | The pilot's pre-lit scenery drawn from vertex data cached on the GPU: the handler keeps each chain's batch input from its first call, later calls skip the batch unpacks (VIF state still advances) and send one `MeshDraw` per kick; the GPU builds the primitive records with VU1's arithmetic (bit-exact) and bins/shades them per tile (CPU chunk lists, `mesh_bin`, `raster_mesh`): frames byte-identical (racing, race intro, menu, scale 3 with pack), same cycles; headless racing 25.5 → 22.1 ms (scale 1), 27.0 → 23.1 (scale 3), race intro 29.8 → 23.2 / 30.6 → 26.0; window race intro lowest 1 s 40 → 56 fps (scale 1), 36 → 47 (scale 3), render thread 78% → 69% racing at scale 3; on by default (D36), `gpu_mesh` / `PS2_GPU_MESH=0` off; follow-ups T55; owner: T52 next | this commit |
