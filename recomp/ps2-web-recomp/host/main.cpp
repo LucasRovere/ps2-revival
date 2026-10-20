@@ -65,7 +65,7 @@ void default_env(const char *name, const std::string &value) {
 }
 
 // settings.json next to ps2run (written by port.py --folder): aspect, scale, textures, mods, memcard, fullscreen;
-// "gpu_mesh": false turns the GPU mesh path off (T48).
+// "gpu_mesh": false turns the GPU mesh path off (T48); "renderer": "native" picks recomp/native/.
 bool apply_folder_settings(const std::filesystem::path &dir) {
     std::ifstream in(dir / "settings.json");
     const std::string json((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
@@ -74,6 +74,7 @@ bool apply_folder_settings(const std::filesystem::path &dir) {
     if (const auto textures = setting(json, "textures"); !textures.empty()) default_env("PS2_TEXTURES", (dir / textures).string());
     if (const auto mods = setting(json, "mods"); !mods.empty()) default_env("PS2_MODS", (dir / mods).string());
     if (setting(json, "gpu_mesh") == "false") default_env("PS2_GPU_MESH", "0");
+    if (const auto renderer = setting(json, "renderer"); !renderer.empty() && renderer != "gs") default_env("PS2_RENDERER", renderer);
     if (const auto card = setting(json, "memcard"); !card.empty()) ps2::g_options.memcard_path = (dir / card).string();
     return setting(json, "fullscreen") == "true";
 }

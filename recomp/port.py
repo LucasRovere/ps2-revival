@@ -255,7 +255,7 @@ def default_aspect(game, patched):
 def folder_settings(game, patched, play, pack):
     """The port folder's settings.json: play.json's picture settings (when there is one), else the defaults.
     The folder keeps its own card and its own copy of the texture pack; a repo-relative mod folder becomes absolute."""
-    settings = {"aspect": default_aspect(game, patched), "scale": 1, "fullscreen": False, "textures": "", "mods": ""}
+    settings = {"aspect": default_aspect(game, patched), "scale": 1, "fullscreen": False, "textures": "", "mods": "", "renderer": "gs"}
     settings.update({k: v for k, v in (play or {}).items() if k in settings})
     if settings["mods"]:
         settings["mods"] = str(REPO / settings["mods"])

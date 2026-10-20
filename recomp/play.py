@@ -15,6 +15,7 @@ and are created with defaults on first use:
   mods        mod folder: replacement files at their disc paths (PS2_MODS, relative to the repo or absolute); "" = off
   frame_log   true: per-frame times and thread waits in frame_log.txt next to the card (PS2_FRAME_LOG)
   gpu_mesh    false: no GPU mesh path (PS2_GPU_MESH=0; chain handlers then draw as before)
+  renderer    "gs" (default) or "native": the native renderer (PS2_RENDERER, recomp/native/)
 
 Usage:
   python recomp/play.py <SERIAL>
@@ -31,7 +32,7 @@ from port import BUILD_SUFFIX, GAMES_DIR, REPO, WORK_DIR, default_aspect
 
 def load_settings(serial, aspect):
     path = GAMES_DIR / serial / "play.json"
-    defaults = {"memcard": f"local/games/{serial}/memcard.ps2", "scale": 1, "fullscreen": False, "aspect": aspect, "textures": "", "mods": "", "frame_log": False, "gpu_mesh": True}
+    defaults = {"memcard": f"local/games/{serial}/memcard.ps2", "scale": 1, "fullscreen": False, "aspect": aspect, "textures": "", "mods": "", "frame_log": False, "gpu_mesh": True, "renderer": "gs"}
     if not path.exists():
         path.write_text(json.dumps(defaults, indent=2) + "\n")
         print(f"created {path} with defaults")
@@ -58,7 +59,7 @@ def main():
             sys.exit(f"No window build: run python recomp/port.py {args.serial} --window first")
         cmd = [runner, elf, "--disc", out / "disc.iso"]
     card = REPO / settings["memcard"]
-    print(f"settings: memcard {card}, scale {settings['scale']}, fullscreen {settings['fullscreen']}, aspect {settings['aspect']}, textures {settings['textures'] or 'off'}, mods {settings['mods'] or 'off'}", flush=True)
+    print(f"settings: memcard {card}, scale {settings['scale']}, fullscreen {settings['fullscreen']}, aspect {settings['aspect']}, textures {settings['textures'] or 'off'}, mods {settings['mods'] or 'off'}, renderer {settings['renderer']}", flush=True)
     cmd += ["--memcard", card, "--fullscreen" if settings["fullscreen"] else "--window"]
     env = {**os.environ, "PS2_SCALE": str(settings["scale"]), "PS2_ASPECT": settings["aspect"]}
     if settings["textures"]:
@@ -67,6 +68,8 @@ def main():
         env["PS2_MODS"] = str(REPO / settings["mods"])
     if not settings["gpu_mesh"]:
         env["PS2_GPU_MESH"] = "0"
+    if settings["renderer"] != "gs":
+        env["PS2_RENDERER"] = settings["renderer"]
     if settings["frame_log"]:
         env["PS2_FRAME_LOG"] = str(card.parent / "frame_log.txt")
         print(f"frame log: {env['PS2_FRAME_LOG']}", flush=True)
