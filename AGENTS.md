@@ -212,4 +212,9 @@ the same change.
   ~60 fps at scale 3 but render thread still above the GS path (racing 14.5 vs 11.5 ms):
   stays opt-in; T59b/T59c (uploads and decode on the GPU, fewer draw calls) first.
   Owner (D39): decompile only hot spots; one picture per screen refresh (T67).
+  T59b (D43): GS memory on the GPU (uploads, CLUT loads, texture decodes as
+  compute jobs), frames byte-identical; render thread at the GS path's in
+  every scene, so `play.py` and the port folder default to `"renderer":
+  "native"` (`"gs"` falls back); `ps2run` with an ELF still follows
+  `PS2_RENDERER`. Owner window play check open.
 - Next up: see [docs/tasks.md](docs/tasks.md). The owner runs tasks with `/next-task`.

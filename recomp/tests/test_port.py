@@ -52,7 +52,7 @@ class FolderSettingsTest(unittest.TestCase):
 
     def test_defaults(self):
         self.assertEqual(folder_settings(self.GAME, True, None, None),
-                         {"aspect": "16:9", "scale": 1, "fullscreen": False, "textures": "", "mods": "", "renderer": "gs", "memcard": "memcard.ps2"})
+                         {"aspect": "16:9", "scale": 1, "fullscreen": False, "textures": "", "mods": "", "renderer": "native", "memcard": "memcard.ps2"})
         self.assertEqual(folder_settings(self.GAME, False, None, None)["aspect"], "4:3")
 
     def test_play_json(self):

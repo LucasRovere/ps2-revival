@@ -15,7 +15,7 @@ and are created with defaults on first use:
   mods        mod folder: replacement files at their disc paths (PS2_MODS, relative to the repo or absolute); "" = off
   frame_log   true: per-frame times and thread waits in frame_log.txt next to the card (PS2_FRAME_LOG)
   gpu_mesh    false: no GPU mesh path (PS2_GPU_MESH=0; chain handlers then draw as before)
-  renderer    "gs" (default) or "native": the native renderer (PS2_RENDERER, recomp/native/)
+  renderer    "native" (default since T59b: PS2_RENDERER, recomp/native/) or "gs": the GS renderer
 
 Usage:
   python recomp/play.py <SERIAL>
@@ -32,7 +32,7 @@ from port import BUILD_SUFFIX, GAMES_DIR, REPO, WORK_DIR, default_aspect
 
 def load_settings(serial, aspect):
     path = GAMES_DIR / serial / "play.json"
-    defaults = {"memcard": f"local/games/{serial}/memcard.ps2", "scale": 1, "fullscreen": False, "aspect": aspect, "textures": "", "mods": "", "frame_log": False, "gpu_mesh": True, "renderer": "gs"}
+    defaults = {"memcard": f"local/games/{serial}/memcard.ps2", "scale": 1, "fullscreen": False, "aspect": aspect, "textures": "", "mods": "", "frame_log": False, "gpu_mesh": True, "renderer": "native"}
     if not path.exists():
         path.write_text(json.dumps(defaults, indent=2) + "\n")
         print(f"created {path} with defaults")

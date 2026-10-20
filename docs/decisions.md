@@ -979,7 +979,8 @@ textures as 32-bit); it holds no rendered pixels.
 CPU decode and upload copy stay too slow for the D38 render target (move
 them to the GPU), or a target is read in another format (done in T58: D41).
 **T59 (D42):** still opt-in; the upload copy and decode are too slow (~3.7
-ms per frame in races): they move to the GPU in T59b.
+ms per frame in races): they move to the GPU in T59b. **T59b (D43):** done;
+GS memory, CLUT loads and texture decodes are on the GPU.
 
 ## D41: Native renderer: targets read in another format, read-backs, scaled nearest sampling (T58)
 
@@ -1054,4 +1055,54 @@ texture-key memo (keys change with every upload).
 
 **Revisit if:** the owner prefers the native renderer on by default
 earlier (e.g. for its look or the fully native track), or T60's mesh kinds
-change the balance (fewer translator draws).
+change the balance (fewer translator draws). **T59b (D43):** the rule is
+met (at or below in every scene, by a few hundredths of a ms): the
+launchers default to the native renderer.
+
+## D43: GS memory on the GPU; the launchers default to the native renderer (T59b)
+
+**Decision (T59b, 2026-10-20):**
+1. **GS memory on the GPU.** The native renderer keeps GS memory in a 4 MB
+   GPU buffer: uploads are swizzled there by a compute pass (bytes written
+   straight into a mapped staging buffer, moved by the GPU at the submit),
+   CLUT loads write one current CLUT on the GPU (each thread owns entries
+   and applies a dispatch's loads in order), textures are decoded into the
+   cached textures by compute, new targets are filled from it, and target
+   read-backs (downloads, uploads into target memory) are written into it
+   on the GPU with no wait. These jobs run in a compute pass at the start of
+   their part of the frame (a part ends where a new target is filled);
+   each job gets the lowest slot after the jobs it depends on (pages
+   written and read, the CLUT load order; a decode orders the CLUT loads
+   after it), so independent jobs share a dispatch. The CPU copy of GS
+   memory is filled only for downloads (their pages) and state saves.
+2. **Texture keys without CPU memory.** D25 tags for texels and (T8/T4)
+   CLUTs as before; a texture without complete tags is keyed by the hash of
+   the newest upload that wrote all of it when nothing written later
+   touches it (uploads that do not cover whole columns are hashed), else
+   by its pages' generations; a CLUT without tags by its loads' source
+   fields and page generations. Keying by page generations alone re-decoded
+   the pilot's small textures ~180 times per frame (their pages get other
+   uploads every frame).
+3. **Default (D42's rule met).** Pilot, window scale 3, 16:9, pack, render
+   thread busy per presented frame, 3 runs each, same session: menus 1.56 vs
+   GS 1.56 ms, race intro 15.48 vs 15.56, racing 11.94 vs 11.95. So
+   `play.py` and the port folder's `settings.json` default to `"renderer":
+   "native"` (`"gs"` = the GS renderer); `ps2run` with an ELF argument keeps
+   the environment's choice (scripted checks unchanged). The pilot's
+   `play.json` and port folder now say `"native"`.
+
+**Why:** the upload copy (~3.7 ms per race frame) and CPU decode were the
+largest render-thread items that the GS path already does on the GPU;
+frames stay byte-identical because the GPU code follows the CPU code
+(same swizzle tables and conversions).
+
+**Costs and limits:** GPU time per race present rose (race intro 5.6 →
+8.4 ms, racing 4.7 → 7.4) with the swizzle and the in-order CLUT loads;
+frames stay paced at 60. The margin to the GS path is within run-to-run
+noise (race intro runs 14.6-16.0 ms). *Unverified:* the owner's window
+play check with the native renderer (open since T59).
+
+**Revisit if:** the owner sees a problem in play (then `"renderer": "gs"`),
+GPU time becomes the limit (T59c or a CLUT-load rework: snapshots by
+content instead of in-order loads), or a game reads target memory often
+during play (read-backs are GPU-side now, downloads still wait).

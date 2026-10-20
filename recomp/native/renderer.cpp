@@ -56,7 +56,7 @@ WGPUBindGroupLayout g_params_layout = nullptr, g_texture_layout = nullptr;
 WGPUPipelineLayout g_draw_layout = nullptr;
 WGPUBindGroupLayout g_dest_layout = nullptr, g_convert_layout = nullptr;
 WGPUPipelineLayout g_convert_pipeline_layout = nullptr;
-WGPURenderPipeline g_init_pipeline = nullptr, g_display_pipeline = nullptr, g_blit_pipeline = nullptr;
+WGPURenderPipeline g_display_pipeline = nullptr, g_blit_pipeline = nullptr;
 WGPURenderPipeline g_to16_pipeline = nullptr, g_to32_pipeline = nullptr, g_pack16_pipeline = nullptr, g_pack32_pipeline = nullptr;
 WGPUBuffer g_lut = nullptr;
 WGPUSampler g_near[4] = {}, g_lin[4] = {}, g_smooth = nullptr;
@@ -69,7 +69,7 @@ std::map<std::string, std::uint64_t> g_missing;
 
 // PS2_NATIVE_TIME: render-thread split, counts and GPU time per present, printed every 600 presents (window).
 enum Time { T_REBUILD, T_DECODE, T_UPLOAD, T_TAG, T_SUBMIT, T_PRESENT, T_ACQUIRE, T_TIMES };
-enum Count { C_REBUILD, C_PASS, C_DRAW, C_COPY, C_SUBMIT, C_UPLOAD, C_COUNTS };
+enum Count { C_REBUILD, C_PASS, C_DRAW, C_COPY, C_SUBMIT, C_UPLOAD, C_DECODE, C_DISPATCH, C_COUNTS };
 bool g_time = false;
 double g_time_ms[T_TIMES] = {}, g_gpu_ms = 0.0;
 std::uint64_t g_counts[C_COUNTS] = {}, g_gpu_frames = 0, g_timed_presents = 0;
@@ -167,7 +167,8 @@ enum : std::uint32_t {
     F_MASKED = 1048576u, F_TARGET16 = 2097152u,
 };
 
-enum class OpKind { pass, draw, copy, init, convert };
+// compute: GS memory jobs first .. first + count, dispatches param .. param + width (set at submit).
+enum class OpKind { pass, draw, copy, init, convert, compute };
 
 struct Op {
     OpKind kind;
@@ -191,19 +192,75 @@ WGPUBindGroup g_param_group = nullptr;
 const Target *g_pass_target = nullptr;
 const Depth *g_pass_depth = nullptr;
 
-// Uploads change GS memory pages; textures are keyed by a hash of the pages under them.
-std::uint32_t g_page_gen[kPages], g_page_hashed[kPages];
-std::uint64_t g_page_hash[kPages];
+// Uploads and read-backs change GS memory pages: generations for the texture memo, CLUT ids and keys of last resort.
+std::uint32_t g_page_gen[kPages];
 std::uint32_t g_upload_serial = 1, g_clut_version = 1;
+
+// GS memory lives on the GPU (T59b): 1x, written by uploads and target read-backs, read by CLUT loads, texture
+// decodes and new targets. The CPU copy (gs::memory()) is filled only for downloads and state saves.
+WGPUBuffer g_vram = nullptr, g_swizzle = nullptr, g_cluts = nullptr, g_data = nullptr, g_job_buffer = nullptr;
+std::uint64_t g_data_capacity = 0, g_job_capacity = 0;
+WGPUBindGroupLayout g_job_layout = nullptr, g_mem_layout = nullptr, g_out_layout = nullptr;
+WGPUBindGroup g_job_group = nullptr, g_mem_group = nullptr;
+WGPUComputePipeline g_upload_pipeline = nullptr, g_clut_pipeline = nullptr, g_decode_pipeline = nullptr;
+WGPURenderPipeline g_fill_pipeline = nullptr;
+// Lowest key for the next CLUT load: after the decodes that read the CLUT as it is now.
+std::uint32_t g_clut_floor = 0;
+// Content of each 16-entry CLUT group: its load's source fields and the generations of the pages it read.
+std::uint64_t g_clut_ids[32];
+
+// Upload bytes go straight into a mapped staging buffer (each upload from a 4-byte boundary) that the submit copies
+// into the data buffer on the GPU; a ring, so a buffer is mapped again long before it is reused.
+constexpr std::uint64_t kStage = (16u << 20) + 4096;  // the largest transfer (2048 x 2048 x 32 bits) fits
+struct Stage {
+    WGPUBuffer buffer = nullptr;
+    std::uint8_t *ptr = nullptr;
+    bool mapped = false;
+};
+Stage g_stages[4];
+std::uint32_t g_stage = 0;
+std::uint64_t g_staged = 0;
+// Bytes of an upload that arrives in several pieces, for its tags and hash and to carry it over a submit.
+std::vector<std::uint8_t> g_pieces;
 
 struct Upload {
     bool active = false;
     std::uint32_t bp = 0, bw = 0, psm = 0, x = 0, y = 0, w = 0, h = 0;
-    std::size_t expected = 0;
-    std::vector<std::uint8_t> bytes;
+    std::size_t expected = 0, start = 0;
     std::uint32_t lo = 0, hi = 0;
     std::vector<Target *> targets;  // targets whose memory it writes: read back first, refilled after
 } g_upload;
+
+// GS memory jobs run in a compute pass at the start of their segment of the frame's ops; a segment ends at an op
+// that reads GS memory in a render pass (fill_target). Each job gets the lowest key after the jobs it depends on
+// (pages written and read, the CLUT chain); key % 3 is its kind, so jobs of one key and kind share a dispatch.
+enum JobKind : std::uint32_t { J_UPLOAD, J_CLUT, J_DECODE };
+
+struct Job {
+    std::uint32_t key = 0, kind = 0, threads = 0;
+    std::uint32_t rec[12] = {};
+    WGPUBindGroup out = nullptr;
+};
+
+struct PageUse {
+    std::int32_t write = -1, read = -1;
+    // Uploads with the last write key: same address and format, union rectangle (disjoint uploads share a dispatch).
+    std::uint32_t fmt = 0;
+    std::uint32_t box[4] = {};
+};
+
+struct Dispatch {
+    WGPUComputePipeline pipeline = nullptr;
+    WGPUBindGroup out = nullptr;
+    std::uint32_t offset = 0, x = 0, y = 0;
+};
+
+std::vector<Job> g_jobs;
+std::vector<Dispatch> g_dispatches;
+std::vector<std::uint32_t> g_records, g_job_params;
+PageUse g_pages[kPages];
+std::int32_t g_clut_key = -1, g_segment_op = -1;
+std::size_t g_segment_start = 0;
 
 // Draw state rebuilt when a GS register other than a vertex register changes (gs::g_setup_generation).
 // The registers a draw state depends on, to skip rebuilding when a write left them as they were.
@@ -267,21 +324,6 @@ void for_pages(std::uint32_t bp, std::uint32_t bw, std::uint32_t psm, std::uint3
         }
 }
 
-std::uint64_t page_hash(std::uint32_t page) {
-    if (g_page_hashed[page] != g_page_gen[page]) {
-        const std::uint8_t *p = gs::memory() + page * 8192u;
-        std::uint64_t h = 0xCBF29CE484222325ull;
-        for (std::uint32_t i = 0; i < 8192; i += 8) {
-            std::uint64_t v;
-            std::memcpy(&v, p + i, 8);
-            h = (h ^ v) * 0x100000001B3ull;
-        }
-        g_page_hash[page] = h ^ (h >> 29);
-        g_page_hashed[page] = g_page_gen[page];
-    }
-    return g_page_hash[page];
-}
-
 WGPUBuffer make_buffer(std::uint64_t size, WGPUBufferUsage usage) {
     WGPUBufferDescriptor d = WGPU_BUFFER_DESCRIPTOR_INIT;
     d.size = size;
@@ -326,59 +368,24 @@ WGPUBindGroup texture_group(WGPUTextureView v, std::uint32_t wrap) {
     return wgpuDeviceCreateBindGroup(g_device, &d);
 }
 
-// ---- GS memory decode (textures and new targets read what uploads put there) ----
-
-std::uint32_t expand16(std::uint32_t c, std::uint32_t ta0, std::uint32_t ta1, bool aem) {
-    std::uint32_t a = ta0;
-    if (c & 0x8000u) a = ta1;
-    else if (aem && !(c & 0x7FFFu)) a = 0;
-    return ((c & 0x1Fu) << 3) | (((c >> 5) & 0x1Fu) << 11) | (((c >> 10) & 0x1Fu) << 19) | (a << 24);
-}
+// ---- GS memory jobs: uploads, CLUT loads and texture decodes on the GPU ----
 
 struct TexFormat {
     std::uint32_t psm, cpsm, csa, ta0, ta1;
     bool aem;
 };
 
-void decode(const TexFormat &f, std::uint32_t bp, std::uint32_t bw, std::uint32_t w, std::uint32_t h, std::vector<std::uint32_t> &out) {
-    out.resize(static_cast<std::size_t>(w) * h);
-    const std::uint32_t *clut = gs::g_state.clut;
-    const bool clut16 = f.cpsm != gs::PSMCT32 && f.cpsm != gs::PSMCT24;
-    for (std::uint32_t y = 0; y < h; ++y)
-        for (std::uint32_t x = 0; x < w; ++x) {
-            const std::uint32_t raw = gs::read_pixel(f.psm, bp, bw, x, y);
-            std::uint32_t c;
-            switch (f.psm) {
-            case gs::PSMCT32: c = raw; break;
-            case gs::PSMCT24: c = raw | (((f.aem && !raw) ? 0u : f.ta0) << 24); break;
-            case gs::PSMCT16: case gs::PSMCT16S: c = expand16(raw, f.ta0, f.ta1, f.aem); break;
-            case gs::PSMT8: case gs::PSMT8H: c = clut[raw & 255u]; break;
-            default: c = clut[((f.csa & 15u) * 16u + (raw & 15u)) & 511u]; break;
-            }
-            if (clut16 && (bits_per_pixel(f.psm) <= 8)) c = expand16(c, f.ta0, f.ta1, f.aem);
-            out[static_cast<std::size_t>(y) * w + x] = c;
-        }
-}
-
-// ---- Uploads and CLUT loads into the CPU copy of GS memory ----
-
 namespace swz {
 std::vector<std::uint32_t> g_tables;
-const std::uint32_t *off32, *offz32, *off16, *off16s, *offz16, *offz16s, *off8, *off4;
+const std::uint32_t *off32, *off16, *off16s;
 }
 
 void load_tables() {
     using namespace swz;
     gs::swizzle_tables(g_tables);
-    const std::uint32_t *t = g_tables.data();
-    off32 = t, t += 32 * 64;
-    offz32 = t, t += 32 * 64;
-    off16 = t, t += 64 * 64;
-    off16s = t, t += 64 * 64;
-    offz16 = t, t += 64 * 64;
-    offz16s = t, t += 64 * 64;
-    off8 = t, t += 64 * 128;
-    off4 = t;
+    off32 = g_tables.data();
+    off16 = off32 + 2 * 32 * 64;
+    off16s = off16 + 64 * 64;
 }
 
 // Where 16-bit pixels sit in 32-bit ones within a page (CT16, then CT16S): 4096 entries per format
@@ -401,104 +408,132 @@ WGPUBuffer make_lut() {
     return b;
 }
 
-// One row of an image transfer into GS memory (page widths and heights are powers of two).
-template <std::uint32_t Bits>
-void write_row(std::uint8_t *mem, const std::uint8_t *d, std::size_t bit, const std::uint32_t *trow, std::uint32_t base, std::uint32_t x0, std::uint32_t w, std::uint32_t pws) {
-    const std::uint32_t pmask = (1u << pws) - 1;
-    for (std::uint32_t col = 0; col < w; ++col, bit += Bits) {
-        const std::uint32_t x = (x0 + col) & 0x7FFu;
-        const std::uint32_t at = trow[x & pmask];
-        const std::uint32_t page = base + (x >> pws) * 8192u;
-        if constexpr (Bits == 4) {
-            const std::uint32_t v = (d[bit / 8] >> (bit & 4)) & 15u;
-            std::uint8_t &b = mem[(page + at / 2) & (gs::kMemorySize - 1)];
-            b = (at & 1u) ? static_cast<std::uint8_t>((b & 0x0Fu) | (v << 4)) : static_cast<std::uint8_t>((b & 0xF0u) | v);
+void end_segment() {
+    g_segment_op = -1;
+    g_segment_start = g_ops.size();
+    g_clut_key = -1;
+    g_clut_floor = 0;
+    for (PageUse &p : g_pages) p = PageUse{};
+}
+
+// Adds a job at the lowest key >= bound of its kind to the current segment's compute op (made at the segment start).
+std::uint32_t push_job(Job j, std::uint32_t bound) {
+    j.key = bound + (j.kind + 3u - bound % 3u) % 3u;
+    if (g_segment_op < 0) {
+        Op op{OpKind::compute};
+        op.first = static_cast<std::uint32_t>(g_jobs.size());
+        g_ops.insert(g_ops.begin() + static_cast<std::ptrdiff_t>(g_segment_start), op);
+        g_segment_op = static_cast<std::int32_t>(g_segment_start);
+    }
+    ++g_ops[static_cast<std::size_t>(g_segment_op)].count;
+    g_jobs.push_back(j);
+    return j.key;
+}
+
+// A reader runs after the uploads to its pages; uploads after it wait for it.
+std::uint32_t read_bound(std::uint32_t bp, std::uint32_t bw, std::uint32_t psm, std::uint32_t x, std::uint32_t y, std::uint32_t w, std::uint32_t h) {
+    std::uint32_t bound = 0;
+    for_pages(bp, bw, psm, x, y, w, h, [&](std::uint32_t p) {
+        if (g_pages[p].write >= 0) bound = std::max(bound, static_cast<std::uint32_t>(g_pages[p].write) + 1u);
+    });
+    return bound;
+}
+
+void mark_read(std::uint32_t bp, std::uint32_t bw, std::uint32_t psm, std::uint32_t x, std::uint32_t y, std::uint32_t w, std::uint32_t h, std::uint32_t key) {
+    for_pages(bp, bw, psm, x, y, w, h, [&](std::uint32_t p) { g_pages[p].read = std::max(g_pages[p].read, static_cast<std::int32_t>(key)); });
+}
+
+bool disjoint(const std::uint32_t *a, const std::uint32_t *b) {
+    if (a[2] > 2048 || a[3] > 2048 || b[2] > 2048 || b[3] > 2048) return false;  // wrapping rectangles
+    return a[2] <= b[0] || b[2] <= a[0] || a[3] <= b[1] || b[3] <= a[1];
+}
+
+// The current staging buffer, mapped (waits only if the GPU has not finished with it since its last use).
+std::uint8_t *staging() {
+    Stage &s = g_stages[g_stage];
+    if (!s.ptr) {
+        while (!s.mapped) wgpuDevicePoll(g_device, true, nullptr);
+        s.ptr = static_cast<std::uint8_t *>(wgpuBufferGetMappedRange(s.buffer, 0, kStage));
+    }
+    return s.ptr;
+}
+
+void push_upload(const Upload &u, std::uint32_t rows) {
+    const std::uint32_t fmt = u.bp | (u.bw << 14) | (u.psm << 20), box[4] = {u.x, u.y, u.x + u.w, u.y + rows};
+    std::uint32_t bound = 0;
+    for_pages(u.bp, u.bw, u.psm, u.x, u.y, u.w, rows, [&](std::uint32_t p) {
+        const PageUse &s = g_pages[p];
+        if (s.read >= 0) bound = std::max(bound, static_cast<std::uint32_t>(s.read) + 1u);
+        if (s.write >= 0) bound = std::max(bound, static_cast<std::uint32_t>(s.write) + (s.fmt == fmt && disjoint(s.box, box) ? 0u : 1u));
+    });
+    Job j;
+    j.kind = J_UPLOAD;
+    j.threads = rows * u.w;
+    const std::uint32_t rec[8] = {u.bp, u.bw, u.psm, u.x, u.y, u.w, static_cast<std::uint32_t>(u.start / 4), bits_per_pixel(u.psm)};
+    std::memcpy(j.rec, rec, sizeof rec);
+    const std::uint32_t key = push_job(j, bound);
+    for_pages(u.bp, u.bw, u.psm, u.x, u.y, u.w, rows, [&](std::uint32_t p) {
+        PageUse &s = g_pages[p];
+        if (s.write < static_cast<std::int32_t>(key)) {
+            s.write = static_cast<std::int32_t>(key);
+            s.fmt = fmt;
+            std::memcpy(s.box, box, sizeof box);
         } else {
-            std::memcpy(mem + ((page + at) & (gs::kMemorySize - 1)), d + bit / 8, Bits / 8);
+            s.box[0] = std::min(s.box[0], box[0]), s.box[1] = std::min(s.box[1], box[1]), s.box[2] = std::max(s.box[2], box[2]), s.box[3] = std::max(s.box[3], box[3]);
         }
-    }
+    });
 }
 
-// PSMT4 rectangles aligned to 8 x 4: the byte holding pixel (x, y) also holds (x ^ 4, y ^ 2) (low nibble when y & 2
-// is 0), and from x % 32 == 0 the word holding (x, y) holds x, x + 8, x + 16, x + 24 in its bytes: whole bytes or words
-// instead of nibbles (T4 uploads were the slowest part of the upload copy).
-void write_t4(const Upload &u, std::uint8_t *mem, std::uint32_t per_row, std::uint32_t pws, std::uint32_t phs, std::uint32_t pw, std::uint32_t ph) {
-    const std::uint8_t *d = u.bytes.data();
-    const std::uint32_t w = u.w;
-    const auto byte = [&](std::uint32_t row, std::uint32_t col) {
-        const std::size_t i = static_cast<std::size_t>(row) * w + col, j = static_cast<std::size_t>(row + 2) * w + (col ^ 4u);
-        return ((d[i / 2] >> ((i & 1u) * 4)) & 15u) | (((d[j / 2] >> ((j & 1u) * 4)) & 15u) << 4);
-    };
-    for (std::uint32_t row = 0; row < u.h; ++row) {
-        const std::uint32_t y = (u.y + row) & 0x7FFu;
-        if (y & 2u) continue;
-        const std::uint32_t base = u.bp * 256u + (y >> phs) * per_row * 8192u;
-        const std::uint32_t *trow = swz::off4 + (y & (ph - 1)) * pw;
-        std::uint32_t col = 0;
-        for (; u.x % 32 == 0 && col + 32 <= w; col += 32)
-            for (std::uint32_t j = 0; j < 8; ++j) {
-                const std::uint32_t x = (u.x + col + j) & 0x7FFu;
-                const std::uint32_t at = base + (x >> pws) * 8192u + trow[x & (pw - 1)] / 2;
-                const std::uint32_t word = byte(row, col + j) | byte(row, col + j + 8) << 8 | byte(row, col + j + 16) << 16 | byte(row, col + j + 24) << 24;
-                std::memcpy(mem + (at & (gs::kMemorySize - 4)), &word, 4);
-            }
-        for (; col < w; ++col) {
-            const std::uint32_t x = (u.x + col) & 0x7FFu;
-            mem[(base + (x >> pws) * 8192u + trow[x & (pw - 1)] / 2) & (gs::kMemorySize - 1)] = static_cast<std::uint8_t>(byte(row, col));
-        }
+// Writes into each page, newest last: textures without D25 tags (written by uploads that do not cover whole
+// columns) are keyed by the upload that wrote all of them, so the key needs no CPU copy of GS memory.
+struct Written {
+    std::uint32_t id, fmt;  // fmt ~0: a target read back (content unknown)
+    std::uint32_t box[4];
+    std::uint64_t hash;     // of the upload's bytes; 0 when not hashed (whole-column uploads are tagged instead)
+};
+std::vector<Written> g_written[kPages];
+std::uint32_t g_written_id = 0;
+
+bool whole_columns(std::uint32_t psm, std::uint32_t x, std::uint32_t y, std::uint32_t w, std::uint32_t h) {
+    std::uint32_t cw = 0, ch = 2;
+    switch (psm) {
+    case gs::PSMCT32: case gs::PSMCT24: cw = 8; break;
+    case gs::PSMCT16: case gs::PSMCT16S: cw = 16; break;
+    case gs::PSMT8: cw = 16, ch = 4; break;
+    case gs::PSMT4: cw = 32, ch = 4; break;
+    default: return false;
     }
+    return x % cw == 0 && w % cw == 0 && y % ch == 0 && h % ch == 0;
 }
 
-// Writes a finished image transfer as gs.cpp's per-pixel transfer would.
-void write_upload(const Upload &u) {
-    using namespace swz;
-    std::uint8_t *mem = gs::memory();
-    const std::uint8_t *d = u.bytes.data();
-    std::uint32_t pw, ph;
-    page_size(u.psm, pw, ph);
-    const std::uint32_t per_row = std::max<std::uint32_t>(1, u.bw * 64 / pw), bits = bits_per_pixel(u.psm);
-    const std::uint32_t pws = static_cast<std::uint32_t>(std::countr_zero(pw)), phs = static_cast<std::uint32_t>(std::countr_zero(ph));
-    const std::uint32_t *table = nullptr;
-    switch (u.psm) {
-    case gs::PSMCT32: case gs::PSMCT24: table = off32; break;
-    case gs::PSMZ32: case gs::PSMZ24: table = offz32; break;
-    case gs::PSMCT16: table = off16; break;
-    case gs::PSMCT16S: table = off16s; break;
-    case gs::PSMZ16: table = offz16; break;
-    case gs::PSMZ16S: table = offz16s; break;
-    case gs::PSMT8: table = off8; break;
-    case gs::PSMT4: table = off4; break;
-    default: break;
-    }
-    const std::size_t row_bits = static_cast<std::size_t>(u.w) * bits;
-    const std::uint32_t rows = static_cast<std::uint32_t>(std::min<std::size_t>(u.h, u.bytes.size() * 8 / std::max<std::size_t>(row_bits, 1)));
-    if (u.psm == gs::PSMT4 && rows == u.h && u.x % 8 == 0 && u.w % 8 == 0 && u.y % 4 == 0 && u.h % 4 == 0) {
-        write_t4(u, mem, per_row, pws, phs, pw, ph);
-        return;
-    }
-    for (std::uint32_t row = 0; row < rows; ++row) {
-        const std::uint32_t y = (u.y + row) & 0x7FFu;
-        const std::size_t bit = row * row_bits;
-        if (!table) {
-            for (std::uint32_t col = 0; col < u.w; ++col) {
-                std::uint32_t v = 0;
-                const std::size_t b = bit + static_cast<std::size_t>(col) * bits;
-                if (bits == 4) v = (d[b / 8] >> (b & 4)) & 15u;
-                else std::memcpy(&v, d + b / 8, bits / 8);
-                gs::write_pixel(u.psm, u.bp, u.bw, (u.x + col) & 0x7FFu, y, v);
-            }
-            continue;
-        }
-        const std::uint32_t base = u.bp * 256u + (y >> phs) * per_row * 8192u;
-        const std::uint32_t *trow = table + (y & (ph - 1)) * pw;
-        switch (bits) {
-        case 32: write_row<32>(mem, d, bit, trow, base, u.x, u.w, pws); break;
-        case 24: write_row<24>(mem, d, bit, trow, base, u.x, u.w, pws); break;
-        case 16: write_row<16>(mem, d, bit, trow, base, u.x, u.w, pws); break;
-        case 8: write_row<8>(mem, d, bit, trow, base, u.x, u.w, pws); break;
-        default: write_row<4>(mem, d, bit, trow, base, u.x, u.w, pws); break;
-        }
-    }
+void note_written(std::uint32_t bp, std::uint32_t bw, std::uint32_t psm, std::uint32_t fmt, const std::uint32_t *box, std::uint64_t hash) {
+    const Written e{++g_written_id, fmt, {box[0], box[1], box[2], box[3]}, hash};
+    for_pages(bp, bw, psm, box[0], box[1], box[2] - box[0], box[3] - box[1], [&](std::uint32_t p) {
+        std::vector<Written> &v = g_written[p];
+        std::erase_if(v, [&](const Written &o) { return o.fmt == fmt && fmt != ~0u && o.box[0] >= box[0] && o.box[1] >= box[1] && o.box[2] <= box[2] && o.box[3] <= box[3]; });
+        if (v.size() >= 64) v.erase(v.begin());  // older writes only matter when no newer one covers a texture
+        v.push_back(e);
+    });
+}
+
+// A texture level's key from the newest upload that covers all of it when nothing written later touches it;
+// else the generations of its pages (a GPU decode after each upload to them).
+std::uint64_t written_key(std::uint32_t bp, std::uint32_t bw, std::uint32_t psm, std::uint32_t w, std::uint32_t h) {
+    const std::uint32_t fmt = bp | (bw << 14) | (psm << 20), box[4] = {0, 0, w, h};
+    const Written *found = nullptr;
+    bool ok = true;
+    for_pages(bp, bw, psm, 0, 0, w, h, [&](std::uint32_t p) {
+        const std::vector<Written> &v = g_written[p];
+        auto it = v.rbegin();
+        while (it != v.rend() && it->fmt == fmt && disjoint(it->box, box)) ++it;
+        const bool covers = it != v.rend() && it->fmt == fmt && it->hash && it->box[0] == 0 && it->box[1] == 0 && it->box[2] >= w && it->box[3] >= h;
+        if (!covers || (found && found->id != it->id)) ok = false;
+        else found = &*it;
+    });
+    if (ok && found) return mix(mix(found->hash, found->box[2] | (static_cast<std::uint64_t>(found->box[3]) << 32)), 0x77726974ull);
+    std::uint64_t key = 0;
+    for_pages(bp, bw, psm, 0, 0, w, h, [&](std::uint32_t p) { key = mix(key, (static_cast<std::uint64_t>(g_page_gen[p]) << 32) | p); });
+    return key;
 }
 
 struct ClutLoad {
@@ -506,8 +541,10 @@ struct ClutLoad {
     std::uint32_t upload = 0;
 } g_last_clut;
 
+void submit_ops();
+
 // gs.cpp's CLUT load (CSM1 and CSM0), skipped when it repeats the last one with no upload since.
-void read_clut(std::uint64_t tex0, std::uint64_t texclut) {
+void push_clut(std::uint64_t tex0, std::uint64_t texclut) {
     const std::uint64_t fields = tex0 & 0x1FFFFFE000000000ull, tc = texclut & 0x3FFFFFu;
     const std::uint32_t psm = static_cast<std::uint32_t>(tex0 >> 20) & 0x3Fu;
     if (g_last_clut.tex0 == (fields | psm) && g_last_clut.texclut == tc && g_last_clut.upload == g_upload_serial) return;
@@ -517,23 +554,143 @@ void read_clut(std::uint64_t tex0, std::uint64_t texclut) {
     const bool eight = psm == gs::PSMT8 || psm == gs::PSMT8H;
     const std::uint32_t entries = eight ? 256u : 16u, cbw = static_cast<std::uint32_t>(tc) & 0x3Fu;
     const std::uint32_t cou = (static_cast<std::uint32_t>(tc) >> 6) & 0x3Fu, cov = (static_cast<std::uint32_t>(tc) >> 12) & 0x3FFu;
-    std::uint32_t *clut = gs::g_state.clut;
-    bool changed = false;
-    for (std::uint32_t i = 0; i < entries; ++i) {
-        std::uint32_t x, y, slot;
-        if (csm) {
-            x = cou * 16 + i, y = cov, slot = (csa * 16 + i) & 511u;
-        } else if (eight) {
-            const std::uint32_t j = (i & ~0x18u) | ((i & 0x08u) << 1) | ((i & 0x10u) >> 1);
-            x = j & 15u, y = j >> 4, slot = i;
-        } else {
-            x = i & 7u, y = i >> 3, slot = ((csa & 15u) * 16u + i) & 255u;
+    const std::uint32_t bw = csm ? cbw : 1u, x = csm ? cou * 16u : 0u, y = csm ? cov : 0u;
+    const std::uint32_t w = csm ? entries : eight ? 16u : 8u, h = csm ? 1u : eight ? 16u : 2u;
+    const std::uint32_t bound = std::max({read_bound(cbp, bw, cpsm, x, y, w, h), static_cast<std::uint32_t>(std::max(g_clut_key, 0)), g_clut_floor});
+    Job j;
+    j.kind = J_CLUT;
+    const std::uint32_t rec[8] = {cbp, cpsm, csm, csa, eight ? 1u : 0u, cbw, cou, cov};
+    std::memcpy(j.rec, rec, sizeof rec);
+    const std::uint32_t key = push_job(j, bound);
+    mark_read(cbp, bw, cpsm, x, y, w, h, key);
+    g_clut_key = static_cast<std::int32_t>(key);
+    ++g_clut_version;
+    std::uint64_t source = mix(fields | psm, tc);
+    for_pages(cbp, bw, cpsm, x, y, w, h, [&](std::uint32_t p) { source = mix(source, g_page_gen[p]); });
+    const std::uint32_t first = csm ? csa : eight ? 0u : csa & 15u;
+    for (std::uint32_t g = 0; g < entries / 16; ++g) g_clut_ids[(first + g) & 31u] = mix(source, g);
+}
+
+// Content of the CLUT entries a texture reads (T8: all 256, T4: the 16 at CSA).
+std::uint64_t palette_id(std::uint32_t psm, std::uint32_t csa) {
+    const bool eight = psm == gs::PSMT8 || psm == gs::PSMT8H;
+    std::uint64_t h = 0;
+    for (std::uint32_t g = eight ? 0u : csa & 15u, end = eight ? 16u : (csa & 15u) + 1u; g < end; ++g) h = mix(h, g_clut_ids[g]);
+    return h;
+}
+
+void push_decode(WGPUTexture tex, std::uint32_t level, const TexFormat &f, std::uint32_t bp, std::uint32_t bw, std::uint32_t w, std::uint32_t h) {
+    WGPUTextureViewDescriptor vd = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+    vd.baseMipLevel = level;
+    vd.mipLevelCount = 1;
+    WGPUTextureView v = wgpuTextureCreateView(tex, &vd);
+    WGPUBindGroupEntry e = WGPU_BIND_GROUP_ENTRY_INIT;
+    e.binding = 10;
+    e.textureView = v;
+    WGPUBindGroupDescriptor d = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+    d.layout = g_out_layout;
+    d.entryCount = 1;
+    d.entries = &e;
+    Job j;
+    j.kind = J_DECODE;
+    j.threads = w * h;
+    j.out = wgpuDeviceCreateBindGroup(g_device, &d);
+    wgpuTextureViewRelease(v);
+    g_dead_groups.push_back(j.out);
+    const std::uint32_t rec[11] = {f.psm, bp, bw, static_cast<std::uint32_t>(std::countr_zero(w)), j.threads, f.cpsm, f.csa, 0, f.ta0, f.ta1, f.aem ? 1u : 0u};
+    std::memcpy(j.rec, rec, sizeof rec);
+    const bool paletted = bits_per_pixel(f.psm) <= 8;
+    std::uint32_t bound = read_bound(bp, bw, f.psm, 0, 0, w, h);
+    if (paletted && g_clut_key >= 0) bound = std::max(bound, static_cast<std::uint32_t>(g_clut_key) + 1u);
+    const std::uint32_t key = push_job(j, bound);
+    mark_read(bp, bw, f.psm, 0, 0, w, h, key);
+    if (paletted) g_clut_floor = std::max(g_clut_floor, key + 1u);
+}
+
+void dispatch(WGPUComputePipeline pipeline, WGPUBindGroup out, std::uint32_t groups, const std::uint32_t *params, std::size_t n) {
+    Dispatch d;
+    d.pipeline = pipeline;
+    d.out = out;
+    d.offset = static_cast<std::uint32_t>(g_job_params.size() * 4);
+    d.x = std::min(groups, 1024u);
+    d.y = (groups + 1023) / 1024;
+    g_job_params.resize(g_job_params.size() + 64, 0);  // 256-byte steps (dynamic offsets)
+    std::memcpy(g_job_params.data() + d.offset / 4, params, n * 4);
+    g_dispatches.push_back(d);
+}
+
+// Sorts each compute op's jobs by key; jobs of one key share a dispatch (decodes: one each, own output).
+// Records go after the arena (base, in words) in the data buffer.
+void prepare_jobs(std::uint32_t base) {
+    g_records.clear();
+    g_job_params.clear();
+    g_dispatches.clear();
+    for (Op &op : g_ops) {
+        if (op.kind != OpKind::compute) continue;
+        const auto first = g_jobs.begin() + op.first, last = first + op.count;
+        std::stable_sort(first, last, [](const Job &a, const Job &b) { return a.key < b.key; });
+        op.param = static_cast<std::uint32_t>(g_dispatches.size());
+        for (auto it = first; it != last;) {
+            auto end = it;
+            while (end != last && end->key == it->key) ++end;
+            if (it->kind == J_DECODE) {
+                for (; it != end; ++it) {
+                    const std::uint32_t p[12] = {it->rec[0], it->rec[1], it->rec[2], it->rec[3], it->rec[4], it->rec[5], it->rec[6], it->rec[7], it->rec[8], it->rec[9], it->rec[10], 0};
+                    dispatch(g_decode_pipeline, it->out, (it->threads + 63) / 64, p, 12);
+                }
+                continue;
+            }
+            const bool upload = it->kind == J_UPLOAD;
+            const std::uint32_t at = base + static_cast<std::uint32_t>(g_records.size());
+            std::uint32_t n = 0, threads = 0;
+            for (; it != end; ++it, ++n) {
+                if (upload) {
+                    g_records.insert(g_records.end(), it->rec, it->rec + 8);
+                    g_records.push_back(threads);
+                    threads += it->threads;
+                } else {
+                    g_records.insert(g_records.end(), it->rec, it->rec + 8);
+                }
+            }
+            const std::uint32_t p[3] = {at, n, threads};
+            if (!upload) dispatch(g_clut_pipeline, nullptr, 1, p, 3);
+            else if (threads) dispatch(g_upload_pipeline, nullptr, (threads + 63) / 64, p, 3);
         }
-        const std::uint32_t c = gs::read_pixel(cpsm == 0 ? gs::PSMCT32 : cpsm, cbp, csm ? cbw : 1u, x, y);
-        changed = changed || clut[slot] != c;
-        clut[slot] = c;
+        op.width = static_cast<std::uint32_t>(g_dispatches.size()) - op.param;
     }
-    if (changed) ++g_clut_version;
+}
+
+void ensure_job_buffers(std::uint64_t data_bytes, std::uint64_t job_bytes) {
+    bool changed = !g_job_group;
+    if (data_bytes > g_data_capacity) {
+        if (g_data) wgpuBufferRelease(g_data);
+        g_data_capacity = std::max<std::uint64_t>(data_bytes * 2, 8u << 20);
+        g_data = make_buffer(g_data_capacity, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+        changed = true;
+    }
+    if (job_bytes > g_job_capacity) {
+        if (g_job_buffer) wgpuBufferRelease(g_job_buffer);
+        g_job_capacity = std::max<std::uint64_t>(job_bytes * 2, 64u << 10);
+        g_job_buffer = make_buffer(g_job_capacity, WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst);
+        changed = true;
+    }
+    if (!changed) return;
+    if (g_job_group) wgpuBindGroupRelease(g_job_group);
+    WGPUBindGroupEntry e[3] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+    e[0].binding = 5;
+    e[0].buffer = g_job_buffer;
+    e[0].size = 48;
+    e[1].binding = 6;
+    e[1].buffer = g_data;
+    e[1].size = WGPU_WHOLE_SIZE;
+    e[2].binding = 7;
+    e[2].buffer = g_cluts;
+    e[2].size = WGPU_WHOLE_SIZE;
+    WGPUBindGroupDescriptor d = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+    d.layout = g_job_layout;
+    d.entryCount = 3;
+    d.entries = e;
+    g_job_group = wgpuDeviceCreateBindGroup(g_device, &d);
 }
 
 // ---- Render targets ----
@@ -591,41 +748,24 @@ void drop_group(WGPUBindGroup &g) {
 
 void end_pass() { g_pass_target = nullptr, g_pass_depth = nullptr; }
 
-// GS memory's content drawn into rows [from_row, to_row) of a target (new targets, state loads, uploads).
+// GS memory's content drawn into rows [from_row, to_row) of a target (new targets, state loads, uploads). It reads GS
+// memory in a render pass, so the jobs before it run before it and the jobs after it in the next segment.
 void fill_target(Target &t, std::uint32_t from_row, std::uint32_t to_row) {
-    const std::uint32_t w = t.width, h = t.height;
-    std::vector<std::uint32_t> rgba(static_cast<std::size_t>(w) * h);
-    for (std::uint32_t y = from_row; y < to_row; ++y)
-        for (std::uint32_t x = 0; x < w; ++x) {
-            std::uint32_t c = gs::read_pixel(t.psm, t.fbp * 32u, t.fbw, x, y);
-            if (t.sixteen()) c = expand16(c, 0, 0x80, false);
-            else if (bits_per_pixel(t.psm) == 24) c |= 0x80000000u;
-            rgba[static_cast<std::size_t>(y) * w + x] = c;
-        }
-    WGPUTexture staging = make_texture(w, h, WGPUTextureFormat_RGBA8Unorm, WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst);
-    write_texture(staging, 0, w, h, rgba.data());
-    WGPUTextureView staging_view = make_view(staging);
-    WGPUBindGroupEntry e = WGPU_BIND_GROUP_ENTRY_INIT;
-    e.binding = 0;
-    e.textureView = staging_view;
-    WGPUBindGroupLayout layout = wgpuRenderPipelineGetBindGroupLayout(g_init_pipeline, 0);
-    WGPUBindGroupDescriptor d = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
-    d.layout = layout;
-    d.entryCount = 1;
-    d.entries = &e;
+    Params q{};
+    q.flags = t.psm;
+    q.fbmsk = t.fbp * 32u;
+    q.blend = t.fbw;
+    g_params.push_back(q);
     Op op{OpKind::init};
-    op.group = wgpuDeviceCreateBindGroup(g_device, &d);
-    wgpuBindGroupLayoutRelease(layout);
+    op.param = static_cast<std::uint32_t>(g_params.size() - 1);
     op.color = t.view;
     op.scissor[1] = from_row * g_scale;
     op.scissor[3] = to_row * g_scale;
-    op.width = w * g_scale;
+    op.width = t.width * g_scale;
     op.height = t.height * g_scale;
     g_ops.push_back(op);
-    g_dead_groups.push_back(op.group);
-    g_dead_views.push_back(staging_view);
-    g_dead_textures.push_back(staging);
     end_pass();
+    end_segment();
 }
 
 // ---- Format reinterpretation: 16-bit views of 32-bit targets ----
@@ -780,10 +920,13 @@ WGPUBindGroup dest_group(Target &t) {
     return t.dest_group;
 }
 
-// Writes a target's pixels into the CPU copy of GS memory (downloads, uploads into its memory).
+// Writes a target's pixels into GS memory (downloads, uploads into its memory): packed as GS pixels, copied into the
+// data buffer and written by the upload shader as one transfer of 32-bit values. Submitted at once, no GPU wait.
 void read_back(Target &t) {
     resolve(t);
     submit_ops();
+    const std::uint32_t pixels = t.width * t.height;
+    ensure_job_buffers(pixels * 4ull + 64, 256);
     WGPUTexture packed = make_texture(t.width, t.height, WGPUTextureFormat_R32Uint, WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc);
     WGPUTextureView packed_view = make_view(packed);
     const WGPURenderPipeline pipe = t.sixteen() ? g_pack16_pipeline : g_pack32_pipeline;
@@ -811,12 +954,29 @@ void read_back(Target &t) {
     wgpuRenderPassEncoderDraw(p, 3, 1, 0, 0);
     wgpuRenderPassEncoderEnd(p);
     wgpuRenderPassEncoderRelease(p);
+    WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+    src.texture = packed;
+    WGPUTexelCopyBufferInfo dst = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
+    dst.buffer = g_data;
+    dst.layout.bytesPerRow = t.width * 4;  // fbw * 256
+    dst.layout.rowsPerImage = t.height;
+    const WGPUExtent3D size{t.width, t.height, 1};
+    wgpuCommandEncoderCopyTextureToBuffer(enc, &src, &dst, &size);
+    const std::uint32_t rec[9] = {t.fbp * 32u, t.fbw, t.psm, 0, 0, t.width, 0, 32, 0}, params[3] = {pixels, 1, pixels};
+    wgpuQueueWriteBuffer(g_queue, g_data, pixels * 4ull, rec, sizeof rec);
+    wgpuQueueWriteBuffer(g_queue, g_job_buffer, 0, params, sizeof params);
+    WGPUComputePassEncoder cp = wgpuCommandEncoderBeginComputePass(enc, nullptr);
+    wgpuComputePassEncoderSetPipeline(cp, g_upload_pipeline);
+    const std::uint32_t offset = 0, groups = (pixels + 63) / 64;
+    wgpuComputePassEncoderSetBindGroup(cp, 0, g_job_group, 1, &offset);
+    wgpuComputePassEncoderSetBindGroup(cp, 1, g_mem_group, 0, nullptr);
+    wgpuComputePassEncoderDispatchWorkgroups(cp, std::min(groups, 1024u), (groups + 1023) / 1024, 1);
+    wgpuComputePassEncoderEnd(cp);
+    wgpuComputePassEncoderRelease(cp);
     submit_commands(enc);
-    std::vector<std::uint32_t> pixels;
-    read_pixels(packed, t.width, t.height, pixels);
-    for (std::uint32_t y = 0; y < t.height; ++y)
-        for (std::uint32_t x = 0; x < t.width; ++x) gs::write_pixel(t.psm, t.fbp * 32u, t.fbw, x, y, pixels[static_cast<std::size_t>(y) * t.width + x]);
     for_pages(t.fbp * 32u, t.fbw, t.psm, 0, 0, t.width, t.height, [](std::uint32_t pg) { ++g_page_gen[pg]; });
+    const std::uint32_t box[4] = {0, 0, t.width, t.height};
+    note_written(t.fbp * 32u, t.fbw, t.psm, ~0u, box, 0);
     wgpuBindGroupRelease(group);
     wgpuTextureViewRelease(packed_view);
     wgpuTextureRelease(packed);
@@ -836,8 +996,7 @@ Depth &depth_for(std::uint32_t zbp, const Target &t) {
 
 struct Memo {
     std::uint64_t fields[4] = {};
-    std::uint32_t clut = 0;
-    std::uint64_t pages = 0, key = 0;
+    std::uint64_t clut = 0, pages = 0, key = 0;
     bool valid = false;
 } g_memo[64];
 
@@ -865,7 +1024,7 @@ Texture &add_texture(std::uint64_t key, std::uint32_t w, std::uint32_t h, std::u
         }
     }
     Texture &t = g_textures[key];
-    t.tex = make_texture(w, h, WGPUTextureFormat_RGBA8Unorm, WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst, levels);
+    t.tex = make_texture(w, h, WGPUTextureFormat_RGBA8Unorm, WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst | WGPUTextureUsage_StorageBinding, levels);
     t.view = make_view(t.tex);
     t.used = ++g_texture_clock;
     return t;
@@ -954,15 +1113,16 @@ bool texture_source(const State &st, const gs::Context &c, const Target *drawing
         const std::uint32_t bp = level_bp(c, l, bw);
         for_pages(bp, bw, psm, 0, 0, std::max(1u, (1u << tw) >> l), std::max(1u, (1u << th) >> l), [&](std::uint32_t p) { pages = mix(pages, g_page_gen[p]); });
     }
-    const bool memo_ok = m.valid && m.pages == pages && (!paletted || m.clut == g_clut_version) && std::memcmp(m.fields, fields, sizeof fields) == 0;
-    std::uint64_t key = m.key;
     const TexFormat fmt{psm, static_cast<std::uint32_t>(c.tex0 >> 51) & 0xFu, static_cast<std::uint32_t>(c.tex0 >> 56) & 0x1Fu,
                         static_cast<std::uint32_t>(st.texa) & 0xFFu, static_cast<std::uint32_t>(st.texa >> 32) & 0xFFu, ((st.texa >> 15) & 1u) != 0};
+    const std::uint64_t palette = paletted ? palette_id(psm, fmt.csa) : 0;
+    const bool memo_ok = m.valid && m.pages == pages && m.clut == palette && std::memcmp(m.fields, fields, sizeof fields) == 0;
+    std::uint64_t key = m.key;
     if (!memo_ok) {
         key = 0;
         std::uint32_t w[25];
+        pack_setup(st, c, w);
         if (g_packs && !target_under(lo, lo + 1)) {
-            pack_setup(st, c, w);
             if (texpack::replaceable(w)) {
                 const std::uint64_t pk = texpack::combine(texpack::texel_key(w), texpack::palette_key(w));
                 if (pk) {
@@ -995,29 +1155,27 @@ bool texture_source(const State &st, const gs::Context &c, const Target *drawing
                     content = texpack::texel_key(lw);
                 }
                 if (content) key = mix(key, content);
-                else for_pages(bp, bw, psm, 0, 0, std::max(1u, (1u << tw) >> l), std::max(1u, (1u << th) >> l), [&](std::uint32_t p) { key = mix(key, page_hash(p)); });
+                else key = mix(key, written_key(bp, bw, psm, std::max(1u, (1u << tw) >> l), std::max(1u, (1u << th) >> l)));
             }
             if (paletted) {
-                const std::uint32_t first = psm == gs::PSMT8 || psm == gs::PSMT8H ? 0u : (fmt.csa & 15u) * 16u, count = first ? 16u : (psm == gs::PSMT8 || psm == gs::PSMT8H ? 256u : 16u);
-                for (std::uint32_t i = 0; i < count; ++i) key = mix(key, gs::g_state.clut[(first + i) & 511u]);
+                const std::uint64_t tags = psm == gs::PSMT8 || psm == gs::PSMT4 ? texpack::palette_key(w) : 0;  // D25 CLUT tags
+                key = mix(key, tags ? tags : palette);
             }
             if (!texture_entry(key)) {
                 const Timer timer(T_DECODE);
+                count(C_DECODE);
                 Texture &t = add_texture(key, 1u << tw, 1u << th, levels);
-                std::vector<std::uint32_t> texels;
                 for (std::uint32_t l = 0; l < levels; ++l) {
                     std::uint32_t bw;
                     const std::uint32_t bp = level_bp(c, l, bw);
-                    const std::uint32_t lw = std::max(1u, (1u << tw) >> l), lh = std::max(1u, (1u << th) >> l);
-                    decode(fmt, bp, bw, lw, lh, texels);
-                    write_texture(t.tex, l, lw, lh, texels.data());
+                    push_decode(t.tex, l, fmt, bp, bw, std::max(1u, (1u << tw) >> l), std::max(1u, (1u << th) >> l));
                 }
                 ++g_decoded;
             }
         }
         std::memcpy(m.fields, fields, sizeof fields);
         m.pages = pages;
-        m.clut = g_clut_version;
+        m.clut = palette;
         m.key = key;
         m.valid = true;
     }
@@ -1158,7 +1316,7 @@ WGPURenderPipeline full_pipeline(const char *entry, WGPUTextureFormat format) {
     return wgpuDeviceCreateRenderPipeline(g_device, &d);
 }
 
-WGPURenderPipeline convert_pipeline(const char *entry) {
+WGPURenderPipeline convert_pipeline(const char *entry, WGPUPipelineLayout layout) {
     WGPUColorTargetState color = WGPU_COLOR_TARGET_STATE_INIT;
     color.format = kColor;
     WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
@@ -1172,11 +1330,19 @@ WGPURenderPipeline convert_pipeline(const char *entry) {
     fragment.constantCount = 1;
     fragment.constants = &constant;
     WGPURenderPipelineDescriptor d = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
-    d.layout = g_convert_pipeline_layout;
+    d.layout = layout;
     d.vertex.module = g_module;
     d.vertex.entryPoint = view("vs_convert");
     d.fragment = &fragment;
     return wgpuDeviceCreateRenderPipeline(g_device, &d);
+}
+
+WGPUComputePipeline compute_pipeline(const char *entry, WGPUPipelineLayout layout) {
+    WGPUComputePipelineDescriptor d = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
+    d.layout = layout;
+    d.compute.module = g_module;
+    d.compute.entryPoint = view(entry);
+    return wgpuDeviceCreateComputePipeline(g_device, &d);
 }
 
 // ---- Draw state ----
@@ -1433,7 +1599,20 @@ void submit_ops() {
     }
     if (!g_vertices.empty()) wgpuQueueWriteBuffer(g_queue, g_vertex_buffer, 0, g_vertices.data(), g_vertices.size() * sizeof(NVertex));
     if (!g_params.empty()) wgpuQueueWriteBuffer(g_queue, g_param_buffer, 0, g_params.data(), g_params.size() * sizeof(Params));
+    // Upload bytes (copied from the staging buffer by the GPU), then the jobs' records.
+    const std::uint64_t staged = (g_staged + 3) & ~3ull;
+    prepare_jobs(static_cast<std::uint32_t>(staged / 4));
+    ensure_job_buffers(staged + g_records.size() * 4 + 4, g_job_params.size() * 4 + 256);
+    if (!g_records.empty()) wgpuQueueWriteBuffer(g_queue, g_data, staged, g_records.data(), g_records.size() * 4);
+    if (!g_job_params.empty()) wgpuQueueWriteBuffer(g_queue, g_job_buffer, 0, g_job_params.data(), g_job_params.size() * 4);
     WGPUCommandEncoder enc = encoder();
+    Stage &stage = g_stages[g_stage];
+    if (staged) {
+        wgpuBufferUnmap(stage.buffer);
+        stage.ptr = nullptr;
+        stage.mapped = false;
+        wgpuCommandEncoderCopyBufferToBuffer(enc, stage.buffer, 0, g_data, 0, staged);
+    }
     WGPURenderPassEncoder pass = nullptr;
     WGPURenderPipeline bound_pipeline = nullptr;
     WGPUBindGroup bound_group = nullptr, bound_dest = nullptr;
@@ -1512,9 +1691,10 @@ void submit_ops() {
             pd.colorAttachments = &ca;
             WGPURenderPassEncoder p = wgpuCommandEncoderBeginRenderPass(enc, &pd);
             wgpuRenderPassEncoderSetScissorRect(p, 0, op.scissor[1], op.width, op.scissor[3] - op.scissor[1]);
-            wgpuRenderPassEncoderSetPipeline(p, g_init_pipeline);
-            wgpuRenderPassEncoderSetBindGroup(p, 0, op.group, 0, nullptr);
-            wgpuRenderPassEncoderDraw(p, 3, 1, 0, 0);
+            wgpuRenderPassEncoderSetPipeline(p, g_fill_pipeline);
+            wgpuRenderPassEncoderSetBindGroup(p, 0, g_param_group, 0, nullptr);
+            wgpuRenderPassEncoderSetBindGroup(p, 1, g_mem_group, 0, nullptr);
+            wgpuRenderPassEncoderDraw(p, 3, 1, 0, op.param);
             wgpuRenderPassEncoderEnd(p);
             wgpuRenderPassEncoderRelease(p);
             break;
@@ -1538,6 +1718,25 @@ void submit_ops() {
             wgpuRenderPassEncoderRelease(p);
             break;
         }
+        case OpKind::compute: {
+            close();
+            WGPUComputePassEncoder cp = wgpuCommandEncoderBeginComputePass(enc, nullptr);
+            WGPUComputePipeline bound = nullptr;
+            for (std::uint32_t i = op.param; i < op.param + op.width; ++i) {
+                const Dispatch &d = g_dispatches[i];
+                if (bound != d.pipeline) {
+                    wgpuComputePassEncoderSetPipeline(cp, bound = d.pipeline);
+                    wgpuComputePassEncoderSetBindGroup(cp, 1, g_mem_group, 0, nullptr);
+                }
+                wgpuComputePassEncoderSetBindGroup(cp, 0, g_job_group, 1, &d.offset);
+                if (d.out) wgpuComputePassEncoderSetBindGroup(cp, 2, d.out, 0, nullptr);
+                wgpuComputePassEncoderDispatchWorkgroups(cp, d.x, d.y, 1);
+                count(C_DISPATCH);
+            }
+            wgpuComputePassEncoderEnd(cp);
+            wgpuComputePassEncoderRelease(cp);
+            break;
+        }
         }
     }
     close();
@@ -1551,7 +1750,23 @@ void submit_ops() {
     g_ops.clear();
     g_vertices.clear();
     g_params.clear();
+    g_jobs.clear();
+    if (staged) {
+        WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
+        cb.mode = WGPUCallbackMode_AllowProcessEvents;
+        cb.callback = [](WGPUMapAsyncStatus, WGPUStringView, void *s, void *) { static_cast<Stage *>(s)->mapped = true; };
+        cb.userdata1 = &stage;
+        wgpuBufferMapAsync(stage.buffer, WGPUMapMode_Write, 0, kStage, cb);
+        g_stage = (g_stage + 1) % 4;
+        g_staged = 0;
+        if (g_upload.active) {
+            g_upload.start = 0;
+            std::memcpy(staging(), g_pieces.data(), g_pieces.size());
+            g_staged = g_pieces.size();
+        }
+    }
     end_pass();
+    end_segment();
     g_cur.valid = false;
 }
 
@@ -1675,24 +1890,18 @@ void pump() {
 #endif
 }
 
-// A 4-byte-per-texel texture read back to the CPU (waits for the GPU).
-void read_pixels(WGPUTexture tex, std::uint32_t width, std::uint32_t height, std::vector<std::uint32_t> &rgba) {
-    const std::uint32_t row = (width * 4 + 255) & ~255u;
-    const std::uint64_t bytes = static_cast<std::uint64_t>(row) * height;
+// The readback buffer with at least bytes, and an encoder that copies into it.
+WGPUCommandEncoder readback_encoder(std::uint64_t bytes) {
     if (bytes > g_readback_size) {
         if (g_readback) wgpuBufferRelease(g_readback);
         g_readback = make_buffer(bytes, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
         g_readback_size = bytes;
     }
-    WGPUCommandEncoder enc = encoder();
-    WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
-    src.texture = tex;
-    WGPUTexelCopyBufferInfo dst = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
-    dst.buffer = g_readback;
-    dst.layout.bytesPerRow = row;
-    dst.layout.rowsPerImage = height;
-    const WGPUExtent3D size{width, height, 1};
-    wgpuCommandEncoderCopyTextureToBuffer(enc, &src, &dst, &size);
+    return encoder();
+}
+
+// Submits enc and maps the readback buffer (waits for the GPU).
+const std::uint8_t *map_readback(WGPUCommandEncoder enc, std::uint64_t bytes) {
     submit_commands(enc);
     bool mapped = false;
     WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
@@ -1701,10 +1910,34 @@ void read_pixels(WGPUTexture tex, std::uint32_t width, std::uint32_t height, std
     cb.userdata1 = &mapped;
     wgpuBufferMapAsync(g_readback, WGPUMapMode_Read, 0, bytes, cb);
     while (!mapped) pump();
-    const auto *p = static_cast<const std::uint8_t *>(wgpuBufferGetConstMappedRange(g_readback, 0, bytes));
+    return static_cast<const std::uint8_t *>(wgpuBufferGetConstMappedRange(g_readback, 0, bytes));
+}
+
+// A 4-byte-per-texel texture read back to the CPU (waits for the GPU).
+void read_pixels(WGPUTexture tex, std::uint32_t width, std::uint32_t height, std::vector<std::uint32_t> &rgba) {
+    const std::uint32_t row = (width * 4 + 255) & ~255u;
+    const std::uint64_t bytes = static_cast<std::uint64_t>(row) * height;
+    WGPUCommandEncoder enc = readback_encoder(bytes);
+    WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+    src.texture = tex;
+    WGPUTexelCopyBufferInfo dst = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
+    dst.buffer = g_readback;
+    dst.layout.bytesPerRow = row;
+    dst.layout.rowsPerImage = height;
+    const WGPUExtent3D size{width, height, 1};
+    wgpuCommandEncoderCopyTextureToBuffer(enc, &src, &dst, &size);
+    const std::uint8_t *p = map_readback(enc, bytes);
     rgba.resize(static_cast<std::size_t>(width) * height);
     if (p)
         for (std::uint32_t y = 0; y < height; ++y) std::memcpy(rgba.data() + static_cast<std::size_t>(y) * width, p + static_cast<std::size_t>(y) * row, width * 4);
+    wgpuBufferUnmap(g_readback);
+}
+
+// GPU buffer bytes into CPU memory (waits for the GPU).
+void read_buffer(WGPUBuffer src, std::uint64_t offset, std::uint64_t bytes, void *out) {
+    WGPUCommandEncoder enc = readback_encoder(bytes);
+    wgpuCommandEncoderCopyBufferToBuffer(enc, src, offset, g_readback, 0, bytes);
+    if (const std::uint8_t *p = map_readback(enc, bytes)) std::memcpy(out, p, bytes);
     wgpuBufferUnmap(g_readback);
 }
 
@@ -1746,9 +1979,9 @@ void time_present() {
     if (++g_timed_presents % 600) return;
     const double n = 600.0;
     std::fprintf(stderr, "[native] ms per present: rebuild %.2f, decode %.2f, upload %.2f (tags %.2f), submit %.2f, present %.2f (acquire %.2f); "
-                 "per present: rebuilds %.0f, uploads %.0f, passes %.0f, draws %.0f, copies %.0f, submits %.0f; GPU %.2f ms\n",
+                 "per present: rebuilds %.0f, uploads %.0f, decodes %.1f, dispatches %.0f, passes %.0f, draws %.0f, copies %.0f, submits %.0f; GPU %.2f ms\n",
                  g_time_ms[T_REBUILD] / n, g_time_ms[T_DECODE] / n, g_time_ms[T_UPLOAD] / n, g_time_ms[T_TAG] / n, g_time_ms[T_SUBMIT] / n, g_time_ms[T_PRESENT] / n,
-                 g_time_ms[T_ACQUIRE] / n, g_counts[C_REBUILD] / n, g_counts[C_UPLOAD] / n, g_counts[C_PASS] / n, g_counts[C_DRAW] / n, g_counts[C_COPY] / n,
+                 g_time_ms[T_ACQUIRE] / n, g_counts[C_REBUILD] / n, g_counts[C_UPLOAD] / n, g_counts[C_DECODE] / n, g_counts[C_DISPATCH] / n, g_counts[C_PASS] / n, g_counts[C_DRAW] / n, g_counts[C_COPY] / n,
                  g_counts[C_SUBMIT] / n, g_gpu_frames ? g_gpu_ms / static_cast<double>(g_gpu_frames) : 0.0);
     std::memset(g_time_ms, 0, sizeof g_time_ms);
     std::memset(g_counts, 0, sizeof g_counts);
@@ -1877,6 +2110,44 @@ bool init() {
     pld.bindGroupLayoutCount = 2;
     pld.bindGroupLayouts = convert_layouts;
     g_convert_pipeline_layout = wgpuDeviceCreatePipelineLayout(g_device, &pld);
+    WGPUBindGroupLayoutEntry je[3] = {WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT};
+    const WGPUBufferBindingType job_types[3] = {WGPUBufferBindingType_Uniform, WGPUBufferBindingType_ReadOnlyStorage, WGPUBufferBindingType_Storage};
+    for (std::uint32_t i = 0; i < 3; ++i) {
+        je[i].binding = 5 + i;
+        je[i].visibility = WGPUShaderStage_Compute;
+        je[i].buffer.type = job_types[i];
+    }
+    je[0].buffer.hasDynamicOffset = true;
+    je[0].buffer.minBindingSize = 48;
+    ld.entryCount = 3;
+    ld.entries = je;
+    g_job_layout = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
+    WGPUBindGroupLayoutEntry me[2] = {WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT};
+    for (std::uint32_t i = 0; i < 2; ++i) {
+        me[i].binding = 8 + i;
+        me[i].visibility = WGPUShaderStage_Compute | WGPUShaderStage_Fragment;
+        me[i].buffer.type = i ? WGPUBufferBindingType_ReadOnlyStorage : WGPUBufferBindingType_Storage;
+    }
+    ld.entryCount = 2;
+    ld.entries = me;
+    g_mem_layout = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
+    WGPUBindGroupLayoutEntry oe = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+    oe.binding = 10;
+    oe.visibility = WGPUShaderStage_Compute;
+    oe.storageTexture.access = WGPUStorageTextureAccess_WriteOnly;
+    oe.storageTexture.format = WGPUTextureFormat_RGBA8Unorm;
+    oe.storageTexture.viewDimension = WGPUTextureViewDimension_2D;
+    ld.entryCount = 1;
+    ld.entries = &oe;
+    g_out_layout = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
+    const WGPUBindGroupLayout job_layouts[3] = {g_job_layout, g_mem_layout, g_out_layout}, fill_layouts[2] = {g_params_layout, g_mem_layout};
+    pld.bindGroupLayouts = job_layouts;
+    const WGPUPipelineLayout job_pipeline_layout = wgpuDeviceCreatePipelineLayout(g_device, &pld);
+    pld.bindGroupLayoutCount = 3;
+    const WGPUPipelineLayout decode_pipeline_layout = wgpuDeviceCreatePipelineLayout(g_device, &pld);
+    pld.bindGroupLayoutCount = 2;
+    pld.bindGroupLayouts = fill_layouts;
+    const WGPUPipelineLayout fill_pipeline_layout = wgpuDeviceCreatePipelineLayout(g_device, &pld);
 
     for (std::uint32_t i = 0; i < 4; ++i) {
         WGPUSamplerDescriptor sd = WGPU_SAMPLER_DESCRIPTOR_INIT;
@@ -1891,7 +2162,6 @@ bool init() {
     WGPUSamplerDescriptor sd = WGPU_SAMPLER_DESCRIPTOR_INIT;
     sd.magFilter = sd.minFilter = WGPUFilterMode_Linear;
     g_smooth = wgpuDeviceCreateSampler(g_device, &sd);
-    g_init_pipeline = full_pipeline("fs_init", kColor);
     g_display_pipeline = full_pipeline("fs_display", WGPUTextureFormat_RGBA8Unorm);
     g_show_params = make_buffer(16, WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst);
     WGPUTexture blank = make_texture(1, 1, WGPUTextureFormat_RGBA8Unorm, WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst);
@@ -1907,13 +2177,42 @@ bool init() {
     bd.entryCount = 1;
     bd.entries = &be;
     g_blank_dest_group = wgpuDeviceCreateBindGroup(g_device, &bd);
-    g_to16_pipeline = convert_pipeline("fs_to16");
-    g_to32_pipeline = convert_pipeline("fs_to32");
+    g_to16_pipeline = convert_pipeline("fs_to16", g_convert_pipeline_layout);
+    g_to32_pipeline = convert_pipeline("fs_to32", g_convert_pipeline_layout);
+    g_fill_pipeline = convert_pipeline("fs_fill", fill_pipeline_layout);
     g_pack16_pipeline = full_pipeline("fs_pack16", WGPUTextureFormat_R32Uint);
     g_pack32_pipeline = full_pipeline("fs_pack32", WGPUTextureFormat_R32Uint);
-    if (!g_module || !g_init_pipeline || !g_display_pipeline || !g_to16_pipeline || !g_to32_pipeline || !g_pack16_pipeline || !g_pack32_pipeline) return false;
+    g_upload_pipeline = compute_pipeline("upload", job_pipeline_layout);
+    g_clut_pipeline = compute_pipeline("load_clut", job_pipeline_layout);
+    g_decode_pipeline = compute_pipeline("decode", decode_pipeline_layout);
+    if (!g_module || !g_fill_pipeline || !g_display_pipeline || !g_to16_pipeline || !g_to32_pipeline || !g_pack16_pipeline || !g_pack32_pipeline || !g_upload_pipeline ||
+        !g_clut_pipeline || !g_decode_pipeline)
+        return false;
     load_tables();
     g_lut = make_lut();
+    g_vram = make_buffer(gs::kMemorySize, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc);
+    g_swizzle = make_buffer(swz::g_tables.size() * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+    wgpuQueueWriteBuffer(g_queue, g_swizzle, 0, swz::g_tables.data(), swz::g_tables.size() * 4);
+    g_cluts = make_buffer(2048, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc);
+    for (Stage &st : g_stages) {
+        WGPUBufferDescriptor sbd = WGPU_BUFFER_DESCRIPTOR_INIT;
+        sbd.size = kStage;
+        sbd.usage = WGPUBufferUsage_MapWrite | WGPUBufferUsage_CopySrc;
+        sbd.mappedAtCreation = true;
+        st.buffer = wgpuDeviceCreateBuffer(g_device, &sbd);
+        st.mapped = true;
+    }
+    WGPUBindGroupEntry ge[2] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+    ge[0].binding = 8;
+    ge[0].buffer = g_vram;
+    ge[0].size = WGPU_WHOLE_SIZE;
+    ge[1].binding = 9;
+    ge[1].buffer = g_swizzle;
+    ge[1].size = WGPU_WHOLE_SIZE;
+    bd.layout = g_mem_layout;
+    bd.entryCount = 2;
+    bd.entries = ge;
+    g_mem_group = wgpuDeviceCreateBindGroup(g_device, &bd);
     g_packs = texpack::init();
     for (std::uint32_t p = 0; p < kPages; ++p) g_page_gen[p] = 1;
     std::fprintf(stderr, "[native] renderer on, scale %u, aspect %.0f:%.0f\n", g_scale, g_aspect_w, g_aspect_h);
@@ -1943,8 +2242,15 @@ void reset() {
     ++g_clut_version;
     g_cur.valid = false;
     g_upload = Upload{};
+    g_staged = 0;
+    g_pieces.clear();
+    for (std::vector<Written> &v : g_written) v.clear();
     g_last_clut = ClutLoad{};
     texpack::clear_tags();
+    // GS memory and the CLUT as gs.cpp holds them (zeroed, or loaded from a save state).
+    wgpuQueueWriteBuffer(g_queue, g_vram, 0, gs::memory(), gs::kMemorySize);
+    wgpuQueueWriteBuffer(g_queue, g_cluts, 0, gs::g_state.clut, 2048);
+    for (std::uint32_t g = 0; g < 32; ++g) g_clut_ids[g] = mix(mix(0x636C7574ull, g_upload_serial), g);
     for (WGPUBindGroup g : g_dead_groups) wgpuBindGroupRelease(g);
     for (WGPUTextureView v : g_dead_views) wgpuTextureViewRelease(v);
     for (WGPUTexture t : g_dead_textures) wgpuTextureRelease(t);
@@ -2015,15 +2321,33 @@ void draw(const State &st, const Vertex *v, int) {
     add_vertices(out, n, box);
 }
 
-void finish_upload() {
+// bytes: the upload's bytes on the CPU (the last piece's caller, else g_pieces).
+void finish_upload(const std::uint8_t *bytes = nullptr) {
     Upload &u = g_upload;
     if (!u.active) return;
     const Timer timer(T_UPLOAD);
     count(C_UPLOAD);
-    write_upload(u);
+    if (!bytes) bytes = g_pieces.data();
+    const std::size_t size = g_staged - u.start;
+    const std::uint32_t rows = static_cast<std::uint32_t>(std::min<std::size_t>(u.h, size * 8 / (static_cast<std::size_t>(u.w) * bits_per_pixel(u.psm))));
+    if (rows) {
+        push_upload(u, rows);
+        const std::uint32_t box[4] = {u.x, u.y, u.x + u.w, u.y + rows};
+        std::uint64_t hash = 0;
+        if (!whole_columns(u.psm, u.x, u.y, u.w, rows)) {
+            hash = size;
+            for (std::size_t i = 0; i < size; i += 8) {
+                std::uint64_t v = 0;
+                std::memcpy(&v, bytes + i, std::min<std::size_t>(8, size - i));
+                hash = (hash ^ v) * 0x9E3779B97F4A7C15ull;
+            }
+            hash |= 1;
+        }
+        note_written(u.bp, u.bw, u.psm, u.bp | (u.bw << 14) | (u.psm << 20), box, hash);
+    }
     {
         const Timer tag(T_TAG);
-        texpack::tag_upload(u.bp, u.bw, u.psm, u.x, u.y, u.w, u.h, u.bytes.data(), u.bytes.size());
+        texpack::tag_upload(u.bp, u.bw, u.psm, u.x, u.y, u.w, u.h, bytes, size);
     }
     // Targets under the upload get the rows it touched back from memory; views convert from their parent.
     for (Target *t : u.targets) {
@@ -2044,7 +2368,6 @@ void finish_upload() {
     if (!u.targets.empty()) g_cur.valid = false;
     u.targets.clear();
     u.active = false;
-    u.bytes.clear();
 }
 
 void image_begin(const State &s) {
@@ -2070,15 +2393,25 @@ void image_begin(const State &s) {
     u.hi = hi;
     u.targets = targets_under(lo, hi);
     for (Target *t : u.targets) read_back(*t);
-    u.expected = static_cast<std::size_t>(u.w) * u.h * bits_per_pixel(u.psm) / 8;
+    u.expected = std::min<std::size_t>(static_cast<std::size_t>(u.w) * u.h * bits_per_pixel(u.psm) / 8, kStage);  // more than GS memory holds
+    g_staged = (g_staged + 3) & ~3ull;
+    if (g_staged + u.expected > kStage) {
+        submit_ops();
+        g_staged = 0;  // nothing in it is used when there was nothing to submit
+    }
+    u.start = g_staged;
+    g_pieces.clear();
     u.active = true;
 }
 
 void image_data(const std::uint8_t *data, std::size_t bytes) {
     Upload &u = g_upload;
     if (!u.active) return;
-    u.bytes.insert(u.bytes.end(), data, data + bytes);
-    if (u.bytes.size() >= u.expected) finish_upload();
+    const std::size_t got = g_staged - u.start, take = std::min(bytes, u.expected - got);
+    std::memcpy(staging() + g_staged, data, take);
+    g_staged += take;
+    if (got + take < u.expected || !g_pieces.empty()) g_pieces.insert(g_pieces.end(), data, data + take);
+    if (got + take >= u.expected) finish_upload(g_pieces.empty() ? data : g_pieces.data());
 }
 
 void transfer(std::uint32_t dir) {
@@ -2086,7 +2419,7 @@ void transfer(std::uint32_t dir) {
         missing("local copies");
         return;
     }
-    // Download: targets under the source rectangle go into the CPU memory copy, which gs.cpp then reads.
+    // Download: targets under the source rectangle go into GS memory, which is read back for gs.cpp.
     finish_upload();
     const std::uint64_t buf = gs::g_state.bitbltbuf, pos = gs::g_state.trxpos, reg = gs::g_state.trxreg;
     const std::uint32_t w = static_cast<std::uint32_t>(reg) & 0xFFFu, h = static_cast<std::uint32_t>(reg >> 32) & 0xFFFu;
@@ -2098,19 +2431,23 @@ void transfer(std::uint32_t dir) {
                   hi = std::max(hi, p * 8192u + 8192u);
               });
     for (Target *t : targets_under(lo, hi)) read_back(*t);
+    submit_ops();
+    read_buffer(g_vram, lo, hi - lo, gs::memory() + lo);
 }
 
 void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
     finish_upload();
-    read_clut(tex0, texclut);
+    push_clut(tex0, texclut);
     texpack::tag_clut(tex0, texclut);
 }
 
 void flush() { submit_ops(); }
 
+// Also fills the CPU copy of GS memory and the CLUT (state saves).
 void wait_idle() {
     submit_ops();
-    pump();
+    read_buffer(g_vram, 0, gs::kMemorySize, gs::memory());
+    read_buffer(g_cluts, 0, 2048, gs::g_state.clut);
 }
 
 bool display(const gs::DisplayRegs &r, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) {

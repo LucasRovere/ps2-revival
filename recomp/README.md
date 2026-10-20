@@ -197,7 +197,7 @@ git-ignored), created with defaults on first use:
 | `mods` | `""` | Mod folder (`PS2_MODS`, relative to the repo or absolute): replacement disc files ([Mods](#mods-t42)); `""` = off |
 | `frame_log` | `false` | `true`: frame-time log in `frame_log.txt` next to the card (`PS2_FRAME_LOG`, [below](#draw-profile-and-frame-time-log-t45)) |
 | `gpu_mesh` | `true` | `false`: no GPU mesh path (`PS2_GPU_MESH=0`, [Chain handlers](#chain-handlers-t46)); also read from the port folder's `settings.json` |
-| `renderer` | `"gs"` | `"native"`: the native renderer (`PS2_RENDERER=native`, [Native renderer](#native-renderer-t57)); also read from the port folder's `settings.json` |
+| `renderer` | `"native"` (T59b) | the native renderer (`PS2_RENDERER=native`, [Native renderer](#native-renderer-t57)); `"gs"`: the GS renderer (the fallback); also read from the port folder's `settings.json` |
 
 Keys missing from an older `play.json` take the defaults. The log shows
 `settings: ...`, `[gpu] scale N`, `[gpu] aspect W:H` and
@@ -585,8 +585,11 @@ EE PCs named from the analysis export.
 
 The first layer of the fully native renderer (D37, D40): the GS-draw
 translator, our code in `native/` (`renderer.cpp`, `native.wgsl`), hooked
-into the vendored GS front end by one patch (below). Opt-in: its render
-thread is still above the GS path's at owner settings (T59, D42):
+into the vendored GS front end by one patch (below). The launchers'
+default since T59b (D43: its render thread reached the GS path's at owner
+settings): `play.py` and the port folder's `settings.json` `renderer`
+(`"gs"` = the GS renderer). `ps2run` with an ELF argument still follows
+the environment (unset = GS renderer, as the scripted checks use):
 
 ```powershell
 $env:PS2_RENDERER = "native"     # window or headless; frame dumps read the native targets
@@ -644,12 +647,26 @@ Shared GS memory (T58, D41):
   pixel the sub-pixel belongs to, plus the sub-pixel's offset, so 1:1
   copies stay exact.
 
-Textures come from a CPU copy of GS memory that the translator keeps from
-uploads (no rendered pixels in it) and the CLUT loads (repeated loads with
-no upload since are skipped). Decoded textures are cached by content: the
-D25 upload tags of the texture's columns when they have them, else a hash
-of its 8 KB pages, plus the CLUT entries it reads; so a texture uploaded
-again every frame is decoded once. A texture at a target's base pointer in
+GS memory lives on the GPU (T59b): a 4 MB buffer (1x, no rendered pixels
+in it) written by compute passes from the uploads' bytes (copied into a
+mapped staging buffer as they arrive, moved by the GPU at the submit) and
+by target read-backs; CLUT loads (repeated loads with no upload since are
+skipped) and texture decodes (into the cached textures, one dispatch per
+level) are compute passes too, and new targets are filled from it in a
+render pass. These GS memory jobs run in a compute pass at the start of
+their part of the frame (a part ends where a new target is filled); each
+job gets the lowest slot after the jobs it depends on (pages written and
+read, the CLUT load order), so independent uploads share a dispatch
+(pilot races: ~1,500-2,200 uploads in ~130-190 dispatches). The CPU copy
+(`gs::memory()`, `g_state.clut`) is filled only for downloads (the source
+pages) and state saves (`wait_idle`); a state load or reset writes it to
+the GPU. Decoded textures are cached by content: the D25 upload tags of
+the texture's columns (and of its CLUT for T8/T4) when they have them;
+else, for texels, the hash of the newest upload that wrote all of the
+texture when nothing written later touches it (uploads that do not cover
+whole columns are hashed for this), else the generations of its pages;
+for the CLUT, its loads' source fields and page generations. So a texture
+uploaded again every frame is decoded once. A texture at a target's base pointer in
 the same format class samples the target (a copy of it when the draw writes
 the same target). Texture packs (`PS2_TEXTURES`) use the D25 keys as the
 GS renderer does; pack dumping (`PS2_TEX_DUMP`) is the GS renderer's only.
@@ -663,10 +680,11 @@ raster (CPU or GPU) drew: 0 with the native renderer on (T59/T68 measure).
 
 **Timing (T59):** `PS2_NATIVE_TIME=1` (window) prints every 600 presents
 `[native] ms per present: rebuild, decode, upload (tags), submit, present
-(acquire); per present: rebuilds, uploads, passes, draws, copies, submits;
-GPU ms`: render-thread time in the draw-state rebuilds (texture keys
-included), CPU texture decode, the upload copy into the CPU memory and its
-D25 tags, encoding and submitting the commands, and the present (the
+(acquire); per present: rebuilds, uploads, decodes, dispatches, passes,
+draws, copies, submits; GPU ms`: render-thread time in the draw-state
+rebuilds (texture keys included), setting up texture decodes (since T59b
+GPU jobs), the uploads (copy into the staging buffer, job, D25 tags),
+encoding and submitting the commands, and the present (the
 surface acquire apart); GPU time from timestamps at the start and end of
 every command encoder (needs the adapter's timestamp features; the log says
 `no GPU timestamps` otherwise). Off: one test of a false flag per timed
@@ -735,6 +753,25 @@ per texture change), texture keys per rebuild ~1.5 ms (every upload
 invalidates the memo, keys come from the D25 column tags), the menus' CPU
 decode of a texture uploaded every frame (0.6 ms); the VU1 batches the GPU
 mesh path takes on the GS path go through the front end here (T60).
+
+Check after T59b (pilot game; GS memory, CLUT loads and decodes on the
+GPU): headless frames byte-identical to T59's in the menu run from boot
+(107/107, its 132 read-backs and the loading-screen downloads through the
+GPU memory) and the three state runs, cycles unchanged; renderer off
+107/107 and the same cycles. Texture decodes per state run: race intro 274
+(T59 576), racing 387 (7,849), menu state 819 (1,349). Window scale 3,
+16:9, pack, render thread busy per presented frame (3 runs each, GS path
+in brackets, same session): menus 1.56 ms (1.56), race intro 15.48
+(15.56), racing 11.94 (11.95): at the GS path's in every scene, so the
+launchers default to it (D43). Split (`PS2_NATIVE_TIME`, race intro /
+racing): rebuild 0.8 / 0.7 (T59 2.0 / 1.4: no page hashes), upload 1.1 /
+1.1 of which tags 0.8 (T59 3.7 / 3.8), submit 5.0 / 4.0 (T59 4.6 / 3.8:
+~130-190 compute dispatches added; the staging buffer saved the 0.6 ms
+data copy), decode ~0 (menus 0.1, T59 0.6). GPU per present 0.7 / 8.4 /
+7.4 ms (T59 0.7 / 5.6 / 4.7): the uploads' swizzle and the in-order CLUT
+loads moved there (one workgroup applies a dispatch's CLUT loads in order);
+frames stay paced at 60. Left for T59c: ~2,700-3,500 wgpu draws per frame
+(the submit), texture keys per rebuild.
 
 ### Chain handlers (T46)
 
@@ -908,7 +945,7 @@ except:
 | `runtime/include/ps2/chain.hpp`, `runtime/src/chain.cpp`, `chain.hpp` (new), `CMakeLists.txt`, `runtime/src/dmac.cpp` (`run_chain`, `to_vif`), `runtime/src/vif.cpp`, `vif.hpp` (`transfer_chain`, `run_hooked`, `feed`, hook in `run_vu`), `runtime/src/gs/queue.hpp` (`kVif1Chain`), `runtime/src/system.cpp` (VU thread), `runtime/src/vu_micro.cpp`, `vu_micro.hpp` (`program_key`), `runtime/src/draw_profile.cpp`, `draw_profile.hpp` (`handler_ran`), `host/main.cpp`, `host/web.cpp` (`register_chain_handlers()`) | Chain handlers (T46, D32): a claimed VIF1 `call`'s data goes to the handler as one (`kVif1Chain` in the window), `chain::run` with a hook at each VU1 start; profile `ret` now after the tag's data. No handler: one test of a null pointer per `call` tag and VU1 start; frames and cycles unchanged. |
 | `runtime/include/ps2/chain.hpp`, `runtime/src/chain.cpp` (`mesh_path`, `mesh_add`, `mesh_draw`, `run` with an unpack hook), `runtime/src/vif.cpp`, `vif.hpp` (unpack hook in `unpack`, `run_hooked`), `runtime/src/gs/gs.cpp`, `gs.hpp` (`render_mesh`, `kMesh`/`kMeshData`), `runtime/src/gs/queue.hpp`, `runtime/src/gs/gpu/gpu.cpp`, `gpu.hpp` (`draw_mesh`, `mesh_add`, `flush_meshes`, `setup_for`/`add_prim`/`finish_batch`/`dispatch_decodes` split out of `draw`/`flush_batch`, arena `base`, mesh pipelines), `runtime/src/gs/gpu/gs.wgsl` (`raster_mesh`), `runtime/src/gs/gpu/mesh.wgsl` (new: `mesh_build`, `mesh_bin`), `CMakeLists.txt` (`kMeshShader`), `host/main.cpp` (`gpu_mesh` setting) | GPU mesh path (T48, D36): mesh vertices cached on the GPU, strips built and binned there (see [Chain handlers](#chain-handlers-t46)). Off (`PS2_GPU_MESH=0`) or no mesh draws: the same frames and cycles (menu run 107/107, no handler and identity handler). |
 | `CMakeLists.txt` (`../native` sources and `native.wgsl` in the wgpu block), `runtime/src/gs/gs.cpp` (`native::` calls in `init`, `render_reset`, `kick`, TRXDIR, `feed_image`, `load_clut`, `vblank`, kVblank, present, display, window attach/resize, `flush_and_wait`, state load, `stats`; `cpu_raster()` false with it on) | Native renderer hook (T57, D40): with `PS2_RENDERER=native` the GS front end feeds `recomp/native/` instead of the GS raster ([Native renderer](#native-renderer-t57)). Unset: frames and cycles unchanged (menu run 107/107, 52,595,993,647). |
-| `host/main.cpp` (`renderer` setting in `apply_folder_settings`) | Port folder `settings.json` `"renderer": "native"` sets `PS2_RENDERER=native` unless already set. Absent or `"gs"`: unchanged. |
+| `host/main.cpp` (`renderer` setting in `apply_folder_settings`) | Port folder `settings.json` `"renderer"` (absent = `"native"`, T59b) sets `PS2_RENDERER` unless already set; `"gs"`: unchanged. Runs with an ELF argument keep the environment's choice. |
 | `runtime/src/emu_count.cpp`, `emu_count.hpp` (new), `CMakeLists.txt`, hooks in `runtime/src/memory.cpp` (EE register accesses), `hw.cpp` (INTC, DMAC interrupts), `kernel.cpp` (syscalls), `dmac.cpp`, `vif.cpp`, `vu_micro.cpp` (VU1 runs by key, VCALLMS), `gs/gif.cpp`, `gs/gs.cpp` (primitives, registers, transfers, mesh strips), `iop/kernel.cpp` (IOP instructions, HLE calls), `iop/hw.cpp`, `iop/spu2.cpp`, `iop/sif.cpp`, `system.cpp` (per frame, exit, off when the window threads start) | Emulation counters (T56): `PS2_EMU_COUNT=<file>`, headless, see [Emulation counters](#emulation-counters-t56). Unset: one test of a false flag per event; frames and cycles unchanged (menu run 107/107, also set). |
 
 The headless Windows build (T22) needs no changes to upstream: the headless path

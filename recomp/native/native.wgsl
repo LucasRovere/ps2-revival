@@ -282,13 +282,259 @@ fn vs_full(@builtin(vertex_index) i: u32) -> FullOut {
     return o;
 }
 
-// A new target starts with what GS memory holds there (rgba8 staging image, 1x, PS2 alpha).
-@group(0) @binding(0) var staging: texture_2d<f32>;
+// ---- GS memory on the GPU (T59b): uploads, CLUT loads and texture decodes as gs.cpp does them on the CPU.
+// Address math after the vendored gs.wgsl (MIT): swizzle tables from gs::swizzle_tables, GS memory 1x.
 
+struct Job {
+    a: vec4<u32>,
+    b: vec4<u32>,
+    c: vec4<u32>,
+}
+
+@group(0) @binding(5) var<uniform> job: Job;
+@group(0) @binding(6) var<storage, read> job_data: array<u32>;
+@group(0) @binding(7) var<storage, read_write> cluts: array<u32, 512>;
+@group(1) @binding(8) var<storage, read_write> vram: array<atomic<u32>>;
+@group(1) @binding(9) var<storage, read> swizzle: array<u32>;
+@group(2) @binding(10) var decode_out: texture_storage_2d<rgba8unorm, write>;
+
+struct Loc {
+    word: u32,
+    shift: u32,
+    mask: u32,
+}
+
+fn page_addr(bp: u32, bw: u32, x: u32, y: u32, pw: u32, ph: u32) -> u32 {
+    let per_row = max(1u, bw * 64u / pw);
+    return bp * 256u + ((x / pw) + (y / ph) * per_row) * 8192u;
+}
+
+fn locate(psm: u32, bp: u32, bw: u32, x: u32, y: u32) -> Loc {
+    var a = 0u;
+    var shift = 0u;
+    var mask = 0xFFFFFFFFu;
+    switch psm {
+        case 0x30u {
+            a = page_addr(bp, bw, x, y, 64u, 32u) + swizzle[2048u + (y & 31u) * 64u + (x & 63u)];
+        }
+        case 0x31u {
+            a = page_addr(bp, bw, x, y, 64u, 32u) + swizzle[2048u + (y & 31u) * 64u + (x & 63u)];
+            mask = 0xFFFFFFu;
+        }
+        case 0x01u {
+            a = page_addr(bp, bw, x, y, 64u, 32u) + swizzle[(y & 31u) * 64u + (x & 63u)];
+            mask = 0xFFFFFFu;
+        }
+        case 0x02u {
+            a = page_addr(bp, bw, x, y, 64u, 64u) + swizzle[4096u + (y & 63u) * 64u + (x & 63u)];
+            shift = (a & 2u) * 8u;
+            mask = 0xFFFFu;
+        }
+        case 0x0Au {
+            a = page_addr(bp, bw, x, y, 64u, 64u) + swizzle[8192u + (y & 63u) * 64u + (x & 63u)];
+            shift = (a & 2u) * 8u;
+            mask = 0xFFFFu;
+        }
+        case 0x32u {
+            a = page_addr(bp, bw, x, y, 64u, 64u) + swizzle[12288u + (y & 63u) * 64u + (x & 63u)];
+            shift = (a & 2u) * 8u;
+            mask = 0xFFFFu;
+        }
+        case 0x3Au {
+            a = page_addr(bp, bw, x, y, 64u, 64u) + swizzle[16384u + (y & 63u) * 64u + (x & 63u)];
+            shift = (a & 2u) * 8u;
+            mask = 0xFFFFu;
+        }
+        case 0x13u {
+            a = page_addr(bp, bw, x, y, 128u, 64u) + swizzle[20480u + (y & 63u) * 128u + (x & 127u)];
+            shift = (a & 3u) * 8u;
+            mask = 0xFFu;
+        }
+        case 0x14u {
+            let n = swizzle[28672u + (y & 127u) * 128u + (x & 127u)];
+            a = page_addr(bp, bw, x, y, 128u, 128u) + n / 2u;
+            shift = (a & 3u) * 8u + (n & 1u) * 4u;
+            mask = 0xFu;
+        }
+        case 0x1Bu {
+            a = page_addr(bp, bw, x, y, 64u, 32u) + swizzle[(y & 31u) * 64u + (x & 63u)];
+            shift = 24u;
+            mask = 0xFFu;
+        }
+        case 0x24u {
+            a = page_addr(bp, bw, x, y, 64u, 32u) + swizzle[(y & 31u) * 64u + (x & 63u)];
+            shift = 24u;
+            mask = 0xFu;
+        }
+        case 0x2Cu {
+            a = page_addr(bp, bw, x, y, 64u, 32u) + swizzle[(y & 31u) * 64u + (x & 63u)];
+            shift = 28u;
+            mask = 0xFu;
+        }
+        default {
+            a = page_addr(bp, bw, x, y, 64u, 32u) + swizzle[(y & 31u) * 64u + (x & 63u)];
+        }
+    }
+    return Loc((a & 0x3FFFFFu) >> 2u, shift, mask);
+}
+
+fn gs_read(psm: u32, bp: u32, bw: u32, x: u32, y: u32) -> u32 {
+    let l = locate(psm, bp, bw, x, y);
+    return (atomicLoad(&vram[l.word]) >> l.shift) & l.mask;
+}
+
+// Pixels narrower than a word share it with other threads: and/or keeps their bits.
+fn gs_write(psm: u32, bp: u32, bw: u32, x: u32, y: u32, value: u32) {
+    let l = locate(psm, bp, bw, x, y);
+    if (l.mask == 0xFFFFFFFFu) {
+        atomicStore(&vram[l.word], value);
+        return;
+    }
+    atomicAnd(&vram[l.word], ~(l.mask << l.shift));
+    atomicOr(&vram[l.word], (value & l.mask) << l.shift);
+}
+
+fn expand16(c: u32, ta0: u32, ta1: u32, aem: bool) -> u32 {
+    var a = ta0;
+    if ((c & 0x8000u) != 0u) {
+        a = ta1;
+    } else if (aem && (c & 0x7FFFu) == 0u) {
+        a = 0u;
+    }
+    return ((c & 0x1Fu) << 3u) | (((c >> 5u) & 0x1Fu) << 11u) | (((c >> 10u) & 0x1Fu) << 19u) | (a << 24u);
+}
+
+fn job_bits(word: u32, bit: u32, count: u32) -> u32 {
+    let w = word + bit / 32u;
+    let s = bit % 32u;
+    var v = job_data[w] >> s;
+    if (s + count > 32u) {
+        v = v | (job_data[w + 1u] << (32u - s));
+    }
+    if (count == 32u) {
+        return v;
+    }
+    return v & ((1u << count) - 1u);
+}
+
+fn thread(gid: vec3<u32>) -> u32 {
+    return gid.x + gid.y * 65536u;
+}
+
+// Image transfers: records of 9 words (bp, bw, psm, x, y, width, data word, bits per pixel, first thread),
+// job.a = (first record word, records, threads).
+@compute @workgroup_size(64)
+fn upload(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = thread(gid);
+    if (i >= job.a.z) {
+        return;
+    }
+    var lo = 0u;
+    var hi = job.a.y;
+    while (hi - lo > 1u) {
+        let mid = (lo + hi) / 2u;
+        if (job_data[job.a.x + mid * 9u + 8u] <= i) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let r = job.a.x + lo * 9u;
+    let k = i - job_data[r + 8u];
+    let w = job_data[r + 5u];
+    let bpp = job_data[r + 7u];
+    let x = (job_data[r + 3u] + k % w) & 0x7FFu;
+    let y = (job_data[r + 4u] + k / w) & 0x7FFu;
+    gs_write(job_data[r + 2u], job_data[r], job_data[r + 1u], x, y, job_bits(job_data[r + 6u], k * bpp, bpp));
+}
+
+// CLUT loads in order: records of 8 words (cbp, cpsm, csm, csa, 8-bit, cbw, cou, cov), job.a = (first record word,
+// records). Each thread owns two CLUT entries and applies the loads that write them in order, so no barriers.
+@compute @workgroup_size(256)
+fn load_clut(@builtin(local_invocation_index) t: u32) {
+    for (var n = 0u; n < job.a.y; n = n + 1u) {
+        let r = job.a.x + n * 8u;
+        let cbp = job_data[r];
+        let cpsm = job_data[r + 1u];
+        let csa = job_data[r + 3u];
+        let eight = job_data[r + 4u] != 0u;
+        let entries = select(16u, 256u, eight);
+        for (var slot = t; slot < 512u; slot = slot + 256u) {
+            if (job_data[r + 2u] != 0u) {
+                let k = (slot - csa * 16u) & 511u;
+                if (k < entries) {
+                    cluts[slot] = gs_read(cpsm, cbp, job_data[r + 5u], job_data[r + 6u] * 16u + k, job_data[r + 7u]);
+                }
+            } else if (slot < 256u) {
+                if (eight) {
+                    let j = (slot & ~0x18u) | ((slot & 0x08u) << 1u) | ((slot & 0x10u) >> 1u);
+                    cluts[slot] = gs_read(cpsm, cbp, 1u, j & 15u, j >> 4u);
+                } else {
+                    let k = (slot - (csa & 15u) * 16u) & 255u;
+                    if (k < 16u) {
+                        cluts[slot] = gs_read(cpsm, cbp, 1u, k & 7u, k >> 3u);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// One texture level into decode_out: job.a = (psm, bp, bw, log2 width), job.b = (texels, cpsm, csa),
+// job.c = (ta0, ta1, aem). Reads the CLUT as the loads before it left it (they run before, the next after).
+@compute @workgroup_size(64)
+fn decode(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = thread(gid);
+    if (i >= job.b.x) {
+        return;
+    }
+    let psm = job.a.x;
+    let x = i & ((1u << job.a.w) - 1u);
+    let y = i >> job.a.w;
+    let raw = gs_read(psm, job.a.y, job.a.z, x, y);
+    let ta0 = job.c.x;
+    let ta1 = job.c.y;
+    let aem = job.c.z != 0u;
+    var c = 0u;
+    var paletted = false;
+    switch psm {
+        case 0x00u {
+            c = raw;
+        }
+        case 0x01u {
+            c = raw | (select(ta0, 0u, aem && raw == 0u) << 24u);
+        }
+        case 0x02u, 0x0Au {
+            c = expand16(raw, ta0, ta1, aem);
+        }
+        case 0x13u, 0x1Bu {
+            c = cluts[raw & 255u];
+            paletted = true;
+        }
+        default {
+            c = cluts[((job.b.z & 15u) * 16u + (raw & 15u)) & 511u];
+            paletted = psm == 0x14u || psm == 0x24u || psm == 0x2Cu;
+        }
+    }
+    if (paletted && job.b.y != 0u && job.b.y != 1u) {
+        c = expand16(c, ta0, ta1, aem);
+    }
+    textureStore(decode_out, vec2<u32>(x, y), vec4<f32>(f32(c & 0xFFu), f32((c >> 8u) & 0xFFu), f32((c >> 16u) & 0xFFu), f32(c >> 24u)) / 255.0);
+}
+
+// A new target starts with what GS memory holds there (1x, PS2 alpha): draws[i].flags = psm, fbmsk = block
+// pointer, blend = width in 64-pixel units.
 @fragment
-fn fs_init(in: FullOut) -> @location(0) vec4<f32> {
-    let c = textureLoad(staging, vec2<i32>(in.position.xy / SCALE), 0);
-    return vec4<f32>(c.rgb, c.a * 255.0 / 128.0);
+fn fs_fill(in: ConvertOut) -> @location(0) vec4<f32> {
+    let d = draws[in.draw];
+    let g = vec2<u32>(in.position.xy) / u32(SCALE);
+    var c = gs_read(d.flags, d.fbmsk, d.blend, g.x, g.y);
+    if ((d.flags & 0xFu) == 2u || (d.flags & 0xFu) == 0xAu) {
+        c = expand16(c, 0u, 0x80u, false);
+    } else if (d.flags == 0x01u || d.flags == 0x31u) {
+        c = c | 0x80000000u;
+    }
+    return vec4<f32>(f32(c & 0xFFu) / 255.0, f32((c >> 8u) & 0xFFu) / 255.0, f32((c >> 16u) & 0xFFu) / 255.0, f32(c >> 24u) / 128.0);
 }
 
 struct Show {
