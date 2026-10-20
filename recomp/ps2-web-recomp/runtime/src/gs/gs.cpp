@@ -1,4 +1,5 @@
 #include "gs.hpp"
+#include "../emu_count.hpp"
 
 #include "gif.hpp"
 #include "queue.hpp"
@@ -484,6 +485,7 @@ void kick(bool draw) {
         if (gpu_on()) gpu::draw(s, s.queue, needed);
 #endif
         ++g_primitives;
+        if (emu_count::g_on) emu_count::gs_draw(s);
     }
     switch (prim) {
     case 2:
@@ -529,6 +531,7 @@ void vertex(std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint8_t f, b
 void write(std::uint32_t reg, std::uint64_t value) {
     State &s = g_state;
     ++g_writes[reg & 127u];
+    if (emu_count::g_on) emu_count::add(emu_count::kGsReg, reg);
     constexpr std::uint64_t kVertexRegs = (1ull << 0x01) | (1ull << 0x02) | (1ull << 0x03) | (1ull << 0x04) | (1ull << 0x05) | (1ull << 0x0A) | (1ull << 0x0C) | (1ull << 0x0D);
     if (reg >= 64 || !((kVertexRegs >> reg) & 1u)) ++g_setup_generation;
     static const char *seq = std::getenv("PS2_TRACE_GSSEQ");
@@ -599,6 +602,7 @@ void write(std::uint32_t reg, std::uint64_t value) {
                          static_cast<unsigned long long>(s.bitbltbuf), static_cast<unsigned long long>(s.trxpos), static_cast<unsigned long long>(s.trxreg));
         }
         s.trxdir = value;
+        if (emu_count::g_on) emu_count::gs_transfer(value, s.bitbltbuf);
         g_transfer = Transfer{};
         g_carried = 0;
 #ifdef PS2_GPU
@@ -1087,6 +1091,7 @@ void mesh_draw(const chain::MeshDraw &d, const float *screen) {
         queue::post(queue::kMesh, 0, 0, &packet, static_cast<std::uint32_t>(sizeof d + d.count * 8));
         return;
     }
+    if (emu_count::g_on) emu_count::add(emu_count::kGsMesh, d.prim, 0, d.count);
     render_mesh(d, screen);
 }
 

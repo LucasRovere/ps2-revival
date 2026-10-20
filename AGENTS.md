@@ -194,7 +194,7 @@ the same change.
   data, frames byte-identical, on by default (`PS2_GPU_MESH=0` /
   `"gpu_mesh": false` turns it off). Order (owner, D31): Phase 8 → Phase 9 → fully native for the
   pilot game → wrap-up → other games (T40).
-- Fully native plan (T52, D37, pending owner review): no emulated hardware
+- Fully native plan (T52, D37; owner review D38: performance target < 5 ms CPU per frame at scale 3, no wheel, frame-rate-independent play): no emulated hardware
   while the game runs; game code stays recompiled, decompilation selective
   (D5). Native renderer in `recomp/native/` (GS-draw translator on WebGPU
   render pipelines, per-engine mesh kinds, list reader at the frame kick),
@@ -202,4 +202,5 @@ the same change.
   Tasks T56-T68 to fully native (T56 survey and emulation counters first),
   then T69-T72, then T40. T47, T55, T29, T30 dropped. Plan:
   [docs/native-port-plan.md](docs/native-port-plan.md) "Fully native".
+- Emulation counters (T56): `PS2_EMU_COUNT=<file>` (headless, opt-in) + `recomp/emucount.py`: what emulated hardware a scene uses (IOP, VU1, VIF, DMA, GIF, GS census, EE registers by guest function, SIF RPC, SPU2); the measure for T57-T68.
 - Next up: see [docs/tasks.md](docs/tasks.md). The owner runs tasks with `/next-task`.

@@ -1,4 +1,5 @@
 #include "vu_micro.hpp"
+#include "emu_count.hpp"
 
 #include "gs/gif.hpp"
 #include "gs/queue.hpp"
@@ -842,6 +843,7 @@ void run_entry(int unit, std::uint32_t pc) {
     static std::unordered_map<std::uint32_t, std::uint64_t> misses;
     if (unit == 1 && !interpret_only) {
         if (const ProgramFn fn = lookup(pc)) {
+            if (emu_count::g_on) emu_count::add(emu_count::kVu1, g_entries[(pc & 16383u) >> 3].key, pc);
             ++compiled;
             const ProgramFn jit = g_entries[(pc & 16383u) >> 3].jit;
             static std::uint64_t sampled = 0;
@@ -851,6 +853,7 @@ void run_entry(int unit, std::uint32_t pc) {
         }
     }
     if (unit == 1) g_interpreted_calls.fetch_add(1, std::memory_order_relaxed);
+    if (unit == 1 && emu_count::g_on) emu_count::add(emu_count::kVu1, program_key(pc), pc | 0x10000u);
     if (count && unit == 1) {
         ++misses[pc];
         if (++interpreted % 5000 == 0) {
@@ -1033,7 +1036,10 @@ void run(int n, std::uint32_t address) {
 
 namespace ps2 {
 
-void vcallms(Cpu &, std::uint32_t address) { vu::run(0, address); }
+void vcallms(Cpu &, std::uint32_t address) {
+    if (emu_count::g_on) emu_count::add(emu_count::kVu0, address, 1);
+    vu::run(0, address);
+}
 
 }
 

@@ -1,5 +1,6 @@
 #include "sif.hpp"
 
+#include "../emu_count.hpp"
 #include "../hw.hpp"
 #include "iop.hpp"
 #include "io.hpp"
@@ -131,6 +132,7 @@ void bind(const std::uint8_t *packet) {
     std::memcpy(&rpc, packet + 24, 4);
     std::memcpy(&client, packet + 28, 4);
     std::memcpy(&server, packet + 32, 4);
+    if (emu_count::g_on) emu_count::add(emu_count::kSifBind, server);
     Rend r = make_rend(*h, record, paddr, rpc, client, 0x80000009u);
     r.server_data = server ^ kServerXor;
     r.buffer = kRpcRecvAddr;
@@ -148,6 +150,11 @@ void call(const std::uint8_t *packet) {
     std::memcpy(&c, packet, sizeof c);
     const std::uint32_t server = c.server_data ^ kServerXor;
     auto it = g_servers.find(server);
+    if (emu_count::g_on) {
+        const std::uint64_t fn = c.rpc_number | static_cast<std::uint64_t>(it != g_servers.end() && it->second.hle) << 32;
+        emu_count::add(emu_count::kSifCall, server, fn, c.send_size);
+        emu_count::add(emu_count::kSifRecv, server, fn, c.recv_size);
+    }
     if (it == g_servers.end()) {
         std::fprintf(stderr, "[sif] call %u to unknown server 0x%08X\n", c.rpc_number, server);
         reply_call(c);
@@ -248,6 +255,7 @@ void command(std::uint32_t src, std::uint32_t size) {
     case 0x8000000Au: call(packet); break;
     case 0x8000000Cu: other_data(packet); break;
     default: {
+        if (emu_count::g_on) emu_count::add(emu_count::kSifCmd, h->cid);
         auto it = g_cmd_handlers.find(h->cid);
         if (it == g_cmd_handlers.end()) {
             std::fprintf(stderr, "[sif] command 0x%08X has no handler\n", h->cid);
@@ -349,6 +357,8 @@ void install_iop_side() {
     def("sifman", 6, "sceSifSetDChain", [](iop::Cpu &c) { c.r[2] = 0; });
     auto set_dma = [](iop::Cpu &c, std::uint32_t callback, std::uint32_t data) {
         const std::uint32_t list = arg(c, 0), count = arg(c, 1);
+        if (emu_count::g_on)
+            for (std::uint32_t i = 0; i < count; ++i) emu_count::add(emu_count::kIopSifDma, c.r[31], 0, iop::read32(list + i * 16 + 8));
         for (std::uint32_t i = 0; i < count; ++i) {
             const std::uint32_t src = iop::read32(list + i * 16), dst = iop::read32(list + i * 16 + 4), size = iop::read32(list + i * 16 + 8);
             if (g_options.trace_iop_hle) {
@@ -757,6 +767,11 @@ void pump() {
         std::fprintf(stderr, "\n");
     }
     const std::vector<std::uint8_t> packet = std::move(g_outgoing.front());
+    if (emu_count::g_on) {
+        std::uint32_t cid;
+        std::memcpy(&cid, packet.data() + 8, 4);
+        emu_count::add(emu_count::kSifToEe, cid);
+    }
     g_outgoing.pop_front();
     std::memcpy(g_ram + g_ee_recv, packet.data(), packet.size());
     g_processed = false;

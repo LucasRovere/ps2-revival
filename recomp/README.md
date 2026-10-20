@@ -2,7 +2,7 @@
 
 EE (R5900) → C++ static recompiler (Phase 5). The recompiler and runtime are
 [ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp) (MIT), vendored
-in `ps2-web-recomp/` (D14, D16). Our own code: `port.py` (incl. the port folder), `play.py` (launcher), `drawlist.py` (draw-list report), the function
+in `ps2-web-recomp/` (D14, D16). Our own code: `port.py` (incl. the port folder), `play.py` (launcher), `drawlist.py` (draw-list report), `emucount.py` (emulation counter report), the function
 override hook (vendored patch, below), generic overrides in `overrides/`
 (none yet; created with the first), the chain handler hook (vendored patch) with a test handler in
 `chains/` and the instruction tests in `tests/`.
@@ -547,6 +547,39 @@ costs no emulated time, so it loops more often per frame than a real GS
 could fill (55 M pixels per frame in the fade-out). Options are in
 `docs/tasks.md`.
 
+### Emulation counters (T56)
+
+What emulated PS2 hardware a run uses, and how much: the measure of the
+fully native work (D37, D38; every count goes to zero by T68). Headless only
+(in the window one log line says it is ignored). Unset: one test of a false
+flag per counted event; frames and cycles unchanged (pilot menu run 107/107,
+52,595,993,647 cycles, also with the counters set). About 25% slower while on.
+
+```powershell
+$env:PS2_EMU_COUNT = "work\scene.emu"; $env:PS2_GPU_MESH = "0"   # mesh path off: every primitive goes through the GS census
+work\<SERIAL>\recomp\build-window-win\ps2run.exe <elf> --disc <iso> --load-state <state> --frames <n> [--press ...]
+python recomp/emucount.py work\scene.emu[@from-to] [...] --analysis work\<SERIAL>\analysis [--top N] [--sections]
+```
+
+The file gets one section per 100 guest frames (and the last part at exit):
+IOP instructions (by module of the slice's first pc) and HLE library calls,
+IOP register blocks and DMA, SPU2 key-ons, VU1 programs by key and entry
+(and VU1 starts a chain handler did), VU0 micro programs, VIF commands, EE
+DMA starts and qwords per channel, GIF qwords and tags per path, GS
+primitives by kind, GPU mesh path strips, GS register writes, EE register
+accesses by block with the guest pc and ra (pc is the last call, return or
+syscall, not the access itself: map both), syscalls with their caller,
+INTC and DMAC interrupts, SIF binds, RPC calls per server and function
+(send and receive sizes, natively served or IOP), other SIF commands, IOP
+to EE packets and SIF DMA. GS census per primitive: the state modes
+(PRIM, TEX0 formats, TEX1, CLAMP modes, TEXA, ALPHA, TEST, FBA, FRAME and
+ZBUF formats and masks, PABE, DTHE, COLCLAMP, SCANMSK; no addresses), the
+frame and Z buffer drawn, a texture at a frame buffer drawn earlier (render
+to texture: exact base pointer match, cleared by an upload there), uploads,
+downloads and local copies, the displayed buffers once per frame.
+`emucount.py` prints the tables per file or frame range (`@from-to`), with
+EE PCs named from the analysis export.
+
 ### Chain handlers (T46)
 
 Game code can take over a VIF1 chain at its DMA `call` (D32, D35): e.g. an
@@ -718,6 +751,7 @@ except:
 | `runtime/src/gs/gpu/texpack.cpp` (`Slot`, `load`, `claim`, `start_loaders`, `find`) | Pack loader threads (T53): with `PS2_TEXTURES` set, `init` starts threads that decode every pack image; `find` decodes or waits for an image not decoded yet, so frames do not depend on timing. Without a pack nothing starts; frames and cycles unchanged. |
 | `runtime/include/ps2/chain.hpp`, `runtime/src/chain.cpp`, `chain.hpp` (new), `CMakeLists.txt`, `runtime/src/dmac.cpp` (`run_chain`, `to_vif`), `runtime/src/vif.cpp`, `vif.hpp` (`transfer_chain`, `run_hooked`, `feed`, hook in `run_vu`), `runtime/src/gs/queue.hpp` (`kVif1Chain`), `runtime/src/system.cpp` (VU thread), `runtime/src/vu_micro.cpp`, `vu_micro.hpp` (`program_key`), `runtime/src/draw_profile.cpp`, `draw_profile.hpp` (`handler_ran`), `host/main.cpp`, `host/web.cpp` (`register_chain_handlers()`) | Chain handlers (T46, D32): a claimed VIF1 `call`'s data goes to the handler as one (`kVif1Chain` in the window), `chain::run` with a hook at each VU1 start; profile `ret` now after the tag's data. No handler: one test of a null pointer per `call` tag and VU1 start; frames and cycles unchanged. |
 | `runtime/include/ps2/chain.hpp`, `runtime/src/chain.cpp` (`mesh_path`, `mesh_add`, `mesh_draw`, `run` with an unpack hook), `runtime/src/vif.cpp`, `vif.hpp` (unpack hook in `unpack`, `run_hooked`), `runtime/src/gs/gs.cpp`, `gs.hpp` (`render_mesh`, `kMesh`/`kMeshData`), `runtime/src/gs/queue.hpp`, `runtime/src/gs/gpu/gpu.cpp`, `gpu.hpp` (`draw_mesh`, `mesh_add`, `flush_meshes`, `setup_for`/`add_prim`/`finish_batch`/`dispatch_decodes` split out of `draw`/`flush_batch`, arena `base`, mesh pipelines), `runtime/src/gs/gpu/gs.wgsl` (`raster_mesh`), `runtime/src/gs/gpu/mesh.wgsl` (new: `mesh_build`, `mesh_bin`), `CMakeLists.txt` (`kMeshShader`), `host/main.cpp` (`gpu_mesh` setting) | GPU mesh path (T48, D36): mesh vertices cached on the GPU, strips built and binned there (see [Chain handlers](#chain-handlers-t46)). Off (`PS2_GPU_MESH=0`) or no mesh draws: the same frames and cycles (menu run 107/107, no handler and identity handler). |
+| `runtime/src/emu_count.cpp`, `emu_count.hpp` (new), `CMakeLists.txt`, hooks in `runtime/src/memory.cpp` (EE register accesses), `hw.cpp` (INTC, DMAC interrupts), `kernel.cpp` (syscalls), `dmac.cpp`, `vif.cpp`, `vu_micro.cpp` (VU1 runs by key, VCALLMS), `gs/gif.cpp`, `gs/gs.cpp` (primitives, registers, transfers, mesh strips), `iop/kernel.cpp` (IOP instructions, HLE calls), `iop/hw.cpp`, `iop/spu2.cpp`, `iop/sif.cpp`, `system.cpp` (per frame, exit, off when the window threads start) | Emulation counters (T56): `PS2_EMU_COUNT=<file>`, headless, see [Emulation counters](#emulation-counters-t56). Unset: one test of a false flag per event; frames and cycles unchanged (menu run 107/107, also set). |
 
 The headless Windows build (T22) needs no changes to upstream: the headless path
 leaves out `host/window.cpp` (SDL2), `host/profile.cpp` (Linux only) and the
@@ -755,6 +789,7 @@ python recomp/tests/oracle.py [--mode rec interp ...]     # Windows: vectors on 
 | `tests/test_port.py` | `port.py`'s pure parts: serial from the boot ELF name, default `game.json`, refusal to overwrite, folder `settings.json` |
 | `tests/test_explore.py` | `explore.py` on synthetic frames: frame signature, black/frozen/repeated frames are not new scenes, stall rule, pattern order (stalls in a row try every pattern), generated presses |
 | `tests/test_drawlist.py` | `drawlist.py` on a synthetic chain: log parsing (incl. chain handler lines), chain read and VIF fingerprint, kinds and shares, `--match` at an odd file offset |
+| `tests/test_emucount.py` | `emucount.py` on a synthetic counter file: sections and frame ranges, names, GS state decode, report lines |
 | `tests/harness/` | C++ harness (`main.cpp`: load state, `dispatch`, print state as JSON), `override.cpp` (the override case's C++) and its CMake project (links upstream `ps2runtime`) |
 
 Harness output (fixture C++, build): `work/recomp-tests/`.

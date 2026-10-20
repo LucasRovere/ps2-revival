@@ -1,4 +1,5 @@
 #include "spu2.hpp"
+#include "../emu_count.hpp"
 
 #include "hw.hpp"
 #include "iop.hpp"
@@ -379,6 +380,7 @@ void write_voice(Core &k, std::uint32_t off, std::uint32_t value) {
 }
 
 void key(Core &k, std::uint32_t mask, bool on) {
+    if (on && emu_count::g_on) emu_count::add(emu_count::kSpu2KeyOn, static_cast<std::uint64_t>(&k - g_cores), 0, static_cast<std::uint64_t>(__builtin_popcount(mask)));
     for (int i = 0; i < 24; ++i) {
         if (!(mask & (1u << i))) continue;
         Voice &v = k.voices[i];

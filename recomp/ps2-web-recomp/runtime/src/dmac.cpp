@@ -2,6 +2,7 @@
 
 #include "chain.hpp"
 #include "draw_profile.hpp"
+#include "emu_count.hpp"
 #include "kernel.hpp"
 
 #include "gs/gif.hpp"
@@ -77,6 +78,7 @@ std::uint8_t *target(std::uint32_t address) {
 
 void deliver(int ch, std::uint32_t address, std::uint32_t qwc) {
     if (!qwc) return;
+    if (emu_count::g_on) emu_count::add(emu_count::kDma, static_cast<std::uint64_t>(ch), 0, qwc);
     static std::vector<std::uint8_t> buffer;
     const std::size_t bytes = static_cast<std::size_t>(qwc) * 16;
     const std::size_t room = (address & 0x80000000u) ? kScratchpadSize - (address & (kScratchpadSize - 1)) : kRamSize - (address & (kRamSize - 16));
@@ -188,6 +190,7 @@ void run_normal(int ch) {
     } else if ((c.chcr & 1u) || ch == 2 || ch == 0 || ch == 9) {
         deliver(ch, c.madr, c.qwc);
     } else if (ch == 1) {
+        if (emu_count::g_on) emu_count::add(emu_count::kDma, 1, 1, c.qwc);
         for (std::uint32_t i = 0, n = 1; i < c.qwc; i += n, n = 1) {
             while (i + n < c.qwc && target(c.madr + (i + n) * 16) == target(c.madr + i * 16) + n * 16) ++n;
             gs::read_image(target(c.madr + i * 16), n);
@@ -326,6 +329,7 @@ void start(int ch) {
     c.paused = false;
     c.tag_end = c.qwc && chain_ends_after_current(c);
     ++g_starts[ch];
+    if (emu_count::g_on) emu_count::add(emu_count::kDmaStart, static_cast<std::uint64_t>(ch));
     if (ch == 1 && draw_profile::g_on && ((c.chcr >> 2) & 3u) == 1) draw_profile::chain_start();
     static const bool trace = std::getenv("PS2_TRACE_DMA") != nullptr;
     if (trace) std::fprintf(stderr, "[dma] ch%d chcr 0x%08X madr 0x%08X qwc %u tadr 0x%08X thread %d%s\n", ch, c.chcr, c.madr, c.qwc, c.tadr,
@@ -394,6 +398,7 @@ bool ipu_pull(std::uint8_t *qword) {
         }
     }
     std::memcpy(qword, source(c.madr), 16);
+    if (emu_count::g_on) emu_count::add(emu_count::kDma, 4, 0, 1);
     c.madr += 16;
     if (!--c.qwc && (!chain || c.tag_end)) finish(4);
     return true;
@@ -403,6 +408,7 @@ bool ipu_push(const std::uint8_t *qword) {
     Channel &c = g_ch[3];
     if (!(c.chcr & 0x100u) || !c.qwc) return false;
     std::memcpy(target(c.madr), qword, 16);
+    if (emu_count::g_on) emu_count::add(emu_count::kDma, 3, 0, 1);
     c.madr += 16;
     if (!--c.qwc) finish(3);
     return true;

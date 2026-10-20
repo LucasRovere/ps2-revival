@@ -1,4 +1,5 @@
 #include "hw.hpp"
+#include "../emu_count.hpp"
 
 #include "iop.hpp"
 #include "kernel.hpp"
@@ -105,6 +106,7 @@ void start_dma(unsigned ch) {
     Dma &d = g_dma[ch];
     if (kernel::g_trace_modules) std::fprintf(stderr, "[iop-dma] start ch %u madr 0x%08X bcr 0x%08X chcr 0x%08X\n", ch, d.madr, d.bcr, d.chcr);
     const std::uint32_t words = (d.bcr & 0xFFFFu) * ((d.bcr >> 16) ? (d.bcr >> 16) : 1u);
+    if (emu_count::g_on) emu_count::add(emu_count::kIopDma, ch, 0, words);
     if (ch == 4 || ch == 7) {
         spu2::dma(ch == 4 ? 0 : 1, d.madr, words, (d.chcr & 1u) != 0, static_cast<int>(ch));
         return;
@@ -208,6 +210,7 @@ void ohci_write(std::uint32_t a, std::uint32_t v) {
 }
 
 std::uint32_t read(std::uint32_t a, unsigned size) {
+    if (emu_count::g_on) emu_count::iop_access(a, false);
     if (a >= 0x1F900000u && a < 0x1F900800u) return spu2::read(a, size);
     if (a >= 0x1F801600u && a < 0x1F801660u) return ohci_read(a);
     if (a >= 0x1F808200u && a < 0x1F808280u) return sio2::read(a);
@@ -236,6 +239,7 @@ std::uint32_t read(std::uint32_t a, unsigned size) {
 }
 
 void write(std::uint32_t a, std::uint32_t v, unsigned size) {
+    if (emu_count::g_on) emu_count::iop_access(a, true);
     if (a >= 0x1F900000u && a < 0x1F900800u) { spu2::write(a, v, size); return; }
     if (a >= 0x1F801600u && a < 0x1F801660u) { ohci_write(a, v); return; }
     if (a >= 0x1F808200u && a < 0x1F808280u) { sio2::write(a, v); return; }

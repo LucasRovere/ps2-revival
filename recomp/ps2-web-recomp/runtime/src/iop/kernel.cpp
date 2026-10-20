@@ -1,4 +1,5 @@
 #include "kernel.hpp"
+#include "../emu_count.hpp"
 
 #include "hw.hpp"
 #include "io.hpp"
@@ -383,7 +384,9 @@ std::uint32_t call_guest(std::uint32_t address, std::uint32_t a0, std::uint32_t 
     g_switch = false;
     while (!g_nested_done && guard > 0) {
         std::int64_t budget = kSlice;
+        const std::uint32_t slice_pc = g_cpu.pc;
         execute(g_cpu, budget);
+        if (emu_count::g_on) emu_count::add(emu_count::kIopInstr, slice_pc >> 10, 0, static_cast<std::uint64_t>(kSlice - std::max<std::int64_t>(0, budget)));
         guard -= kSlice - budget;
         switch_wanted |= g_switch;
         g_switch = false;
@@ -572,6 +575,7 @@ void call_hle(Cpu &c, std::uint32_t id) {
         kernel::fault("bad HLE id");
         return;
     }
+    if (emu_count::g_on) emu_count::iop_hle(kernel::g_hle[id].library, kernel::g_hle[id].index);
     kernel::g_hle[id].function(c);
 }
 
@@ -610,7 +614,9 @@ void run(std::uint64_t ee_cycles) {
             budget = std::min<std::int64_t>(budget, static_cast<std::int64_t>(g_events.top().at - g_now));
         if (budget <= 0) budget = 1;
         const std::int64_t given = budget;
+        const std::uint32_t slice_pc = g_cpu.pc;
         execute(g_cpu, budget);
+        if (emu_count::g_on) emu_count::add(emu_count::kIopInstr, slice_pc >> 10, 0, static_cast<std::uint64_t>(given - std::max<std::int64_t>(0, budget)));
         g_now += static_cast<std::uint64_t>(std::max<std::int64_t>(1, given - std::max<std::int64_t>(0, budget)));
     }
 }

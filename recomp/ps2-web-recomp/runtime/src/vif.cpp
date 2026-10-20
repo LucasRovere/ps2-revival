@@ -3,6 +3,7 @@
 #include "chain.hpp"
 #include "dmac.hpp"
 #include "draw_profile.hpp"
+#include "emu_count.hpp"
 #include "gs/gif.hpp"
 #include "gs/queue.hpp"
 #include "hw.hpp"
@@ -70,10 +71,12 @@ void run_vu(int unit, std::uint32_t address) {
     } else {
         u.itop = u.itops;
         vu::set_tops(0, u.itop);
+        if (emu_count::g_on) emu_count::add(emu_count::kVu0, address, 0);
     }
     if (unit == 1 && g_vu_hook) {
         const std::uint64_t start = draw_profile::g_on ? draw_profile::now_ns() : 0;
         if (g_vu_hook(address)) {
+            if (emu_count::g_on) emu_count::add(emu_count::kVu1Hook, address);
             if (draw_profile::g_on) draw_profile::handler_ran(address, draw_profile::now_ns() - start);
             return;
         }
@@ -245,6 +248,7 @@ void execute(int unit, std::uint32_t cmd, const std::uint32_t *data) {
     const std::uint32_t op = (cmd >> 24) & 0x7Fu, imm = cmd & 0xFFFFu, num = (cmd >> 16) & 0xFFu;
     u.code = cmd;
     if (!on_vu_thread()) ++g_commands[unit][op];
+    if (emu_count::g_on) emu_count::add(emu_count::kVif, static_cast<std::uint64_t>(unit), op);
     switch (op) {
     case 0x00: break;
     case 0x01: u.cycle = imm; break;
@@ -301,6 +305,7 @@ std::size_t run(int unit, const std::uint32_t *words, std::size_t count) {
             // NOP, about half of all commands (pilot game: ~100,000 per frame)
             u.code = 0;
             if (!vu_thread) ++g_commands[unit][0];
+            if (emu_count::g_on) emu_count::add(emu_count::kVif, static_cast<std::uint64_t>(unit), 0);
             ++pos;
             continue;
         }

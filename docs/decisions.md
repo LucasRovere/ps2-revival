@@ -813,7 +813,7 @@ intro at scale 3 is GPU-bound with the path on); the fully native renderer
 (T52) replaces the GS renderer for these meshes; another handler needs
 fog or UV output (not in the path: such batches stay on the CPU path).
 
-## D37: Fully native plan for the pilot game (pending owner review)
+## D37: Fully native plan for the pilot game (owner review: D38)
 
 **Decision (T52, 2026-10-19; every point pending owner review):**
 1. **Definition.** Fully native = no emulated hardware while the game runs
@@ -872,3 +872,48 @@ draws from engine overrides); the list reader needs VU1 results it cannot
 compute; the sound driver protocol needs more than two sessions (plan B:
 IOP and SPU2 for sound only, on the host clock); or the second game shows
 the generic layers are not generic.
+
+## D38: Owner review of the fully native plan (D37): accepted with a performance target, no wheel, frame-rate-independent play
+
+**Decision (owner, 2026-10-19, after T52; target baselines from T56,
+2026-10-20):**
+- **Reasoning (owner, verbatim):** "The reasoning is: get rid of emulator
+  performance handcap. A 32MB game should easily run in any phone. We can
+  not get to that level of optimization, but we surely can do better than
+  full emulator path."
+- **Accepted from D37:** (1) no emulated hardware + game code still
+  recompiled + selective decompilation is "fully native"; (2) a generic GS
+  translator for 2D, UI and effects; (3) the pixel-diff bar for the
+  renderer; (4) approximate SPU2 reverb; (5) `.ps2` card image saves kept;
+  (8) renderer first, then IOP and audio.
+- **Performance target, measured after each task:** CPU time per frame per
+  thread at owner settings (window, scale 3, 16:9, texture pack), from the
+  frame log (`PS2_FRAME_LOG`: busy = frame ms minus the thread's waits) and
+  the threads' CPU time. Goal on the order of **< 5 ms total per frame**
+  (all threads) at scale 3. Baselines (T56, pilot game, ms per presented
+  frame, EE / VU / render / total): racing 9.5 / 8.5 / 11.8 / 29.2, race
+  intro 8.4 / 10.2 / 15.5 / 32.1, menus 3.4 / 0.2 / 1.3 / 4.9; headless
+  (one thread) 20-23 ms racing, 23-26 ms race intro, ~3.3 ms menus.
+  Refined split of the goal: VU thread work 0 (mesh kinds and list reader,
+  T60-T62), render thread ≤ 2 ms (native renderer, T57-T62), EE thread
+  ≤ 3 ms (host clock and one picture per present, T67; *unverified* that
+  the game logic alone fits: the counters show the pilot renders more
+  pictures than vblanks in races and spins on INTC_STAT for vblank in menus,
+  so part of today's EE time is not game logic; T62 measures the EE share
+  left). Each task reports the per-thread numbers against these
+  baselines.
+- **(6) No steering wheel:** wheel and USB-wheel support leave the scope;
+  the USB/wheel server answers "no device" (stub).
+- **(7) Frame rate, owner (verbatim):** "90 would be great (I have 144hz).
+  But the most ideal thing is to have the fps not impact in the game
+  experience." Requirement: game speed, physics and audio independent of
+  the frame rate; an optional 90 fps target on a 144 Hz display (T67).
+
+**Why:** the owner's goal is speed, not just a cleaner architecture: the
+emulated path costs ~30 ms of CPU per frame in races at scale 3 for a game
+written for a 300 MHz CPU. A measured target keeps each task honest.
+
+**Revisit if:** the EE thread cannot get near 3 ms without decompiling game
+logic (then the owner decides how far decompilation goes, D37 point 2), or
+the game's physics or timers break above 60 fps (then fixed-step logic with
+interpolation, or cap at the display rate).

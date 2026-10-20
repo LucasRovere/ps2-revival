@@ -1,5 +1,6 @@
 #include "dmac.hpp"
 #include "draw_profile.hpp"
+#include "emu_count.hpp"
 #include "gs/gif.hpp"
 #include "vif.hpp"
 #include "vu_micro.hpp"
@@ -134,6 +135,7 @@ void time_frames() {
 void vblank() {
     ++g_frames;
     draw_profile::frame(g_frames);
+    emu_count::frame(g_frames);
     time_frames();
     apply_presses();
     if (g_options.on_vblank) g_options.on_vblank();
@@ -405,6 +407,7 @@ int run() {
     iop::dump();
     sif::dump();
     write_coverage();
+    emu_count::finish(g_frames);
     if (const char *peek = std::getenv("PS2_PEEK")) {
         std::uint32_t at = 0, len = 0;
         if (std::sscanf(peek, "%x,%x", &at, &len) == 2)
@@ -439,8 +442,14 @@ bool attach_window(const WindowTarget &t) { return gs::attach_window(static_cast
 void resize_window(std::uint32_t width, std::uint32_t height) { gs::resize_window(width, height); }
 bool present_frame() { return gs::present(); }
 void init_graphics() { gs::init(); }
-void start_render_thread() { gs::start_thread(); }
-void start_vu_thread() { gs::queue::vu().start(32u << 20); }
+void start_render_thread() {
+    emu_count::window();
+    gs::start_thread();
+}
+void start_vu_thread() {
+    emu_count::window();
+    gs::queue::vu().start(32u << 20);
+}
 
 std::atomic<double> g_vu_idle_ms{0.0};
 

@@ -1,6 +1,7 @@
 #include "hw.hpp"
 
 #include "dmac.hpp"
+#include "emu_count.hpp"
 #include "gs/gif.hpp"
 #include "gs/gs.hpp"
 #include "iop/sif.hpp"
@@ -139,6 +140,7 @@ void vblank_start() {
 std::uint32_t intc_pending() { return g_intc_stat & g_intc_mask; }
 
 void intc_raise(unsigned cause) {
+    if (emu_count::g_on) emu_count::add(emu_count::kIntc, cause);
     g_intc_stat |= 1u << cause;
     g_intc_latched |= 1u << cause;
     if (g_intc_mask & (1u << cause)) kernel::wake_idle();
@@ -182,6 +184,7 @@ void gs_set_crt(std::uint32_t interlace, std::uint32_t mode, std::uint32_t field
 }
 
 void dmac_raise(unsigned channel) {
+    if (emu_count::g_on) emu_count::add(emu_count::kDmacIrq, channel);
     g_dmac_stat |= 1u << channel;
     if (g_dmac_stat & (0x10000u << channel)) kernel::wake_idle();
 }

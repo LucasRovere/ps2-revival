@@ -1,5 +1,6 @@
 #include "kernel.hpp"
 
+#include "emu_count.hpp"
 #include "hw.hpp"
 #include "iop/sif.hpp"
 #include "ps2/generated.hpp"
@@ -460,6 +461,7 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
     std::uint32_t n = c.r[3].w[0];
     const bool interrupt_variant = (n & 0x80000000u) != 0;
     if (interrupt_variant) n = 0u - n;
+    if (emu_count::g_on) emu_count::add(emu_count::kSyscall, n, c.r[31].w[0]);
     if (n < 0x100u) {
         const std::uint32_t custom = ld32(kSyscallTable + n * 4u);
         if (custom && has_code(custom & 0x1FFFFFFFu)) {

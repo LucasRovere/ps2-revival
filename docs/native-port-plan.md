@@ -2,7 +2,7 @@
 
 Status: **Phases 5–7 and the conversion tool done (except the
 second-game trial); Phase 8 done as far as planned (T36-T48); fully native
-planned (T52, D37, pending owner review).** Order (owner, D31): fully
+planned (T52, D37, owner review D38); survey and emulation counters done (T56).** Order (owner, D31): fully
 native for the pilot game → wrap-up → other games (T40). Phases 6–9 were re-planned (D23, 2026-10-18) around the
 vendored ps2-web-recomp, which already provides most of what the original
 Phases 6 and 7 planned to build. Strategy decisions: D3, D5, D6, D9, D14,
@@ -286,7 +286,7 @@ game draws, with their world matrices and materials, exported to glTF
 from the chain handlers (T51; covers the track geometry whose disc format
 is not decoded).
 
-## Fully native (D26, D37; plan from T52, pending owner review)
+## Fully native (D26, D37, D38; plan from T52, owner review D38)
 
 The end state of a converted game has no PS2 hardware layer. Planned in
 T52 for the pilot game; the order and task list are in
@@ -314,13 +314,16 @@ mesh kinds) is in the local notes, section "Fully native plan (T52)".
   car setup for model replacement, mods). The rest stays recompiled.
   Decompiling all game logic is not part of the week (*estimate:* thousands
   of game functions at tens of checked functions per agent hour is 100+
-  hours; owner question).
+  hours; the owner accepted selective decompilation, D38).
 - **Done for the pilot game when:** (1) a `native` build of the port links
   without the emulation modules above and plays; (2) the emulation
   counters (T56) are zero over the scripted runs (menu, save, load, race
   intro, racing) and an exploration run; (3) owner play test at owner
   settings (16:9, texture pack, display resolution): title, menus, garage,
-  a full race, save and load, sound; 60 fps without dips the owner notices.
+  a full race, save and load, sound; 60 fps without dips the owner notices;
+  game speed, physics and audio independent of the frame rate (90 fps on a
+  144 Hz display as an option, D38); the performance target below met or
+  its gap explained.
 
 ### How we verify
 
@@ -337,6 +340,19 @@ mesh kinds) is in the local notes, section "Fully native plan (T52)".
   (length, levels, envelope), the owner listens.
 - **Timing:** a test mode keeps the emulated clock (deterministic frames
   for every comparison); play mode uses the host clock.
+- **Performance (D38), after every task:** CPU time per presented frame per
+  thread at owner settings (window, scale 3, 16:9, pack), from the frame log
+  (`PS2_FRAME_LOG`: a thread's busy time = frame ms minus its wait columns;
+  EE: `ee_present`, `ee_ring`, `ee_pace`, `ee_other`; VU: `vu_ring`,
+  `vu_idle`; render: `render_idle`) and the threads' CPU time. Goal on the
+  order of < 5 ms total at scale 3 (VU 0, render ≤ 2, EE ≤ 3, the EE part
+  *unverified*). Pilot baselines (T56): races ~29-32 ms total (EE 8-10, VU
+  8-10, render 12-16), menus ~5 ms. Numbers in the local notes.
+- **Emulation counters (T56):** `PS2_EMU_COUNT` + `recomp/emucount.py`
+  ([recomp/README.md](../recomp/README.md)): per scene, what emulated hardware
+  runs and how much (IOP instructions, VU1 programs, VIF, DMA, GIF, GS,
+  EE register accesses by guest function, SPU2, SIF RPC, syscalls) and the
+  GS census. Every native task names the counters it brings to zero.
 - **Playable at every step:** each native piece has an on/off setting (as
   `gpu_mesh`), is on by default only after its checks, and the old path
   stays until the `native` build (T68).
@@ -395,18 +411,20 @@ native renderer          native IOP servers         host clock, OS layer
 - **Audio:** a native mixer (generic: VAG ADPCM decode, voices with pitch,
   volume, ADSR, streams; host audio thread on the host clock) behind the
   game's sound-driver server. Replaces SPU2 and the IOP sound modules; T30
-  is dropped. Reverb approximated or left out (owner question).
+  is dropped. Reverb approximated (D38).
 - **Input:** the pad server writes the pad state into the game's buffer
-  from SDL each frame (pressure buttons, rumble). Wheel devices: "no
-  device" first (owner question).
+  from SDL each frame (pressure buttons, rumble). Wheel devices: out of
+  scope (D38), the USB/wheel server answers "no device".
 - **Files and disc:** the CD/DVD and file servers read the port folder
   (D27) or the ISO through the existing disc reader; mods (D29) keep working.
 - **Saves:** the memory card server works on the card image (`.ps2`, T34),
-  so PCSX2 saves keep loading (owner question: or plain save files).
+  so PCSX2 saves keep loading (D38).
 - **Timing:** play mode: the game's hardware timer reads come from the host
   clock, vblank callbacks from the present loop; the frame rate may go
-  above 60 (the pilot measures its own timestep, D11). Test mode: emulated
-  clock.
+  above 60 (the pilot measures its own timestep, D11); game speed, physics
+  and audio must not depend on it (D38: optional 90 fps on a 144 Hz display;
+  the game renders once per present instead of as often as the emulated EE
+  allows). Test mode: emulated clock.
 
 ### Game-specific vs generic (D24)
 
@@ -443,6 +461,33 @@ sound servers.
 
 Pace (*estimate*): 17 tasks, about 19 sessions, about a week at the pace of
 Phases 0-8. The renderer (T57-T62) is half of it and holds most of the risk.
+
+### Survey method (T56, generic)
+
+1. Headless runs with `PS2_EMU_COUNT` (and `PS2_GPU_MESH=0`, so every
+   primitive reaches the GS census) from boot through the menus and from
+   saved states for the heavy scenes; scene ranges from a contact sheet of
+   the frame dumps (`emucount.py file@from-to`).
+2. Read per scene: which hardware is used at all (often VIF0, VU0 micro
+   mode, IPU, SPR and SIF DMA channels are not), the EE functions that touch
+   registers (the override list: vblank waits, DMA kick and wait, timer
+   library), the SIF syscall callers and RPC servers with call rates and
+   buffer sizes (the IOP server list), IOP instructions per module (which
+   modules really run), SPU2 key-ons and DMA (voices or streams).
+3. GS census: the union of state modes (the translator's feature list),
+   frame buffers drawn, textures read from them (render targets, also read
+   in another format), transfers (downloads = EE reads from the GS).
+4. Baselines for the performance target: headless `PS2_TIME` per scene and
+   window runs with the frame log at owner settings.
+
+Findings on the pilot game that are likely common (details local):
+frame buffers re-read in another format (a 32-bit frame read as 16-bit
+for post effects), FBMSK bit masks that no colour write mask can express,
+alpha-test fail modes (RGB only, FB only, Z only) used as write masks,
+destination-alpha blends, mipmaps with per-draw LOD (K, MXL); a game that
+does not wait for vblank in races renders more pictures than are shown
+(the instant emulated GS lets it), menus that spin on INTC_STAT for vblank;
+music and movie audio as streamed PCM rather than SPU2 voices.
 
 ### Risks and when to revisit
 

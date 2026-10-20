@@ -1,6 +1,7 @@
 #include "gif.hpp"
 
 #include "../draw_profile.hpp"
+#include "../emu_count.hpp"
 #include "gs.hpp"
 #include "queue.hpp"
 
@@ -77,6 +78,7 @@ struct GsSink {
     int path;
     void tag(const Path &p, const Reg128 &q) {
         ++g_tags[path][p.flg];
+        if (emu_count::g_on) emu_count::add(emu_count::kGifTag, static_cast<std::uint64_t>(path), p.flg);
         gs::g_state.q = 1.0f;
         if (((q.d[0] >> 46) & 1u) && p.flg == 0) gs::write(0x00, (q.d[0] >> 47) & 0x7FFu);
     }
@@ -168,6 +170,7 @@ void render(int path, const std::uint8_t *data, std::uint32_t qwc) {
 
 void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {
     if (!gs::queue::active()) {
+        if (emu_count::g_on) emu_count::add(emu_count::kGif, static_cast<std::uint64_t>(path), 0, qwc);
         if (draw_profile::g_on && path != 3) {
             const std::uint64_t start = draw_profile::now_ns();
             render(path, data, qwc);

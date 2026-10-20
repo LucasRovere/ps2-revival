@@ -6,64 +6,71 @@ fits in one session.
 
 ## Next task
 
-### T56: native: survey and emulation counters
+### T57: native: GS-draw translator
 
-**Goal:** know exactly what still runs emulated in the pilot game, per
-scene, and have a counter for it that every later fully-native task (D37)
-uses as its measure and the final check (T68) needs to be zero.
+**Goal:** the first native renderer layer: the GS primitives the pilot game
+draws, with the GS states it uses, drawn by WebGPU render pipelines into
+native targets at any resolution, fed by the existing VIF/VU1 output; a
+generic pixel-diff tool that sets the renderer bar (D37, D38).
 
 **Context:**
-- Plan: `docs/native-port-plan.md` "Fully native", D37 (pending owner
-  review: if the owner changed the plan, follow the owner). Local notes
-  "Fully native plan (T52)" lists the pilot's hardware-touching functions
-  (rough scan), modules, RPC ids and mesh kinds known so far.
-- What exists: draw profile and frame log (T45), coverage (T39), chain
-  handlers and GPU mesh path (T46, T48), trace flags (`--trace-iop`,
-  `--trace-io`, `/diagnose-hang`). Saved states for menus, race intro and
-  racing are in the local notes (T36, T45, T53 sections).
-- T57-T62 (renderer) need: every GS state and primitive kind the pilot
-  uses, render targets (frame-buffer addresses drawn to and later read as
-  textures), EE reads from the GS (downloads, SIGNAL/FINISH/LABEL, CSR
-  polls), DMA channels in use. T63-T66 (IOP) need: every RPC server bound,
-  its call ids, counts and buffer sizes; who calls SIF DMA directly.
+- Plan: `docs/native-port-plan.md` "Fully native" (architecture, how we
+  verify, survey method, performance target), D37, D38.
+- T56's GS census (local notes "Survey and emulation counters (T56)"): the
+  feature list (primitives, texture formats and CLUTs, filters and mipmaps,
+  blend equations incl. destination alpha, alpha-test fail modes, Z modes,
+  FBA, DTHE, FBMSK), the render targets and the textures read from them,
+  transfers (uploads in play; downloads only on a loading screen). Counter
+  files and reports in `work/t56/` (`features.txt`, `*_full.txt`).
+- Where draws come from today: `gs::write`/`gs::kick` (`gs/gs.cpp`), the
+  GPU mesh path's `mesh_draw` (T48), the GS renderer's texture decode and D25
+  pack keys (`gs/gpu/gpu.cpp`, `texpack.cpp`).
+- Baselines for the performance target (D38, local notes): window scale 3
+  racing EE 9.5 / VU 8.5 / render 11.8 ms per frame, race intro 8.4 / 10.2
+  / 15.5, menus 3.4 / 0.2 / 1.3.
 
 **Scope:**
-1. Emulation counters, opt-in (`PS2_EMU_COUNT=<file>`, vendored patch,
-   listed in `recomp/README.md`): per run and per 100 frames, counts of
-   IOP instructions, VU1 program runs (by key), VIF1/VIF0 commands, DMA
-   transfers per channel, GIF packets per path, GS primitives drawn, GS
-   register writes, EE hardware register reads/writes by block (timers,
-   INTC, DMAC, VIF, GIF, GS, IPU, SIF) with the top guest PCs, SPU2 voice
-   key-ons, SIF RPC calls per server id and function. Unset: frames and
-   cycles unchanged.
-2. A report script (`recomp/emucount.py`, unit test like `drawlist.py`):
-   tables per scene, top PCs mapped to functions from the analysis export.
-3. GS census for the renderer (headless, from the saved states: menus,
-   race intro, racing, a loading screen, an intro movie): GS states used
-   (ALPHA, TEST, FBA, ZBUF/FRAME formats, TEX0 formats, CLAMP, TEX1
-   filtering, PRIM kinds, PABE, DTHE, SCANMSK), frame and Z buffers drawn
-   per frame, textures read from addresses drawn earlier (render to
-   texture), EE reads from the GS. Record in the local notes; generic
-   method in the plan doc.
-4. RPC census for the IOP: servers, call ids, counts, sizes; sound and
-   stream traffic per scene; which EE functions call SIF directly
-   (bind/call/DMA) as the overrides list for T63.
-5. Update the T57-T66 backlog items with what the census shows (split or
-   merge where the numbers say so).
+1. `recomp/native/` (our code, outside the vendored tree) with one small
+   hook patch in the vendored build (CMake + the GS write/kick seam and the
+   mesh draw), listed in `recomp/README.md`. `PS2_RENDERER=native` (window
+   and headless readback for frame dumps); unset: frames and cycles as
+   before.
+2. Translator: tri strips, tri fans, sprites (the kinds T56 found; others
+   logged once); vertex formats (XYZF2/3, ST/Q, UV with FST, RGBAQ, IIP);
+   textures T4/T8 with CT32 CLUTs (CSM0), CT16S, CT16, CT32, decoded once per
+   upload into native textures with the D25 keys (packs keep working), TEXA,
+   MODULATE/DECAL with TCC, linear/nearest filters and the game's own mip
+   levels (MIPTBP1/2, MXL, K); blend equations of the census as fixed
+   function (destination alpha from the target's alpha), alpha test
+   (GREATER with ref, NEVER with fail RGB_ONLY / FB_ONLY / ZB_ONLY as write
+   masks), Z24 tests and ZMSK, FBA, FBMSK FF000000 as an alpha write mask;
+   DTHE may be left out (say so). Targets: the main 32-bit frame with its Z
+   and the 16-bit target read back as a texture in the same format; the
+   display from the copy target the game shows.
+3. Pixel-diff tool (generic, `recomp/`): two frame folders → per frame mean
+   difference, share of pixels over a threshold, diff images; unit test.
+4. Counters: GS primitives drawn by the translator vs the GS raster (a
+   counter kind or a log line), so T59/T68 can see the GS raster at zero.
 
 **Success criteria:**
-- Counters unset: menu run 107/107 frames byte-identical, cycles
-  52,595,993,647 (local baseline); set: same frames and cycles.
-- Reports for at least menus, race intro and racing, with the GS state set
-  and render-target list in the local notes; every number from a run.
-- The overrides list for T63 and the GS feature list for T57/T58 are in
-  the local notes; nothing game-specific in git.
+- Translator off: menu run 107/107 frames byte-identical, cycles
+  52,595,993,647; on: cycles unchanged (renderer changes must not change
+  EE behaviour).
+- Menus (s5850 state), race intro and racing frames against the GS path:
+  thresholds set from these frames and written down; diff images looked at;
+  what differs and why listed (effects left for T58 named).
+- Window runs at owner settings with the frame log: render thread ms per
+  frame against the T56 baselines (D38); headless `PS2_TIME` too.
+- Nothing game-specific in git (`git grep -i`).
 
-**Out of scope:** any native replacement (T57 on); speed work.
+**Out of scope:** format reinterpretation (a 32-bit target read as 16-bit,
+FBMSK bit masks like 00003FFF), GS downloads, fades and frame blends,
+display registers beyond the shown buffer (T58); mesh kinds (T60/T61);
+default on (T59).
 
 ## Backlog
 
-Ordered (owner D31, plan T52/D37 pending owner review): fully native for
+Ordered (owner D31, plan T52/D37, owner review D38): fully native for
 the pilot game, then wrap-up, then other games. The finishing agent turns
 the top item into the next "Next task", with the same level of detail as
 above. Plan: [native-port-plan.md](native-port-plan.md) "Fully native".
@@ -72,82 +79,96 @@ Game-specific details: `local/games/<serial>/notes.md` ("Fully native plan
 Every native piece gets an on/off setting and is on by default only after
 its checks; the old path stays until T68.
 
-Fully native, renderer (D37):
+Fully native, renderer (D37, D38):
 
-1. **T57: native: GS-draw translator.** New `recomp/native/` (our code,
-   one small CMake/hook patch in the vendored tree): GS primitives
-   (triangles, strips, sprites) with the states T56 found drawn by WebGPU
-   render pipelines into native targets at any resolution; textures
-   decoded once per upload (CLUT formats), D25 keys kept (packs work);
-   fed by the existing VIF/VU1 output (`PS2_RENDERER=native`, window and
-   headless readback). Pixel-diff tool (generic, `recomp/`): per frame
-   mean difference, share over a threshold, diff image. Check: menus and
-   racing from the saved states against the GS path, cycles unchanged;
-   thresholds set from these frames.
-2. **T58: native: render targets and effects.** Targets found by
-   frame-buffer address (render to texture, frame copies, fades, frame
-   blend, glow), display output from the display registers, 16:9 and any
-   output size, EE reads from the GS answered. Check: every scene of the
-   scripted runs within the T57 thresholds, diff images looked at.
-3. **T59: native: renderer coverage and default on.** All scenes T56
-   lists (incl. intro movies, loading, fade screens), window speed at
-   owner settings (frame log), MSAA off; on by default if it passes.
-   **Owner check:** a short play in the window.
-4. **T60: native: pre-lit mesh kind.** The pilot's pre-lit scenery as a
+1. **T58: native: render targets and effects.** Targets found by
+   frame-buffer address in any format: a target re-read in another format
+   (the pilot reads its 32-bit frame as 16-bit for post effects, drawing
+   with FBMSK bit masks such as 00003FFF: shader-side bit work), frame
+   copies, fades, frame blend, glow; display output from the display
+   registers, 16:9 and any output size; EE reads from the GS answered (the
+   pilot: downloads only on a loading screen, FINISH events). Check: every
+   scene of the scripted runs within the T57 thresholds, diff images looked
+   at, render thread time against the D38 baselines.
+2. **T59: native: renderer coverage and default on.** All scenes T56 lists
+   (logos, intro movie: CT32 uploads drawn as sprites, title, menus,
+   loading, race intro, racing), window speed at owner settings (frame log,
+   per-thread ms), MSAA off; on by default if it passes; GS raster counter
+   0 with it on. **Owner check:** a short play in the window.
+3. **T60: native: pre-lit mesh kind.** The pilot's pre-lit scenery as a
    WGSL pipeline over vertex buffers from the chain cache (T48), the setup
    program's matrices in a uniform, hardware clipping (no VU1 clipper);
    VU1 off for that kind. Check: pixel diff against T59, VU1 runs of the
-   kind 0 (counters), speed.
-5. **T61: native: car and other mesh kinds.** The car programs (lighting
-   from normals and lights, env map) and the other VU1 kinds T56 finds
-   (sprite-like and the rest) as pipelines; VU1 runs 0 in every scene
-   (compiled VU1 fallback counted). Check as T60. May split in two
-   (cars; the rest).
-6. **T62: native: list reader and kick overrides.** At the engine's frame
+   kind 0 (`emucount.py`), VU thread ms.
+4. **T61: native: car and other mesh kinds.** The car programs (lighting
+   from normals and lights, env map) and the other VU1 programs: T56 counted
+   many more program keys than the pre-lit and car batches (local notes):
+   group them by fingerprint first (`drawlist.py`), then pipelines; VU1
+   runs 0 in every scene. Likely two sessions (cars; the
+   rest): split when starting.
+5. **T62: native: list reader and kick overrides.** At the engine's frame
    kick our code walks the frame's DMA list in guest RAM (tags, VIF unpacks
    into a constant file, GIF packets) and calls the mesh kinds and the
-   translator; the engine's kick, DMA wait and VIF/GS interrupt functions
-   become overrides (local). DMAC, VIF and GS register counters 0 in every
-   scene. Check: pixel diff, scripted runs reach the same screens.
+   translator; the functions T56's counters found touching DMAC/VIF/GIF/GS
+   registers (DMA wait, frame-list kick, frame copy kick and a few more,
+   local notes) become overrides (local). DMAC, VIF, GIF and GS register
+   counters 0 in every scene; EE thread ms measured (how much of it is game
+   logic: D38's EE part). Check: pixel diff, scripted runs reach the same
+   screens.
 
-Fully native, IOP and audio (D37):
+Fully native, IOP and audio (D37, D38):
 
-7. **T63: native: IOP server framework and file servers.** SIF functions
-   (found by rules: strings, RPC ids; generic finder in `analysis/` or
-   `recomp/`) overridden; RPC calls go to native servers in-process; RPC
-   logger and a compare mode (same request through the emulated IOP and
-   the native server, replies diffed). Servers: module loader, IOP heap,
-   IOP reboot (succeed), file I/O and CD/DVD from the port folder or ISO
-   (reuse `iop/cdvdfsv.cpp`, disc reader, mods). Check: replies match in
+6. **T63: native: SIF layer and file servers.** The EE's SIF functions
+   (T56 lists the SIF syscall callers: SifSetDma/SifSetDChain/SifDmaStat
+   wrappers, sceSifInitCmd/InitRpc/BindRpc/ResetIop/SyncIop; a generic
+   finder by rules in `analysis/` or `recomp/`) overridden; RPC calls go to
+   native servers in-process; RPC logger and compare mode (same request
+   through the emulated IOP and the native server, replies diffed). The
+   runtime already serves the CD/DVD, file I/O, loader and IOP heap RPCs
+   natively (T56: all their calls are HLE): move them behind the layer,
+   IOP reboot succeeds, debug-print bind answered. Check: replies match in
    compare mode, menu/save/load runs reach the same screens, exploration
-   baseline unchanged.
-8. **T64: native: pad, card and USB servers.** Pad state from SDL into the
-   game's buffer (pressure, rumble), memory card server on the `.ps2` image
-   (PCSX2 saves still load), USB/wheel drivers answer "no device". IOP CPU
-   runs only the sound modules. Check: save and load runs both ways, a
-   PCSX2 save loads. **Owner check:** pad feel in the window.
-9. **T65: native: sound driver survey.** The game's sound and stream
-   drivers: their RPC protocol from the EE client code, the IRX code
-   (Ghidra, IOP language) and the RPC log (commands per scene, buffers,
-   stream handshakes); what the native mixer must do (voices, ADSR, pitch,
-   reverb, streams, movie audio). Local notes; the generic mixer API
-   written down. May merge into T66 if the protocol is small.
-10. **T66: native: mixer and sound servers.** Generic mixer (`recomp/native/`:
-    VAG ADPCM, voices, ADSR, pitch, volume, streams, host audio thread) and
-    the game's sound/stream servers (local). SPU2 and IOP CPU off. Check:
-    WAV dumps against the emulated path (length, levels, envelope) for
-    menus, a movie and racing; IOP and SPU2 counters 0. **Owner check:**
-    listening. Plan B if it does not fit in two sessions (D37).
+   baseline unchanged, IOP HLE and SIF counters.
+7. **T64: native: pad, card and USB servers.** Pad state from SDL into the
+   game's buffer (T56: the pad module sends its data every frame by SIF DMA,
+   the pad RPC is used only at boot; pressure, rumble), memory card server
+   on the `.ps2` image (D38; the game polls it every frame), USB and
+   wheel drivers answer "no device" (D38: no wheel; today the wheel driver runs on the IOP every frame
+   and the EE keeps sending it a USB command). IOP CPU runs only the sound and stream
+   modules. Check: save and load runs both ways, a PCSX2 save loads.
+   **Owner check:** pad feel in the window.
+8. **T65: native: sound and stream survey.** T56 found almost no SPU2
+   voice key-ons in menus, intro and racing; music and movie audio come as
+   PCM through the game's stream server and SPU2 core1 DMA (a full
+   48 kHz stereo stream in the movie); the sound driver module is
+   nearly idle there. First a longer racing and garage run for effects and
+   engine sounds (key-ons, the sound driver's RPC), then the protocols from
+   the EE client code, the IRX code and the RPC log. Likely merges into T66
+   if the voice side stays small.
+9. **T66: native: mixer and sound servers.** Generic mixer
+   (`recomp/native/`: PCM streams first, VAG ADPCM voices, ADSR, pitch,
+   volume, approximate reverb (D38), host audio thread on the host clock)
+   and the game's stream/sound servers (local). SPU2 and IOP CPU off. Check:
+   WAV dumps against the emulated path (length, levels, envelope) for
+   menus, a movie and racing; IOP and SPU2 counters 0. **Owner check:**
+   listening. Plan B if it does not fit in two sessions (D37).
 
-Fully native, finish (D37):
+Fully native, finish (D37, D38):
 
-11. **T67: native: host clock and frame loop.** Play mode: hardware timer
-    reads from the host clock, vblank callbacks from the present loop,
-    timer interrupts from host timers, no emulated EE clock pacing; frame
-    rate above 60 as an option (D11). Test mode keeps the emulated clock.
-    Check: race timer against a stopwatch, physics at 60 and above,
-    scripted runs in test mode unchanged.
-12. **T68: native: native build and full check.** A `native` build of the
+10. **T67: native: host clock and frame loop.** Play mode: hardware timer
+    reads from the host clock (T56: the SDK timer library functions, local
+    notes), vblank callbacks from the present loop, timer interrupts from
+    host timers, no emulated EE clock pacing; the vblank wait (the pilot
+    spins on INTC_STAT in sceGsSyncV in menus) becomes a real wait; one
+    picture per present (the pilot renders more pictures than vblanks
+    in races today).
+    Requirement (D38): game speed, physics and audio independent of the
+    frame rate; optional 90 fps target for a 144 Hz display (owner);
+    sub-steps or a cap if physics misbehave (D11 revisit). Test mode keeps
+    the emulated clock. Check: race timer against a stopwatch, physics and
+    audio at 60, 90 and uncapped, scripted runs in test mode unchanged, EE
+    thread ms against D38.
+11. **T68: native: native build and full check.** A `native` build of the
     port without the emulation sources (GS raster, VIF, VU1, IOP CPU, SPU2,
     IPU, SIF DMA, SIO2): it links and plays; counters zero over the
     scripted runs and an exploration run; port folder and `play.py` use it.
@@ -156,37 +177,37 @@ Fully native, finish (D37):
 
 After fully native:
 
-13. **T69: look: extras in the native renderer (was T50).** Forced best
+12. **T69: look: extras in the native renderer (was T50).** Forced best
     LOD (EE override of the LOD pick), per-pixel lighting for cars and
     scenery, MSAA, draw distance; the owner picks from frames.
-14. **T70: mods: car model replacement (was T49).** A glTF model (T14/T44
+13. **T70: mods: car model replacement (was T49).** A glTF model (T14/T44
     export, edited) drawn in place of a car's mesh kind draws with the
     game's matrices and lights and its own textures; LOD and part choice
     stay the game's.
-15. **T71: decompile: tools and a first subsystem.** Generic difftest
+14. **T71: decompile: tools and a first subsystem.** Generic difftest
     harness (record a function's calls in a run: arguments and touched
     memory; replay them against an override; compare memory and results)
     and a `/decompile` skill; first use on the frame loop and timestep
     (local). Owner decides how far decompilation goes (D37).
-16. **T72: wrap-up: native conversion method.** Docs and a `/native-port`
+15. **T72: wrap-up: native conversion method.** Docs and a `/native-port`
     skill (survey, translator check, mesh kinds, IOP servers, sound
     driver, native build); generic vs per-game list checked; then T40.
 
 Phase 9 leftovers (after T72):
 
-17. **T44: assets: mesh export options (local tools only).** The pilot
+16. **T44: assets: mesh export options (local tools only).** The pilot
     game's glTF export (T14, `local/games/<serial>/tools/`) with options
     for upgrade kits (the part variants next to the stock parts) and paint
     colour; check renders with `tools/gltfview.py` against the port's
     frames.
-18. **T51: assets: scene capture to glTF (re-scoped by T52).** Generic:
+17. **T51: assets: scene capture to glTF (re-scoped by T52).** Generic:
     the native renderer writes what a frame draws (each mesh once, world
     matrices, materials, textures) as a glTF scene; on the pilot a track
     section, checked by `tools/gltfview.py` renders against frames.
 
 Other games (after the pilot game is fully native, D31):
 
-19. **T40: conversion tool: second-game trial.** Full text in
+18. **T40: conversion tool: second-game trial.** Full text in
     `docs/tasks.md` at `e51cf7b` ("Next task"); in short: run a second game
     from the owner's discs (ISO already listed in `local/MACHINE.md`)
     through `/port-game` (`port.py init <iso> --textures`) with no
@@ -260,4 +281,5 @@ Results with game-specific numbers: `local/games/<serial>/notes.md`.
 | T53: recomp: menu dips (pack loads off the render thread) | 2026-10-19 | Texture pack images decoded by loader threads from the start (pilot pack 1.3 s), a lookup decodes or waits so frames never depend on timing: window menu run at scale 3 max frame 782 → 73 ms, frames over 33 ms 31 → 8, p99 32.6 → 28.1 ms; race intro max 194 → 40 ms; frames with the pack byte-identical, no pack 107/107 and same cycles; options, dialogs and main menu clean (max 21.5 ms); GPU-bound fade screens at scale 3 found (game draws the full screen many times per frame, ~40 ms GPU), not fixed: T54, owner pick | `098850f` |
 | T46: recomp: chain handlers (first: pre-lit static meshes) | 2026-10-19 | Runtime seam (D35): a handler claims VIF1 `call` targets on the EE thread, gets the chain's words where VIF1 runs them (one packet to the VU thread in the window) and runs them through `chain::run` with a hook at each VU1 start; `recomp.chain_handler` built in by `port.py`; VU1 costs no EE cycles, so none charged; no handler: menu 107/107, same cycles, speed within noise; identity handler byte-identical; pilot's pre-lit scenery (local): three batch programs re-done on the CPU with the VU float ops, 0 VU1-memory differences in 15 M checked batches, racing/race intro/menu frames byte-identical, same cycles, ~20% less VU1 work for those batches, frame times unchanged (speed is T48's); owner: T54 fades accepted, decoded pack in RAM OK (D34) | `4b2f4fe` |
 | T48: recomp: GPU mesh path | 2026-10-19 | The pilot's pre-lit scenery drawn from vertex data cached on the GPU: the handler keeps each chain's batch input from its first call, later calls skip the batch unpacks (VIF state still advances) and send one `MeshDraw` per kick; the GPU builds the primitive records with VU1's arithmetic (bit-exact) and bins/shades them per tile (CPU chunk lists, `mesh_bin`, `raster_mesh`): frames byte-identical (racing, race intro, menu, scale 3 with pack), same cycles; headless racing 25.5 → 22.1 ms (scale 1), 27.0 → 23.1 (scale 3), race intro 29.8 → 23.2 / 30.6 → 26.0; window race intro lowest 1 s 40 → 56 fps (scale 1), 36 → 47 (scale 3), render thread 78% → 69% racing at scale 3; on by default (D36), `gpu_mesh` / `PS2_GPU_MESH=0` off; follow-ups T55; owner: T52 next | `06c0a46` |
-| T52: plan: fully native | 2026-10-19 | Plan for the pilot game with no emulated hardware (D37, pending owner review): native renderer in three layers (generic GS-draw translator on WebGPU render pipelines, per-engine mesh kinds as shaders, list reader at the frame kick), native IOP servers behind SIF overrides (generic Sony modules, per-engine sound driver) with a native mixer, host clock; game code stays recompiled, decompilation selective (D5); done = `native` build without emulation modules, emulation counters zero, owner play test; T56-T72 (~19 sessions, *estimate*); T47, T55, T29, T30 dropped, T49/T50 → T70/T69; rough export scan: ~1% of functions touch hardware directly | this commit |
+| T52: plan: fully native | 2026-10-19 | Plan for the pilot game with no emulated hardware (D37; owner review D38): native renderer in three layers (generic GS-draw translator on WebGPU render pipelines, per-engine mesh kinds as shaders, list reader at the frame kick), native IOP servers behind SIF overrides (generic Sony modules, per-engine sound driver) with a native mixer, host clock; game code stays recompiled, decompilation selective (D5); done = `native` build without emulation modules, emulation counters zero, owner play test; T56-T72 (~19 sessions, *estimate*); T47, T55, T29, T30 dropped, T49/T50 → T70/T69; rough export scan: ~1% of functions touch hardware directly | `60ce1f6` |
+| T56: native: survey and emulation counters | 2026-10-20 | `PS2_EMU_COUNT` (vendored, headless, opt-in: menu run 107/107 and same cycles set or unset) + `recomp/emucount.py`: per scene IOP instructions per module, VU1 programs by key, VIF, DMA, GIF, GS, EE register accesses by guest function, syscalls, SIF RPC, SPU2, and a GS census (modes, targets, render-to-texture, transfers); owner answers to T52 recorded (D38: performance target, no wheel, frame-rate-independent play); pilot: VIF0, VU0 micro, IPU unused, a 32-bit frame re-read as 16-bit, downloads only on a loading screen, audio mostly streamed PCM; baselines window scale 3 racing ~29 ms CPU per frame (EE 9.5, VU 8.5, render 11.8) | this commit |
