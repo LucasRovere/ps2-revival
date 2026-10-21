@@ -71,14 +71,28 @@ std::map<std::string, std::uint64_t> g_missing;
 enum Time { T_REBUILD, T_DECODE, T_UPLOAD, T_TAG, T_SUBMIT, T_PRESENT, T_ACQUIRE, T_TIMES };
 enum Count { C_REBUILD, C_PASS, C_DRAW, C_COPY, C_SUBMIT, C_UPLOAD, C_DECODE, C_DISPATCH, C_COUNTS };
 bool g_time = false;
-double g_time_ms[T_TIMES] = {}, g_gpu_ms = 0.0;
+double g_time_ms[T_TIMES] = {}, g_gpu_ms[4] = {};
 std::uint64_t g_counts[C_COUNTS] = {}, g_gpu_frames = 0, g_timed_presents = 0;
 // GPU time: a timestamp at the start and end of every command encoder, summed per present.
-constexpr std::uint32_t kStamps = 512;
+// PS2_NATIVE_TIME=2 (timestamps inside passes) also around every GS memory dispatch (kinds 1-3: upload, CLUT
+// load, decode); they add GPU time of their own.
+constexpr std::uint32_t kStamps = 4096;
 WGPUQuerySet g_stamps = nullptr;
 WGPUBuffer g_stamp_resolve = nullptr, g_stamp_read[3] = {};
-bool g_stamp_busy[3] = {};
-std::uint32_t g_stamp_count = 0, g_stamp_ring = 0;
+bool g_stamp_busy[3] = {}, g_stamps_inside = false;
+std::uint32_t g_stamp_count = 0, g_stamp_ring = 0, g_encoder_stamp = ~0u;
+struct StampPair {
+    std::uint32_t start, kind;  // end = start + 1
+};
+std::vector<StampPair> g_stamp_pairs, g_stamp_pairs_read[3];
+
+// Reserves a pair of timestamps; ~0u when the query set is full.
+std::uint32_t stamp_pair(std::uint32_t kind) {
+    if (!g_stamps || g_stamp_count + 2 > kStamps) return ~0u;
+    g_stamp_pairs.push_back({g_stamp_count, kind});
+    g_stamp_count += 2;
+    return g_stamp_count - 2;
+}
 
 struct Timer {
     Time what;
@@ -99,6 +113,12 @@ void missing(const std::string &what) {
     if (g_missing[what]++ == 0) std::fprintf(stderr, "[native] not done yet: %s\n", what.c_str());
 }
 
+// A view's index in the current texture table (table: g_table_serial when it was added).
+struct Slot {
+    std::uint64_t table = 0;
+    std::uint32_t index = 0;
+};
+
 struct Target {
     std::uint32_t fbp = 0, fbw = 0, psm = 0, width = 0, height = 0;
     WGPUTexture tex = nullptr;
@@ -108,7 +128,8 @@ struct Target {
     WGPUTexture copy = nullptr;
     WGPUTextureView copy_view = nullptr;
     std::uint32_t copy_version = ~0u;
-    WGPUBindGroup group = nullptr, copy_group = nullptr, dest_group = nullptr;
+    WGPUBindGroup dest_group = nullptr;
+    Slot slot, copy_slot;
     // GS pixels drawn since the copy was made (x0, y0, x1, y1).
     std::int32_t dirty[4] = {0, 0, 0, 0};
     // A 16-bit view of a 32-bit target's memory (same width, from page row prow): drawn and read as its own
@@ -129,7 +150,7 @@ struct Depth {
 struct Texture {
     WGPUTexture tex = nullptr;
     WGPUTextureView view = nullptr;
-    WGPUBindGroup groups[4] = {};
+    Slot slot;
     std::uint64_t used = 0;
 };
 
@@ -138,7 +159,8 @@ std::uint64_t g_stamp = 0;
 std::unordered_map<std::uint64_t, Depth> g_depths;
 std::unordered_map<std::uint64_t, Texture> g_textures;
 std::uint64_t g_texture_clock = 0;
-WGPUBindGroup g_blank_group = nullptr, g_blank_dest_group = nullptr;
+WGPUTextureView g_blank_view = nullptr;
+WGPUBindGroup g_blank_dest_group = nullptr;
 
 // Kept alive until the commands that use them are submitted.
 std::vector<WGPUTexture> g_dead_textures;
@@ -157,14 +179,16 @@ struct Params {
     std::uint32_t flags;
     float tex_size[2], store_size[2], aref, lod_l, lod_k, mxl, ta0, ta1;
     // Masked draws: FBMSK (plus channels the draw does not write) and ALPHA | FIX << 8 | blend on << 16.
+    // F_FACTORS: blend = the factor kinds on Cs (bits 0-1) and Cd (2-3), C is FIX (4), FIX << 8.
     std::uint32_t fbmsk, blend;
+    std::uint32_t tex, pad;  // the texture's index in the draw's texture table
     bool operator==(const Params &) const = default;
 };
 
 enum : std::uint32_t {
     F_TME = 1u, F_TCC = 2u, F_ATE = 16u, F_FBA = 256u, F_MAG_LINEAR = 512u, F_LCM = 8192u, F_REPEAT_U = 16384u,
     F_REPEAT_V = 32768u, F_SOURCE16 = 65536u, F_SRC_ONE = 131072u, F_AEM = 262144u, F_SOURCE_TARGET = 524288u,
-    F_MASKED = 1048576u, F_TARGET16 = 2097152u,
+    F_MASKED = 1048576u, F_TARGET16 = 2097152u, F_WRAP_SHIFT = 22u, F_FACTORS = 16777216u,
 };
 
 // compute: GS memory jobs first .. first + count, dispatches param .. param + width (set at submit).
@@ -176,6 +200,7 @@ struct Op {
     bool clear_depth = false;
     WGPURenderPipeline pipeline = nullptr;
     WGPUBindGroup group = nullptr, dest = nullptr;
+    std::uint32_t table = 0;
     std::uint32_t first = 0, count = 0, param = 0;
     std::uint32_t scissor[4] = {};
     float fix = 0.0f;
@@ -191,6 +216,29 @@ std::uint64_t g_vertex_capacity = 0, g_param_capacity = 0;
 WGPUBindGroup g_param_group = nullptr;
 const Target *g_pass_target = nullptr;
 const Depth *g_pass_depth = nullptr;
+
+// Draws pick their texture from a table of views (a binding array, one bind group per table made at the submit), so
+// draws with different textures share a wgpu draw. A table serves the draws into one target (a bound group's
+// textures must not include the pass's target: draws read their own target through its copy); a full table or
+// another target starts the next one.
+constexpr std::uint32_t kTable = 1024;
+std::vector<std::vector<WGPUTextureView>> g_texture_tables(1);
+std::uint64_t g_table_serial = 1;
+const Target *g_table_target = nullptr;
+
+void next_table() {
+    if (g_texture_tables.back().empty()) return;
+    g_texture_tables.emplace_back();
+    ++g_table_serial;
+}
+
+std::uint32_t table_slot(WGPUTextureView v, Slot &slot) {
+    if (slot.table == g_table_serial) return slot.index;
+    if (g_texture_tables.back().size() == kTable) next_table();
+    g_texture_tables.back().push_back(v);
+    slot = {g_table_serial, static_cast<std::uint32_t>(g_texture_tables.back().size() - 1)};
+    return slot.index;
+}
 
 // Uploads and read-backs change GS memory pages: generations for the texture memo, CLUT ids and keys of last resort.
 std::uint32_t g_page_gen[kPages];
@@ -282,8 +330,15 @@ struct Current {
     Target *target = nullptr;
     Depth *depth = nullptr;
     WGPURenderPipeline pipeline = nullptr;
-    WGPUBindGroup group = nullptr, dest = nullptr;
+    WGPUBindGroup dest = nullptr;
+    std::uint32_t table = 0;
     bool masked = false;
+    // The texture's pages (all levels): an upload or read-back elsewhere leaves the draw state as it is. A texture
+    // read from a target (feedback) is set up again after any upload, a paletted one when its CLUT entries change.
+    std::uint64_t pages[kPages / 64] = {};
+    bool touched = false, paletted = false, feedback = false;
+    std::uint64_t palette = 0;
+    std::uint32_t palette_psm = 0, palette_csa = 0;
     Params params{};
     std::uint32_t param = ~0u;
     std::uint32_t scissor[4] = {};
@@ -293,6 +348,24 @@ struct Current {
     std::uint32_t z_max = 0xFFFFFFu;
     bool fst = false, iip = false;
 } g_cur;
+
+// Draw states of the current target kept for a switch back (batches that alternate PRIM attributes or blends): valid
+// until the draw state is invalidated, an upload touches their texture or (paletted) their CLUT entries change.
+Current g_kept[4];
+std::uint32_t g_kept_next = 0;
+
+void touch_page(std::uint32_t p) {
+    ++g_page_gen[p];
+    const std::uint64_t bit = 1ull << (p % 64);
+    if (g_cur.pages[p / 64] & bit) g_cur.touched = true;
+    for (Current &k : g_kept)
+        if (k.pages[p / 64] & bit) k.touched = true;
+}
+
+void invalidate_state() {
+    g_cur.valid = false;
+    for (Current &k : g_kept) k.valid = false;
+}
 
 std::uint32_t bits_per_pixel(std::uint32_t psm) {
     switch (psm) {
@@ -353,17 +426,24 @@ void write_texture(WGPUTexture t, std::uint32_t level, std::uint32_t w, std::uin
     wgpuQueueWriteTexture(g_queue, &dst, data, static_cast<std::size_t>(w) * h * 4, &layout, &size);
 }
 
-WGPUBindGroup texture_group(WGPUTextureView v, std::uint32_t wrap) {
-    WGPUBindGroupEntry e[3] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
-    e[0].binding = 0;
-    e[0].textureView = v;
-    e[1].binding = 1;
-    e[1].sampler = g_near[wrap];
-    e[2].binding = 2;
-    e[2].sampler = g_lin[wrap];
+// A texture table's bind group: its views (fewer than kTable: partially bound) and the samplers by wrap mode.
+WGPUBindGroup table_group(const std::vector<WGPUTextureView> &views) {
+    WGPUBindGroupEntry e[9];
+    for (std::uint32_t i = 0; i < 9; ++i) {
+        e[i] = WGPU_BIND_GROUP_ENTRY_INIT;
+        e[i].binding = i;
+        if (i) e[i].sampler = i <= 4 ? g_near[i - 1] : g_lin[i - 5];
+    }
+#ifndef __EMSCRIPTEN__
+    WGPUBindGroupEntryExtras extras = {};
+    extras.chain.sType = static_cast<WGPUSType>(WGPUSType_BindGroupEntryExtras);
+    extras.textureViews = views.empty() ? &g_blank_view : views.data();
+    extras.textureViewCount = std::max<std::size_t>(views.size(), 1);
+    e[0].nextInChain = &extras.chain;
+#endif
     WGPUBindGroupDescriptor d = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
     d.layout = g_texture_layout;
-    d.entryCount = 3;
+    d.entryCount = 9;
     d.entries = e;
     return wgpuDeviceCreateBindGroup(g_device, &d);
 }
@@ -466,10 +546,12 @@ void push_upload(const Upload &u, std::uint32_t rows) {
         if (s.read >= 0) bound = std::max(bound, static_cast<std::uint32_t>(s.read) + 1u);
         if (s.write >= 0) bound = std::max(bound, static_cast<std::uint32_t>(s.write) + (s.fmt == fmt && disjoint(s.box, box) ? 0u : 1u));
     });
+    // PSMT4 in whole 32 x 4 cells: one thread per word of GS memory (8 pixels), bits per pixel 0 in the record.
+    const bool words = u.psm == gs::PSMT4 && u.x % 32 == 0 && u.w % 32 == 0 && u.y % 4 == 0 && rows % 4 == 0;
     Job j;
     j.kind = J_UPLOAD;
-    j.threads = rows * u.w;
-    const std::uint32_t rec[8] = {u.bp, u.bw, u.psm, u.x, u.y, u.w, static_cast<std::uint32_t>(u.start / 4), bits_per_pixel(u.psm)};
+    j.threads = words ? rows * u.w / 8 : rows * u.w;
+    const std::uint32_t rec[8] = {u.bp, u.bw, u.psm, u.x, u.y, u.w, static_cast<std::uint32_t>(u.start / 4), words ? 0u : bits_per_pixel(u.psm)};
     std::memcpy(j.rec, rec, sizeof rec);
     const std::uint32_t key = push_job(j, bound);
     for_pages(u.bp, u.bw, u.psm, u.x, u.y, u.w, rows, [&](std::uint32_t p) {
@@ -643,15 +725,21 @@ void prepare_jobs(std::uint32_t base) {
             const bool upload = it->kind == J_UPLOAD;
             const std::uint32_t at = base + static_cast<std::uint32_t>(g_records.size());
             std::uint32_t n = 0, threads = 0;
+            // CLUT loads of one key have no decode between them: each 16-entry group gets its last load's entries.
+            std::uint32_t last[32];
+            std::fill(std::begin(last), std::end(last), ~0u);
             for (; it != end; ++it, ++n) {
+                g_records.insert(g_records.end(), it->rec, it->rec + 8);
                 if (upload) {
-                    g_records.insert(g_records.end(), it->rec, it->rec + 8);
                     g_records.push_back(threads);
                     threads += it->threads;
-                } else {
-                    g_records.insert(g_records.end(), it->rec, it->rec + 8);
+                    continue;
                 }
+                const std::uint32_t csm = it->rec[2], csa = it->rec[3], eight = it->rec[4];
+                const std::uint32_t first = csm ? csa : eight ? 0u : csa & 15u, groups = eight ? 16u : 1u;
+                for (std::uint32_t g = 0; g < groups; ++g) last[(first + g) & 31u] = n;
             }
+            if (!upload) g_records.insert(g_records.end(), std::begin(last), std::end(last));
             const std::uint32_t p[3] = {at, n, threads};
             if (!upload) dispatch(g_clut_pipeline, nullptr, 1, p, 3);
             else if (threads) dispatch(g_upload_pipeline, nullptr, (threads + 63) / 64, p, 3);
@@ -702,7 +790,7 @@ void read_pixels(WGPUTexture tex, std::uint32_t width, std::uint32_t height, std
 WGPUCommandEncoder encoder() {
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
 #ifndef __EMSCRIPTEN__
-    if (g_stamps && g_stamp_count + 2 <= kStamps) wgpuCommandEncoderWriteTimestamp(enc, g_stamps, g_stamp_count++);
+    if ((g_encoder_stamp = stamp_pair(0)) != ~0u) wgpuCommandEncoderWriteTimestamp(enc, g_stamps, g_encoder_stamp);
 #endif
     return enc;
 }
@@ -857,12 +945,11 @@ void make_target_texture(Target &t, std::uint32_t height) {
     }
     drop_texture(t.tex, t.view);
     drop_texture(t.copy, t.copy_view);
-    drop_group(t.group);
-    drop_group(t.copy_group);
     drop_group(t.dest_group);
     t.copy_version = ~0u;
     t.tex = tex;
     t.view = make_view(tex);
+    t.slot = {};
     t.height = height;
     if (t.parent) t.synced = ~0u;
     else fill_target(t, old ? old_height : 0, height);
@@ -886,7 +973,7 @@ void ensure_height(Target &t, std::uint32_t rows) {
     rows = std::min<std::uint32_t>((rows + align) & ~align, 2048u);
     if (t.tex && rows <= t.height) return;
     make_target_texture(t, std::max(rows, t.height));
-    g_cur.valid = false;
+    invalidate_state();
 }
 
 // t.copy = t as drawn so far (textures read from the target being drawn, masked draws' destination).
@@ -894,6 +981,7 @@ void copy_target(Target &t) {
     if (!t.copy) {
         t.copy = make_texture(t.width * g_scale, t.height * g_scale, kColor, WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst);
         t.copy_view = make_view(t.copy);
+        t.copy_slot = {};
     }
     Op op{OpKind::copy};
     op.src = t.tex;
@@ -974,7 +1062,7 @@ void read_back(Target &t) {
     wgpuComputePassEncoderEnd(cp);
     wgpuComputePassEncoderRelease(cp);
     submit_commands(enc);
-    for_pages(t.fbp * 32u, t.fbw, t.psm, 0, 0, t.width, t.height, [](std::uint32_t pg) { ++g_page_gen[pg]; });
+    for_pages(t.fbp * 32u, t.fbw, t.psm, 0, 0, t.width, t.height, touch_page);
     const std::uint32_t box[4] = {0, 0, t.width, t.height};
     note_written(t.fbp * 32u, t.fbw, t.psm, ~0u, box, 0);
     wgpuBindGroupRelease(group);
@@ -1019,7 +1107,6 @@ Texture &add_texture(std::uint64_t key, std::uint32_t w, std::uint32_t h, std::u
         for (std::size_t i = 0; i < order.size() / 2; ++i) {
             Texture &t = g_textures[order[i].second];
             drop_texture(t.tex, t.view);
-            for (WGPUBindGroup &g : t.groups) drop_group(g);
             g_textures.erase(order[i].second);
         }
     }
@@ -1049,7 +1136,8 @@ bool tagged(std::uint32_t psm) {
 }
 
 struct Source {
-    WGPUBindGroup group = nullptr;
+    WGPUTextureView view = nullptr;
+    Slot *slot = nullptr;
     float store_w = 1, store_h = 1;
     std::uint32_t flags = 0;
     std::uint32_t levels = 1;
@@ -1071,15 +1159,15 @@ bool target_source(Target &t, const Target *drawing, Source &out) {
     resolve(t);
     if (&t == drawing) {
         if (t.copy_version != t.version) copy_target(t);
-        if (!t.copy_group) t.copy_group = texture_group(t.copy_view, 3);
-        out.group = t.copy_group;
+        out.view = t.copy_view;
+        out.slot = &t.copy_slot;
     } else {
-        if (!t.group) t.group = texture_group(t.view, 3);
-        out.group = t.group;
+        out.view = t.view;
+        out.slot = &t.slot;
     }
     out.store_w = static_cast<float>(t.width);
     out.store_h = static_cast<float>(t.height);
-    out.flags = F_SOURCE_TARGET | (t.sixteen() ? F_SOURCE16 : 0u);
+    out.flags = F_SOURCE_TARGET | (t.sixteen() ? F_SOURCE16 : 0u) | 3u << F_WRAP_SHIFT;
     return true;
 }
 
@@ -1111,7 +1199,10 @@ bool texture_source(const State &st, const gs::Context &c, const Target *drawing
     for (std::uint32_t l = 0; l < levels; ++l) {
         std::uint32_t bw;
         const std::uint32_t bp = level_bp(c, l, bw);
-        for_pages(bp, bw, psm, 0, 0, std::max(1u, (1u << tw) >> l), std::max(1u, (1u << th) >> l), [&](std::uint32_t p) { pages = mix(pages, g_page_gen[p]); });
+        for_pages(bp, bw, psm, 0, 0, std::max(1u, (1u << tw) >> l), std::max(1u, (1u << th) >> l), [&](std::uint32_t p) {
+            pages = mix(pages, g_page_gen[p]);
+            g_cur.pages[p / 64] |= 1ull << (p % 64);
+        });
     }
     const TexFormat fmt{psm, static_cast<std::uint32_t>(c.tex0 >> 51) & 0xFu, static_cast<std::uint32_t>(c.tex0 >> 56) & 0x1Fu,
                         static_cast<std::uint32_t>(st.texa) & 0xFFu, static_cast<std::uint32_t>(st.texa >> 32) & 0xFFu, ((st.texa >> 15) & 1u) != 0};
@@ -1184,12 +1275,11 @@ bool texture_source(const State &st, const gs::Context &c, const Target *drawing
         m.valid = false;
         return false;
     }
-    const std::uint32_t wrap = wrap_index(c.clamp);
-    if (!t->groups[wrap]) t->groups[wrap] = texture_group(t->view, wrap);
-    out.group = t->groups[wrap];
+    out.view = t->view;
+    out.slot = &t->slot;
     out.store_w = static_cast<float>(1u << tw);
     out.store_h = static_cast<float>(1u << th);
-    out.flags = 0;
+    out.flags = wrap_index(c.clamp) << F_WRAP_SHIFT;
     out.levels = levels;
     return true;
 }
@@ -1200,16 +1290,36 @@ struct Coef {
     int one = 0, c = 0;
 };
 
-// GS blend Cv = (A - B) * C + D as WebGPU factors (dual source: blend_src 1 alpha is As).
-bool blend_state(std::uint32_t alpha, WGPUBlendComponent &out, bool &src_one) {
-    const std::uint32_t a = alpha & 3u, b = (alpha >> 2) & 3u, c = (alpha >> 4) & 3u, d = (alpha >> 6) & 3u;
-    Coef s, t;
+// GS blend Cv = (A - B) * C + D: the coefficients of Cs (s) and Cd (t).
+void coefficients(std::uint32_t alpha, Coef &s, Coef &t) {
+    const std::uint32_t a = alpha & 3u, b = (alpha >> 2) & 3u, d = (alpha >> 6) & 3u;
     if (a == 0) ++s.c;
     if (a == 1) ++t.c;
     if (b == 0) --s.c;
     if (b == 1) --t.c;
     if (d == 0) ++s.one;
     if (d == 1) ++t.one;
+}
+
+// Blends whose Cs and Cd factors are each 0, 1, C or 1 - C with C = As or FIX, added: the shader outputs the factors
+// (blend_src 1: rgb for Cs, alpha for Cd), so these blends and unblended draws share a pipeline. out: Params.blend.
+bool shader_factors(std::uint32_t alpha, std::uint32_t fix, std::uint32_t &out) {
+    const std::uint32_t c = (alpha >> 4) & 3u;
+    if (c == 1) return false;
+    Coef s, t;
+    coefficients(alpha, s, t);
+    const auto kind = [](Coef k) { return k.c == 0 ? (k.one == 0 ? 0 : k.one == 1 ? 1 : -1) : k.c == 1 && k.one == 0 ? 2 : k.c == -1 && k.one == 1 ? 3 : -1; };
+    const int ks = kind(s), kd = kind(t);
+    if (ks < 0 || kd < 0) return false;
+    out = static_cast<std::uint32_t>(ks) | static_cast<std::uint32_t>(kd) << 2 | (c == 2 ? 16u : 0u) | fix << 8;
+    return true;
+}
+
+// GS blend as WebGPU factors (dual source: blend_src 1 alpha is As).
+bool blend_state(std::uint32_t alpha, WGPUBlendComponent &out, bool &src_one) {
+    const std::uint32_t c = (alpha >> 4) & 3u;
+    Coef s, t;
+    coefficients(alpha, s, t);
     const WGPUBlendFactor cf = c == 0 ? WGPUBlendFactor_Src1Alpha : c == 1 ? WGPUBlendFactor_DstAlpha : WGPUBlendFactor_Constant;
     const WGPUBlendFactor inv = c == 0 ? WGPUBlendFactor_OneMinusSrc1Alpha : c == 1 ? WGPUBlendFactor_OneMinusDstAlpha : WGPUBlendFactor_OneMinusConstant;
     src_one = false;
@@ -1241,7 +1351,8 @@ bool blend_state(std::uint32_t alpha, WGPUBlendComponent &out, bool &src_one) {
     return true;
 }
 
-// key: bits 0-7 ALPHA (A, B, C, D), 8 blend on, 9-12 colour write mask, 13-15 depth compare, 16 depth write.
+// key: bits 0-7 ALPHA (A, B, C, D), 8 blend on, 9-12 colour write mask, 13-15 depth compare, 16 depth write,
+// 17 factors from the shader (shader_factors).
 WGPURenderPipeline pipeline(std::uint32_t key) {
     if (const auto it = g_pipelines.find(key); it != g_pipelines.end()) return it->second;
     WGPUVertexAttribute attrs[4] = {WGPU_VERTEX_ATTRIBUTE_INIT, WGPU_VERTEX_ATTRIBUTE_INIT, WGPU_VERTEX_ATTRIBUTE_INIT, WGPU_VERTEX_ATTRIBUTE_INIT};
@@ -1259,6 +1370,7 @@ WGPURenderPipeline pipeline(std::uint32_t key) {
     blend.color = {WGPUBlendOperation_Add, WGPUBlendFactor_One, WGPUBlendFactor_Zero};
     bool src_one = false;
     if (key & 0x100u) blend_state(key & 0xFFu, blend.color, src_one);
+    if (key & 0x20000u) blend.color = {WGPUBlendOperation_Add, WGPUBlendFactor_Src1, WGPUBlendFactor_Src1Alpha};
     WGPUColorTargetState color = WGPU_COLOR_TARGET_STATE_INIT;
     color.format = kColor;
     color.blend = &blend;
@@ -1376,6 +1488,8 @@ void rebuild(const State &st, std::uint64_t attr) {
     cur.clut = g_clut_version;
     cur.upload = g_upload_serial;
     cur.regs = regs_of(st, attr);
+    std::memset(cur.pages, 0, sizeof cur.pages);
+    cur.touched = cur.paletted = cur.feedback = false;
     const gs::Context &c = st.ctx[(attr >> 9) & 1u];
     const std::uint32_t fbp = static_cast<std::uint32_t>(c.frame) & 0x1FFu, fbw = static_cast<std::uint32_t>(c.frame >> 16) & 0x3Fu;
     const std::uint32_t fpsm = static_cast<std::uint32_t>(c.frame >> 24) & 0x3Fu;
@@ -1410,6 +1524,10 @@ void rebuild(const State &st, std::uint64_t attr) {
     std::uint32_t mask = write_mask(c, t, partial);
     bool zwrite = zte && !((c.zbuf >> 32) & 1u) && ztst != 0;
     std::uint32_t flags = 0;
+    if (zte && ztst == 0) {  // Z test NEVER: nothing drawn
+        cur.skip = true;
+        return;
+    }
     if (ate && atst == 0) {
         switch (afail) {
         case 0: cur.skip = true; return;
@@ -1430,11 +1548,14 @@ void rebuild(const State &st, std::uint64_t attr) {
     const bool abe = (attr & 0x40u) != 0;
     const std::uint32_t alpha = static_cast<std::uint32_t>(c.alpha) & 0xFFu, fix = static_cast<std::uint32_t>(c.alpha >> 32) & 0xFFu;
     bool src_one = false;
-    if (abe && !partial) {
+    std::uint32_t factors = 1u;  // Cs * 1 + Cd * 0
+    const bool by_shader = !partial && (!abe || shader_factors(alpha, fix, factors));
+    if (abe && !partial && !by_shader) {
         WGPUBlendComponent unused;
         if (!blend_state(alpha, unused, src_one)) missing("blend equation " + std::to_string(alpha));
     }
     if (src_one) flags |= F_SRC_ONE;
+    if (by_shader) flags |= F_FACTORS;
     const std::uint32_t depth_mode = zte ? ztst + 1 : 0;
     Params &p = cur.params;
     p = Params{};
@@ -1450,24 +1571,37 @@ void rebuild(const State &st, std::uint64_t attr) {
         if (t.copy_version != t.version) copy_target(t);
         cur.dest = dest_group(t);
         cur.pipeline = pipeline((0xFu << 9) | (depth_mode << 13) | (zwrite ? 1u << 16 : 0u));
+    } else if (by_shader) {
+        p.blend = factors;
+        cur.pipeline = pipeline(0x20000u | (mask << 9) | (depth_mode << 13) | (zwrite ? 1u << 16 : 0u));
     } else {
         cur.pipeline = pipeline((abe ? (alpha | 0x100u) : 0u) | (mask << 9) | (depth_mode << 13) | (zwrite ? 1u << 16 : 0u));
     }
-    cur.fix = static_cast<float>(fix) / 128.0f;
+    cur.fix = by_shader ? 0.0f : static_cast<float>(fix) / 128.0f;
 
     p.target[0] = static_cast<float>(t.width * g_scale);
     p.target[1] = static_cast<float>(t.height * g_scale);
     p.scale = static_cast<float>(g_scale);
     p.aref = static_cast<float>((test >> 4) & 0xFFu);
     if (c.fba & 1u) flags |= F_FBA;
-    cur.group = g_blank_group;
+    if (g_table_target != &t) {
+        next_table();
+        g_table_target = &t;
+    }
+    cur.table = static_cast<std::uint32_t>(g_texture_tables.size() - 1);
     if (cur.textured) {
         Source src;
         if (texture_source(st, c, &t, src)) {
             const std::uint32_t tw = std::min<std::uint32_t>(static_cast<std::uint32_t>(c.tex0 >> 26) & 0xFu, 10u);
             const std::uint32_t th = std::min<std::uint32_t>(static_cast<std::uint32_t>(c.tex0 >> 30) & 0xFu, 10u);
             const std::uint64_t tex1 = c.tex1;
-            cur.group = src.group;
+            p.tex = table_slot(src.view, *src.slot);
+            cur.table = static_cast<std::uint32_t>(g_texture_tables.size() - 1);
+            cur.palette_psm = static_cast<std::uint32_t>(c.tex0 >> 20) & 0x3Fu;
+            cur.palette_csa = static_cast<std::uint32_t>(c.tex0 >> 56) & 0x1Fu;
+            cur.paletted = bits_per_pixel(cur.palette_psm) <= 8;
+            if (cur.paletted) cur.palette = palette_id(cur.palette_psm, cur.palette_csa);
+            cur.feedback = (src.flags & F_SOURCE_TARGET) != 0;
             flags |= F_TME | src.flags;
             if ((c.tex0 >> 34) & 1u) flags |= F_TCC;
             flags |= (static_cast<std::uint32_t>(c.tex0 >> 35) & 3u) << 2;
@@ -1511,6 +1645,35 @@ void rebuild(const State &st, std::uint64_t attr) {
     cur.scissor[3] = static_cast<std::uint32_t>(y1 - y0) * g_scale;
 }
 
+// A paletted texture's CLUT entries changed since its draw state was made (else its CLUT version is brought up).
+bool palette_changed(Current &k) {
+    if (!k.paletted || k.clut == g_clut_version) return false;
+    if (palette_id(k.palette_psm, k.palette_csa) != k.palette) return true;
+    k.clut = g_clut_version;
+    return false;
+}
+
+bool restore_kept(const State &st, std::uint64_t attr) {
+    if (!g_cur.valid) return false;
+    const Regs regs = regs_of(st, attr);
+    for (Current &k : g_kept)
+        if (k.valid && k.target == g_cur.target && k.attr == attr && !k.touched && k.regs == regs && !palette_changed(k)) {
+            g_cur = k;
+            g_cur.generation = gs::g_setup_generation;
+            return true;
+        }
+    return false;
+}
+
+// Rebuilds the draw state, or takes a kept one; keeps it unless it reads its own target (copies) or is masked.
+void set_state(const State &st, std::uint64_t attr) {
+    if (restore_kept(st, attr)) return;
+    rebuild(st, attr);
+    if (g_cur.feedback || g_cur.masked) return;
+    g_kept[g_kept_next] = g_cur;
+    g_kept_next = (g_kept_next + 1) % 4;
+}
+
 NVertex make_vertex(const Vertex &v, const Vertex &color) {
     const Current &cur = g_cur;
     NVertex o;
@@ -1551,14 +1714,14 @@ void add_vertices(const NVertex *v, std::uint32_t n, const std::int32_t *box) {
     const std::uint32_t first = static_cast<std::uint32_t>(g_vertices.size());
     g_vertices.insert(g_vertices.end(), v, v + n);
     Op &last = g_ops.back();
-    if (last.kind == OpKind::draw && last.pipeline == cur.pipeline && last.group == cur.group && last.dest == cur.dest && last.fix == cur.fix &&
+    if (last.kind == OpKind::draw && last.pipeline == cur.pipeline && last.table == cur.table && last.dest == cur.dest && last.fix == cur.fix &&
         std::memcmp(last.scissor, cur.scissor, sizeof cur.scissor) == 0 && last.first + last.count == first) {
         last.count += n;
         return;
     }
     Op op{OpKind::draw};
     op.pipeline = cur.pipeline;
-    op.group = cur.group;
+    op.table = cur.table;
     op.dest = cur.dest;
     op.first = first;
     op.count = n;
@@ -1605,6 +1768,8 @@ void submit_ops() {
     ensure_job_buffers(staged + g_records.size() * 4 + 4, g_job_params.size() * 4 + 256);
     if (!g_records.empty()) wgpuQueueWriteBuffer(g_queue, g_data, staged, g_records.data(), g_records.size() * 4);
     if (!g_job_params.empty()) wgpuQueueWriteBuffer(g_queue, g_job_buffer, 0, g_job_params.data(), g_job_params.size() * 4);
+    std::vector<WGPUBindGroup> tables;
+    for (const std::vector<WGPUTextureView> &t : g_texture_tables) tables.push_back(table_group(t));
     WGPUCommandEncoder enc = encoder();
     Stage &stage = g_stages[g_stage];
     if (staged) {
@@ -1615,7 +1780,8 @@ void submit_ops() {
     }
     WGPURenderPassEncoder pass = nullptr;
     WGPURenderPipeline bound_pipeline = nullptr;
-    WGPUBindGroup bound_group = nullptr, bound_dest = nullptr;
+    WGPUBindGroup bound_dest = nullptr;
+    std::uint32_t bound_table = ~0u;
     std::uint32_t bound_scissor[4] = {~0u};
     float bound_fix = -1.0f;
     const auto close = [&] {
@@ -1647,7 +1813,7 @@ void submit_ops() {
             wgpuRenderPassEncoderSetBindGroup(pass, 0, g_param_group, 0, nullptr);
             wgpuRenderPassEncoderSetBindGroup(pass, 2, bound_dest = g_blank_dest_group, 0, nullptr);
             bound_pipeline = nullptr;
-            bound_group = nullptr;
+            bound_table = ~0u;
             bound_scissor[0] = ~0u;
             bound_fix = -1.0f;
             break;
@@ -1655,7 +1821,7 @@ void submit_ops() {
         case OpKind::draw: {
             if (!pass) break;
             if (bound_pipeline != op.pipeline) wgpuRenderPassEncoderSetPipeline(pass, bound_pipeline = op.pipeline);
-            if (bound_group != op.group) wgpuRenderPassEncoderSetBindGroup(pass, 1, bound_group = op.group, 0, nullptr);
+            if (bound_table != op.table) wgpuRenderPassEncoderSetBindGroup(pass, 1, tables[bound_table = op.table], 0, nullptr);
             if (bound_dest != op.dest) wgpuRenderPassEncoderSetBindGroup(pass, 2, bound_dest = op.dest, 0, nullptr);
             if (std::memcmp(bound_scissor, op.scissor, sizeof bound_scissor) != 0) {
                 std::memcpy(bound_scissor, op.scissor, sizeof bound_scissor);
@@ -1730,7 +1896,14 @@ void submit_ops() {
                 }
                 wgpuComputePassEncoderSetBindGroup(cp, 0, g_job_group, 1, &d.offset);
                 if (d.out) wgpuComputePassEncoderSetBindGroup(cp, 2, d.out, 0, nullptr);
+#ifndef __EMSCRIPTEN__
+                const std::uint32_t stamp = g_stamps_inside ? stamp_pair(d.pipeline == g_upload_pipeline ? 1 : d.pipeline == g_clut_pipeline ? 2 : 3) : ~0u;
+                if (stamp != ~0u) wgpuComputePassEncoderWriteTimestamp(cp, g_stamps, stamp);
+#endif
                 wgpuComputePassEncoderDispatchWorkgroups(cp, d.x, d.y, 1);
+#ifndef __EMSCRIPTEN__
+                if (stamp != ~0u) wgpuComputePassEncoderWriteTimestamp(cp, g_stamps, stamp + 1);
+#endif
                 count(C_DISPATCH);
             }
             wgpuComputePassEncoderEnd(cp);
@@ -1741,6 +1914,10 @@ void submit_ops() {
     }
     close();
     submit_commands(enc);
+    for (WGPUBindGroup g : tables) wgpuBindGroupRelease(g);
+    g_texture_tables.assign(1, {});
+    ++g_table_serial;
+    g_table_target = nullptr;
     for (WGPUBindGroup g : g_dead_groups) wgpuBindGroupRelease(g);
     for (WGPUTextureView v : g_dead_views) wgpuTextureViewRelease(v);
     for (WGPUTexture t : g_dead_textures) wgpuTextureRelease(t);
@@ -1767,12 +1944,13 @@ void submit_ops() {
     }
     end_pass();
     end_segment();
-    g_cur.valid = false;
+    invalidate_state();
 }
 
 void submit_commands(WGPUCommandEncoder enc) {
 #ifndef __EMSCRIPTEN__
-    if (g_stamps && (g_stamp_count & 1u)) wgpuCommandEncoderWriteTimestamp(enc, g_stamps, g_stamp_count++);
+    if (g_encoder_stamp != ~0u) wgpuCommandEncoderWriteTimestamp(enc, g_stamps, g_encoder_stamp + 1);
+    g_encoder_stamp = ~0u;
 #endif
     count(C_SUBMIT);
     WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
@@ -1945,7 +2123,8 @@ void read_buffer(WGPUBuffer src, std::uint64_t offset, std::uint64_t bytes, void
 void time_present() {
 #ifndef __EMSCRIPTEN__
     if (g_stamps && g_stamp_count >= 2 && !g_stamp_busy[g_stamp_ring]) {
-        const std::uint32_t n = g_stamp_count & ~1u;
+        const std::uint32_t n = g_stamp_count;
+        g_stamp_pairs_read[g_stamp_ring].swap(g_stamp_pairs);
         WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
         wgpuCommandEncoderResolveQuerySet(enc, g_stamps, 0, n, g_stamp_resolve, 0);
         wgpuCommandEncoderCopyBufferToBuffer(enc, g_stamp_resolve, 0, g_stamp_read[g_stamp_ring], 0, n * 8ull);
@@ -1960,9 +2139,9 @@ void time_present() {
             const std::size_t i = reinterpret_cast<std::size_t>(slot), n = reinterpret_cast<std::size_t>(stamps);
             if (status == WGPUMapAsyncStatus_Success) {
                 const auto *t = static_cast<const std::uint64_t *>(wgpuBufferGetConstMappedRange(g_stamp_read[i], 0, n * 8));
-                std::uint64_t ticks = 0;
-                for (std::size_t k = 0; t && k < n; k += 2) ticks += t[k + 1] > t[k] ? t[k + 1] - t[k] : 0;
-                g_gpu_ms += static_cast<double>(ticks) * wgpuQueueGetTimestampPeriod(g_queue) / 1e6;
+                for (const StampPair &pr : g_stamp_pairs_read[i])
+                    if (t && pr.start + 1 < n && t[pr.start + 1] > t[pr.start])
+                        g_gpu_ms[pr.kind] += static_cast<double>(t[pr.start + 1] - t[pr.start]) * wgpuQueueGetTimestampPeriod(g_queue) / 1e6;
                 ++g_gpu_frames;
                 wgpuBufferUnmap(g_stamp_read[i]);
             }
@@ -1974,18 +2153,20 @@ void time_present() {
         g_stamp_ring = (g_stamp_ring + 1) % 3;
     }
     g_stamp_count = 0;
+    g_stamp_pairs.clear();
     wgpuDevicePoll(g_device, false, nullptr);
 #endif
     if (++g_timed_presents % 600) return;
     const double n = 600.0;
+    const auto gpu = [](int kind) { return g_gpu_frames ? g_gpu_ms[kind] / static_cast<double>(g_gpu_frames) : 0.0; };
     std::fprintf(stderr, "[native] ms per present: rebuild %.2f, decode %.2f, upload %.2f (tags %.2f), submit %.2f, present %.2f (acquire %.2f); "
-                 "per present: rebuilds %.0f, uploads %.0f, decodes %.1f, dispatches %.0f, passes %.0f, draws %.0f, copies %.0f, submits %.0f; GPU %.2f ms\n",
+                 "per present: rebuilds %.0f, uploads %.0f, decodes %.1f, dispatches %.0f, passes %.0f, draws %.0f, copies %.0f, submits %.0f; GPU %.2f ms (upload %.2f, CLUT %.2f, decode %.2f)\n",
                  g_time_ms[T_REBUILD] / n, g_time_ms[T_DECODE] / n, g_time_ms[T_UPLOAD] / n, g_time_ms[T_TAG] / n, g_time_ms[T_SUBMIT] / n, g_time_ms[T_PRESENT] / n,
                  g_time_ms[T_ACQUIRE] / n, g_counts[C_REBUILD] / n, g_counts[C_UPLOAD] / n, g_counts[C_DECODE] / n, g_counts[C_DISPATCH] / n, g_counts[C_PASS] / n, g_counts[C_DRAW] / n, g_counts[C_COPY] / n,
-                 g_counts[C_SUBMIT] / n, g_gpu_frames ? g_gpu_ms / static_cast<double>(g_gpu_frames) : 0.0);
+                 g_counts[C_SUBMIT] / n, gpu(0), gpu(1), gpu(2), gpu(3));
     std::memset(g_time_ms, 0, sizeof g_time_ms);
     std::memset(g_counts, 0, sizeof g_counts);
-    g_gpu_ms = 0.0;
+    std::memset(g_gpu_ms, 0, sizeof g_gpu_ms);
     g_gpu_frames = 0;
 }
 
@@ -2030,14 +2211,36 @@ bool init() {
         wgpuAdapterInfoFreeMembers(info);
     }
     WGPUDeviceDescriptor dd = WGPU_DEVICE_DESCRIPTOR_INIT;
-    WGPUFeatureName features[3] = {WGPUFeatureName_DualSourceBlending};
-    dd.requiredFeatureCount = 1;
+#ifndef __EMSCRIPTEN__
+    // Texture tables (binding arrays indexed per draw, bound only as far as used).
+    const WGPUFeatureName arrays[3] = {static_cast<WGPUFeatureName>(WGPUNativeFeature_TextureBindingArray),
+                                       static_cast<WGPUFeatureName>(WGPUNativeFeature_SampledTextureAndStorageBufferArrayNonUniformIndexing),
+                                       static_cast<WGPUFeatureName>(WGPUNativeFeature_PartiallyBoundBindingArray)};
+    for (const WGPUFeatureName f : arrays)
+        if (!wgpuAdapterHasFeature(g_adapter, f)) {
+            std::fprintf(stderr, "[native] no adapter with texture binding arrays, using the GS renderer\n");
+            return false;
+        }
+    WGPUNativeLimits native_limits = WGPU_NATIVE_LIMITS_INIT;
+    native_limits.maxBindingArrayElementsPerShaderStage = kTable;
+    WGPULimits limits = WGPU_LIMITS_INIT;
+    limits.nextInChain = &native_limits.chain;
+    dd.requiredLimits = &limits;
+    WGPUFeatureName features[7] = {WGPUFeatureName_DualSourceBlending, arrays[0], arrays[1], arrays[2]};
+    dd.requiredFeatureCount = 4;
+#else
+    return false;  // texture tables need binding arrays (wgpu-native)
+    WGPUFeatureName features[7] = {WGPUFeatureName_DualSourceBlending};
+#endif
     g_time = std::getenv("PS2_NATIVE_TIME") != nullptr;
     bool stamps = false;
 #ifndef __EMSCRIPTEN__
     const auto inside = static_cast<WGPUFeatureName>(WGPUNativeFeature_TimestampQueryInsideEncoders);
+    const auto passes = static_cast<WGPUFeatureName>(WGPUNativeFeature_TimestampQueryInsidePasses);
     stamps = g_time && wgpuAdapterHasFeature(g_adapter, WGPUFeatureName_TimestampQuery) && wgpuAdapterHasFeature(g_adapter, inside);
-    if (stamps) features[1] = WGPUFeatureName_TimestampQuery, features[2] = inside, dd.requiredFeatureCount = 3;
+    if (stamps) features[4] = WGPUFeatureName_TimestampQuery, features[5] = inside, dd.requiredFeatureCount = 6;
+    g_stamps_inside = stamps && std::strcmp(std::getenv("PS2_NATIVE_TIME"), "2") == 0 && wgpuAdapterHasFeature(g_adapter, passes);
+    if (g_stamps_inside) features[6] = passes, dd.requiredFeatureCount = 7;
 #endif
     dd.requiredFeatures = features;
     dd.uncapturedErrorCallbackInfo.callback = [](WGPUDevice const *, WGPUErrorType type, WGPUStringView message, void *, void *) {
@@ -2082,19 +2285,26 @@ bool init() {
     ld.entryCount = 1;
     ld.entries = &pe;
     g_params_layout = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
-    WGPUBindGroupLayoutEntry te[3] = {WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT};
-    te[0].binding = 0;
-    te[0].visibility = WGPUShaderStage_Fragment;
-    te[0].texture.sampleType = WGPUTextureSampleType_Float;
-    te[0].texture.viewDimension = WGPUTextureViewDimension_2D;
-    for (int i = 1; i < 3; ++i) {
-        te[i].binding = static_cast<std::uint32_t>(i);
+    WGPUBindGroupLayoutEntry te[9];
+    for (std::uint32_t i = 0; i < 9; ++i) {
+        te[i] = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+        te[i].binding = i;
         te[i].visibility = WGPUShaderStage_Fragment;
         te[i].sampler.type = WGPUSamplerBindingType_Filtering;
     }
-    ld.entryCount = 3;
+    te[0].sampler.type = WGPUSamplerBindingType_BindingNotUsed;
+    te[0].texture.sampleType = WGPUTextureSampleType_Float;
+    te[0].texture.viewDimension = WGPUTextureViewDimension_2D;
+#ifndef __EMSCRIPTEN__
+    WGPUBindGroupLayoutEntryExtras table = {};
+    table.chain.sType = static_cast<WGPUSType>(WGPUSType_BindGroupLayoutEntryExtras);
+    table.count = kTable;
+    te[0].nextInChain = &table.chain;
+#endif
+    ld.entryCount = 9;
     ld.entries = te;
     g_texture_layout = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
+    te[0].nextInChain = nullptr;
     ld.entryCount = 1;
     g_dest_layout = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
     const WGPUBindGroupLayout layouts[3] = {g_params_layout, g_texture_layout, g_dest_layout};
@@ -2167,11 +2377,10 @@ bool init() {
     WGPUTexture blank = make_texture(1, 1, WGPUTextureFormat_RGBA8Unorm, WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst);
     const std::uint32_t white = 0xFFFFFFFFu;
     write_texture(blank, 0, 1, 1, &white);
-    WGPUTextureView blank_view = make_view(blank);
-    g_blank_group = texture_group(blank_view, 0);
+    g_blank_view = make_view(blank);
     WGPUBindGroupEntry be = WGPU_BIND_GROUP_ENTRY_INIT;
     be.binding = 0;
-    be.textureView = blank_view;
+    be.textureView = g_blank_view;
     WGPUBindGroupDescriptor bd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
     bd.layout = g_dest_layout;
     bd.entryCount = 1;
@@ -2225,13 +2434,11 @@ void reset() {
     for (auto &[k, t] : g_targets) {
         drop_texture(t.tex, t.view);
         drop_texture(t.copy, t.copy_view);
-        drop_group(t.group);
-        drop_group(t.copy_group);
+        drop_group(t.dest_group);
     }
     for (auto &[k, z] : g_depths) drop_texture(z.tex, z.view);
     for (auto &[k, t] : g_textures) {
         drop_texture(t.tex, t.view);
-        for (WGPUBindGroup &g : t.groups) drop_group(g);
     }
     g_targets.clear();
     g_depths.clear();
@@ -2240,7 +2447,7 @@ void reset() {
     for (std::uint32_t p = 0; p < kPages; ++p) ++g_page_gen[p];
     ++g_upload_serial;
     ++g_clut_version;
-    g_cur.valid = false;
+    invalidate_state();
     g_upload = Upload{};
     g_staged = 0;
     g_pieces.clear();
@@ -2268,12 +2475,13 @@ void draw(const State &st, const Vertex *v, int) {
     }
     const std::uint64_t attr = prim_attr(st);
     Current &cur = g_cur;
-    const bool inputs = (attr & 0x10u) && (cur.upload != g_upload_serial || cur.clut != g_clut_version);
+    const bool clut = cur.clut != g_clut_version, upload = cur.upload != g_upload_serial;
+    const bool inputs = (attr & 0x10u) && (cur.feedback ? upload || clut : cur.touched || palette_changed(cur));
     if (!cur.valid || inputs || cur.attr != attr) {
-        rebuild(st, attr);
+        set_state(st, attr);
     } else if (cur.generation != gs::g_setup_generation) {
         if (regs_of(st, attr) == cur.regs) cur.generation = gs::g_setup_generation;
-        else rebuild(st, attr);
+        else set_state(st, attr);
     }
     if (cur.skip) {
         ++g_skipped[prim];
@@ -2365,7 +2573,7 @@ void finish_upload(const std::uint8_t *bytes = nullptr) {
         ++t->version;
         t->stamp = ++g_stamp;
     }
-    if (!u.targets.empty()) g_cur.valid = false;
+    if (!u.targets.empty()) invalidate_state();
     u.targets.clear();
     u.active = false;
 }
@@ -2385,7 +2593,7 @@ void image_begin(const State &s) {
     ++g_upload_serial;
     std::uint32_t lo = ~0u, hi = 0;
     for_pages(u.bp, u.bw, u.psm, u.x, u.y, u.w, u.h, [&](std::uint32_t p) {
-        ++g_page_gen[p];
+        touch_page(p);
         lo = std::min(lo, p * 8192u);
         hi = std::max(hi, p * 8192u + 8192u);
     });

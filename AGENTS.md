@@ -217,4 +217,9 @@ the same change.
   every scene, so `play.py` and the port folder default to `"renderer":
   "native"` (`"gs"` falls back); `ps2run` with an ELF still follows
   `PS2_RENDERER`. Owner window play check open.
+  T59c (D44): texture tables (binding arrays, required) and shader blend
+  factors merge draws (race intro 3,515 → 124 per present), draw states
+  kept, CLUT loads in one pass; render thread clearly below the GS path
+  (race intro 11.3 vs 15.9 ms, racing 9.5 vs 12.4), GPU 5-6 ms in races;
+  frames byte-identical.
 - Next up: see [docs/tasks.md](docs/tasks.md). The owner runs tasks with `/next-task`.

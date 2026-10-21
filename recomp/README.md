@@ -597,7 +597,9 @@ work\<SERIAL>\recomp\build-window-win\ps2run.exe <elf> --disc <iso> [--window] [
 ```
 
 The log says `[native] renderer on, scale N, aspect W:H`; without a WebGPU
-adapter that has dual-source blending it says so and the GS renderer runs.
+adapter that has dual-source blending and texture binding arrays (non-uniform
+indexing, partially bound; wgpu-native features) it says so and the GS
+renderer runs.
 Unset, nothing changes (menu run 107/107 frames, 52,595,993,647 cycles).
 Renderer changes never change EE behaviour: cycles are the same with it on.
 
@@ -673,6 +675,29 @@ GS renderer does; pack dumping (`PS2_TEX_DUMP`) is the GS renderer's only.
 With the native renderer the GPU mesh path (T48) is off: the chain
 handler's VU1 batches go through the translator.
 
+Fewer draw calls (T59c, D44): draws pick their texture from a **texture
+table** (a binding array of up to 1,024 views indexed per draw from
+`Params.tex`, with the 8 samplers by wrap mode; one bind group per table,
+made at the submit). A table serves the draws into one target (a bound
+group must not hold the pass's own target; draws read their own target
+through its copy), so a new target or a full table starts the next one.
+Blends whose Cs and Cd factors are each 0, 1, C or 1 - C with C = As or FIX
+and an added result, and unblended draws, share one pipeline per write
+mask and Z mode: the shader outputs the factors (dual-source `blend_src 1`:
+rgb for Cs, alpha for Cd; the pipeline blends `Src1`, `Src1Alpha`); Ad
+blends, subtractions and `Cd * (1 + C)` keep their own pipelines. Z test
+NEVER draws nothing (skipped). So consecutive primitives share a wgpu draw
+unless the target, Z state, write mask, an Ad/subtract blend or a masked
+draw changes. Draw states: up to 4 recent ones of the current target are
+kept and taken back when the registers match (batches that alternate PRIM
+attributes); a state is set up again only when an upload or read-back
+touches its texture's pages (feedback textures read from a target: after
+any upload) or its CLUT entries change (paletted: by the CLUT content ids),
+not after every upload or CLUT load. CLUT loads of one dispatch (no decode
+between them) are applied as their last writer per 16-entry group (one
+pass, no in-order loop); PSMT4 uploads in whole 32 x 4 cells write one word
+of GS memory per thread.
+
 At exit: `[native] translator drew N primitives (T triangles, S sprites),
 skipped K; GS raster R; textures decoded D, from the pack P; targets T;
 submits F` and one line per target. `GS raster` counts primitives the GS
@@ -681,14 +706,16 @@ raster (CPU or GPU) drew: 0 with the native renderer on (T59/T68 measure).
 **Timing (T59):** `PS2_NATIVE_TIME=1` (window) prints every 600 presents
 `[native] ms per present: rebuild, decode, upload (tags), submit, present
 (acquire); per present: rebuilds, uploads, decodes, dispatches, passes,
-draws, copies, submits; GPU ms`: render-thread time in the draw-state
+draws, copies, submits; GPU ms (upload, CLUT, decode)`: render-thread time in the draw-state
 rebuilds (texture keys included), setting up texture decodes (since T59b
 GPU jobs), the uploads (copy into the staging buffer, job, D25 tags),
 encoding and submitting the commands, and the present (the
 surface acquire apart); GPU time from timestamps at the start and end of
 every command encoder (needs the adapter's timestamp features; the log says
-`no GPU timestamps` otherwise). Off: one test of a false flag per timed
-spot. The rest of the render thread's busy time (frame log) is the GS front
+`no GPU timestamps` otherwise). `PS2_NATIVE_TIME=2` also stamps around every
+GS memory dispatch (timestamps inside passes) for the GPU split by kind;
+those stamps add GPU time of their own (~0.5-0.8 ms in races), so GPU
+totals come from `=1`. Off: one test of a false flag per timed spot. The rest of the render thread's busy time (frame log) is the GS front
 end (GIF packets, registers, vertex kicks) and the translator's vertices.
 The present acquires the surface texture before the frame's commands are
 submitted: the acquire waits for the GPU work submitted before it, and
@@ -772,6 +799,25 @@ data copy), decode ~0 (menus 0.1, T59 0.6). GPU per present 0.7 / 8.4 /
 loads moved there (one workgroup applies a dispatch's CLUT loads in order);
 frames stay paced at 60. Left for T59c: ~2,700-3,500 wgpu draws per frame
 (the submit), texture keys per rebuild.
+
+Check after T59c (pilot game; texture tables, shader blend factors, kept
+draw states, CLUT last writers, PSMT4 words): headless frames byte-identical
+to T59b's in the menu run from boot (107/107) and the three state runs, and
+at scale 3 with the pack (racing 15/15 against the T59b exe); cycles
+unchanged; renderer off 107/107. Where the draws split before (race intro,
+per present): 2,990 of 3,515 at a pipeline change (opaque, `(Cs - Cd) As +
+Cd`, `Cd As`, `(Cs - Cd) FIX + Cd` alternating), 817 at a texture change.
+Window scale 3, 16:9, pack, per present (menus / race intro / racing):
+wgpu draws 13 / 124 / 232-342 (T59b 17 / 3,515 / 2,667), submit 0.19 /
+1.8 / 1.7 ms (0.20 / 5.0 / 4.0), rebuilds 16 / 1,426 / ~1,000 (17 / 3,725 /
+2,861) in 0.18 / 0.66 / 0.56 ms (0.19 / 0.82 / 0.72), upload 0.1 / 1.2 /
+1.1 (tags 0.1 / 0.9 / 0.85, unchanged: D25 hashing). Render thread busy (3
+runs each, GS path in brackets, same session): menus 1.61 (1.63), race
+intro 11.28 (15.86), racing 9.52 (12.36); the race intro now at 60 fps
+(GS path ~58.5). GPU per present 0.6 / 5.8 / 5.2 ms (T59b 0.7 / 8.4 / 7.4,
+T59 0.7 / 5.6 / 4.7). The T59b rise was the in-order CLUT loads (3.3 / 2.0-
+2.8 ms GPU, one workgroup looping over every load) and the uploads' atomics;
+now CLUT 0.4 / 0.3, uploads 0.55 / 0.4 (`PS2_NATIVE_TIME=2`).
 
 ### Chain handlers (T46)
 

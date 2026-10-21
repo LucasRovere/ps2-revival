@@ -20,6 +20,8 @@ struct Draw {
     ta1: f32,
     fbmsk: u32,
     blend: u32,
+    tex: u32,
+    pad: u32,
 }
 
 const F_TME: u32 = 1u;
@@ -36,11 +38,19 @@ const F_AEM: u32 = 262144u;
 const F_SOURCE_TARGET: u32 = 524288u;
 const F_MASKED: u32 = 1048576u;
 const F_TARGET16: u32 = 2097152u;
+const F_FACTORS: u32 = 16777216u;
 
 @group(0) @binding(0) var<storage, read> draws: array<Draw>;
-@group(1) @binding(0) var tex: texture_2d<f32>;
-@group(1) @binding(1) var near: sampler;
-@group(1) @binding(2) var lin: sampler;
+// The draw's texture is textures[d.tex]; samplers by wrap mode (bit 0: clamp U, bit 1: clamp V).
+@group(1) @binding(0) var textures: binding_array<texture_2d<f32>, 1024>;
+@group(1) @binding(1) var near0: sampler;
+@group(1) @binding(2) var near1: sampler;
+@group(1) @binding(3) var near2: sampler;
+@group(1) @binding(4) var near3: sampler;
+@group(1) @binding(5) var lin0: sampler;
+@group(1) @binding(6) var lin1: sampler;
+@group(1) @binding(7) var lin2: sampler;
+@group(1) @binding(8) var lin3: sampler;
 // Masked draws: a copy of the target being drawn.
 @group(2) @binding(0) var dest: texture_2d<f32>;
 
@@ -184,10 +194,15 @@ fn texel(d: Draw, stq: vec3<f32>, pos: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>) 
         uv = (floor(g) * SCALE + sub + 0.5) / (d.store_size * SCALE);
     }
     var c: vec4<f32>;
-    if (linear) {
-        c = textureSampleLevel(tex, lin, uv, level);
-    } else {
-        c = textureSampleLevel(tex, near, uv, level);
+    switch field(d, 22u, 2u) + select(0u, 4u, linear) {
+        case 0u { c = textureSampleLevel(textures[d.tex], near0, uv, level); }
+        case 1u { c = textureSampleLevel(textures[d.tex], near1, uv, level); }
+        case 2u { c = textureSampleLevel(textures[d.tex], near2, uv, level); }
+        case 3u { c = textureSampleLevel(textures[d.tex], near3, uv, level); }
+        case 4u { c = textureSampleLevel(textures[d.tex], lin0, uv, level); }
+        case 5u { c = textureSampleLevel(textures[d.tex], lin1, uv, level); }
+        case 6u { c = textureSampleLevel(textures[d.tex], lin2, uv, level); }
+        default { c = textureSampleLevel(textures[d.tex], lin3, uv, level); }
     }
     if (!has(d, F_SOURCE_TARGET)) {
         return c * 255.0;
@@ -265,7 +280,21 @@ fn fs(in: VertexOut) -> FragmentOut {
     }
     o.color = vec4<f32>(select(c.rgb / 255.0, vec3<f32>(1.0), has(d, F_SRC_ONE)), written / 128.0);
     o.blend = vec4<f32>(0.0, 0.0, 0.0, c.a / 128.0);
+    if (has(d, F_FACTORS)) {
+        // The pipeline blends Cs * blend.rgb + Cd * blend.a: the factors 0, 1, C or 1 - C (C = As or FIX).
+        let cv = select(c.a, f32((d.blend >> 8u) & 0xFFu), (d.blend & 16u) != 0u) / 128.0;
+        o.blend = vec4<f32>(vec3<f32>(factor(d.blend & 3u, cv)), factor((d.blend >> 2u) & 3u, cv));
+    }
     return o;
+}
+
+fn factor(kind: u32, cv: f32) -> f32 {
+    switch kind {
+        case 0u { return 0.0; }
+        case 1u { return 1.0; }
+        case 2u { return cv; }
+        default { return 1.0 - cv; }
+    }
 }
 
 struct FullOut {
@@ -422,7 +451,7 @@ fn thread(gid: vec3<u32>) -> u32 {
 }
 
 // Image transfers: records of 9 words (bp, bw, psm, x, y, width, data word, bits per pixel, first thread),
-// job.a = (first record word, records, threads).
+// job.a = (first record word, records, threads). Bits per pixel 0: PSMT4 in whole 32 x 4 cells, a thread per word.
 @compute @workgroup_size(64)
 fn upload(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = thread(gid);
@@ -443,37 +472,61 @@ fn upload(@builtin(global_invocation_id) gid: vec3<u32>) {
     let k = i - job_data[r + 8u];
     let w = job_data[r + 5u];
     let bpp = job_data[r + 7u];
+    if (bpp == 0u) {
+        upload_t4_word(r, k, w);
+        return;
+    }
     let x = (job_data[r + 3u] + k % w) & 0x7FFu;
     let y = (job_data[r + 4u] + k / w) & 0x7FFu;
     gs_write(job_data[r + 2u], job_data[r], job_data[r + 1u], x, y, job_bits(job_data[r + 6u], k * bpp, bpp));
 }
 
-// CLUT loads in order: records of 8 words (cbp, cpsm, csm, csa, 8-bit, cbw, cou, cov), job.a = (first record word,
-// records). Each thread owns two CLUT entries and applies the loads that write them in order, so no barriers.
+// A PSMT4 cell (32 x 4 pixels) is 16 words: the word holding (x, y) with x % 32 < 8 and y % 4 < 2 holds x, x + 8,
+// x + 16, x + 24 in its bytes, each byte (x, y) in its low nibble and (x ^ 4, y + 2) in its high nibble.
+fn upload_t4_word(r: u32, k: u32, w: u32) {
+    let cell = k / 16u;
+    let x0 = (cell % (w / 32u)) * 32u + k % 8u;
+    let y0 = (cell / (w / 32u)) * 4u + (k / 8u) % 2u;
+    let data = job_data[r + 6u];
+    var v = 0u;
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let lo = job_bits(data, (y0 * w + x0 + i * 8u) * 4u, 4u);
+        let hi = job_bits(data, ((y0 + 2u) * w + ((x0 + i * 8u) ^ 4u)) * 4u, 4u);
+        v = v | ((lo | (hi << 4u)) << (i * 8u));
+    }
+    let l = locate(0x14u, job_data[r], job_data[r + 1u], (job_data[r + 3u] + x0) & 0x7FFu, (job_data[r + 4u] + y0) & 0x7FFu);
+    atomicStore(&vram[l.word], v);
+}
+
+// CLUT loads (no decode between them): records of 8 words (cbp, cpsm, csm, csa, 8-bit, cbw, cou, cov), then per
+// 16-entry group the last load that writes it (~0u: none); job.a = (first record word, records). Each thread owns two
+// CLUT entries and takes them from their group's last load.
 @compute @workgroup_size(256)
 fn load_clut(@builtin(local_invocation_index) t: u32) {
-    for (var n = 0u; n < job.a.y; n = n + 1u) {
+    for (var slot = t; slot < 512u; slot = slot + 256u) {
+        let n = job_data[job.a.x + job.a.y * 8u + slot / 16u];
+        if (n == 0xFFFFFFFFu) {
+            continue;
+        }
         let r = job.a.x + n * 8u;
         let cbp = job_data[r];
         let cpsm = job_data[r + 1u];
         let csa = job_data[r + 3u];
         let eight = job_data[r + 4u] != 0u;
         let entries = select(16u, 256u, eight);
-        for (var slot = t; slot < 512u; slot = slot + 256u) {
-            if (job_data[r + 2u] != 0u) {
-                let k = (slot - csa * 16u) & 511u;
-                if (k < entries) {
-                    cluts[slot] = gs_read(cpsm, cbp, job_data[r + 5u], job_data[r + 6u] * 16u + k, job_data[r + 7u]);
-                }
-            } else if (slot < 256u) {
-                if (eight) {
-                    let j = (slot & ~0x18u) | ((slot & 0x08u) << 1u) | ((slot & 0x10u) >> 1u);
-                    cluts[slot] = gs_read(cpsm, cbp, 1u, j & 15u, j >> 4u);
-                } else {
-                    let k = (slot - (csa & 15u) * 16u) & 255u;
-                    if (k < 16u) {
-                        cluts[slot] = gs_read(cpsm, cbp, 1u, k & 7u, k >> 3u);
-                    }
+        if (job_data[r + 2u] != 0u) {
+            let k = (slot - csa * 16u) & 511u;
+            if (k < entries) {
+                cluts[slot] = gs_read(cpsm, cbp, job_data[r + 5u], job_data[r + 6u] * 16u + k, job_data[r + 7u]);
+            }
+        } else if (slot < 256u) {
+            if (eight) {
+                let j = (slot & ~0x18u) | ((slot & 0x08u) << 1u) | ((slot & 0x10u) >> 1u);
+                cluts[slot] = gs_read(cpsm, cbp, 1u, j & 15u, j >> 4u);
+            } else {
+                let k = (slot - (csa & 15u) * 16u) & 255u;
+                if (k < 16u) {
+                    cluts[slot] = gs_read(cpsm, cbp, 1u, k & 7u, k >> 3u);
                 }
             }
         }

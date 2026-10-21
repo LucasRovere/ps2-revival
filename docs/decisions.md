@@ -1106,3 +1106,49 @@ play check with the native renderer (open since T59).
 GPU time becomes the limit (T59c or a CLUT-load rework: snapshots by
 content instead of in-order loads), or a game reads target memory often
 during play (read-backs are GPU-side now, downloads still wait).
+**T59c (D44):** done; the GPU rise was the in-order CLUT loads (now one
+pass per dispatch) and the uploads' atomics; the native renderer's lead is
+clear now (race intro 11.3 vs 15.9 ms, racing 9.5 vs 12.4).
+
+## D44: Texture tables and shader blend factors; the native renderer stays the default (T59c)
+
+**Decision (T59c, 2026-10-20):**
+1. **Owner answers (after T59b):** "Native is now the default, but its lead
+   is within noise. Keep it on?" → keep native. "GPU time per frame rose
+   (races 7.4-8.4 ms). OK for now?" → OK for now; T59c investigates and
+   cuts it.
+2. **Fewer draw calls.** Draws index their texture in a texture table (a
+   binding array, wgpu-native features: required, else the GS renderer);
+   one table per run of draws into one target (a bound group must not hold
+   the pass's target). Blends with factors 0, 1, C or 1 - C (C = As or FIX)
+   and an added result share one pipeline with unblended draws: the shader
+   outputs the factors through dual-source `blend_src 1`. Z test NEVER is
+   skipped. Pilot race intro: 3,515 → 124 wgpu draws per present (most
+   splits were pipeline changes between alternating blends, not textures).
+3. **Cheaper draw states and keys.** A draw state is set up again only when
+   an upload or read-back touches its texture's pages or its CLUT entries
+   change (CLUT content ids), and up to 4 recent states of the current
+   target are kept for a switch back: rebuilds 3,725 → 1,426 per present.
+4. **GPU time.** CLUT loads of one dispatch are applied as the last writer
+   of each 16-entry group (in one pass instead of one workgroup looping over
+   every load: 3.3 → 0.4 ms in the race intro); PSMT4 uploads in whole 32 x
+   4 cells write whole words. GPU per present race intro 8.4 → 5.8 ms,
+   racing 7.4 → 5.2 (T59: 5.6 / 4.7).
+5. **Default (D42's rule).** Render thread busy per presented frame, window
+   scale 3, 16:9, pack, 3 runs each, same session: menus 1.61 vs GS 1.63
+   ms, race intro 11.28 vs 15.86, racing 9.52 vs 12.36: below the GS path in
+   every scene (menus within noise: few draws there), so the default stays
+   `"native"`.
+
+**Why:** the per-draw cost (~1.3 µs per wgpu draw plus state) was the
+largest render-thread item; binding arrays and shader-chosen factors merge
+draws without changing a pixel (frames byte-identical: same factors, same
+samples). The table per target keeps the WebGPU usage rule (a texture is
+not sampled and drawn in one pass) without tracking which views a pass
+draws.
+
+**Revisit if:** an adapter without binding arrays matters (then per-pass
+groups as before T59c, or an atlas), the 4 kept states thrash in a scene
+(more entries), or the remaining render-thread items (D25 upload tags
+~0.8 ms, vertex copies at the submit, ~200 compute dispatches) become the
+limit.
