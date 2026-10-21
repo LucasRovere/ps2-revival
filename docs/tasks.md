@@ -204,10 +204,13 @@ Other games (after the pilot game is fully native, D31):
     which native layers (D37) apply unchanged. No game data in git
     (`git grep -i` for its title and serial).
 
-Texture work (small, owner-driven):
+Nice to have (owner, 2026-10-20; not scheduled):
 
-- Owner to judge the upscaled glare-star sprites (harder, longer rays);
-  if bad, a `textures.overrides` `skip` for their keys.
+- Native renderer without texture binding arrays: today a GPU without them
+  falls back to the GS renderer (T59c). A fallback path (e.g. texture
+  atlas or per-texture draws) would let native run on those GPUs too.
+
+Owner answered (2026-10-19): keep the upscaled glare-star sprites as they are.
 
 Dropped by T52 (D37): T47 (cars on the GS path: T61), T55 (GPU mesh path
 follow-ups: the compute raster is replaced), T29 (speed headroom: native
